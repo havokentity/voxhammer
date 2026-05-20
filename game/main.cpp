@@ -300,7 +300,7 @@ int main(int argc, char** argv) {
                 float pos[3] = {0, 0, 0};
                 ParseRGB(console.FindCVar("camera.pos")->value, pos[0], pos[1], pos[2]);
                 const float sens = 0.0025f, PI = 3.14159265f;
-                yaw += ci.look_dx * sens;
+                yaw -= ci.look_dx * sens;   // inverted X (horizontal)
                 pitch -= ci.look_dy * sens;
                 while (yaw > PI) yaw -= 2 * PI;
                 while (yaw < -PI) yaw += 2 * PI;
