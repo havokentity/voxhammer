@@ -79,11 +79,21 @@ float3 sky(float3 rd) {
     return base;
 }
 
-// Cheap hash for deterministic sub-pixel pseudo-random offsets.
-float hash(float2 p) {
-    p = frac(p * float2(443.897, 441.423));
-    p += dot(p, p.yx + 19.19);
-    return frac(p.x * p.y);
+// Interleaved Gradient Noise (Jimenez 2014): a high-quality, low-discrepancy
+// per-pixel value in [0,1). Used to rotate the sample kernels per pixel so the
+// few taps read as fine film grain instead of the repeating tile a frac/sin
+// hash produces.
+float ign(float2 p) {
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+// Vogel-disk sample k of n on the unit disk, spun by phi (a golden-angle
+// spiral). Spreads the handful of penumbra/AO taps evenly with no clumping.
+float2 vogelDisk(int k, int n, float phi) {
+    const float GOLDEN_ANGLE = 2.39996323;
+    float r = sqrt((float(k) + 0.5) / float(n));
+    float theta = float(k) * GOLDEN_ANGLE + phi;
+    return float2(r * cos(theta), r * sin(theta));
 }
 
 // Build an orthonormal basis given a normal n (Frisvad / Duff et al.).
@@ -128,17 +138,14 @@ float softShadow(float3 hp, float3 nrm, float3 sunD, float2 screenPos) {
     float3 st, sb;
     buildBasis(sunD, st, sb);
 
+    float rot  = ign(screenPos) * 6.2832;   // per-pixel kernel rotation
+    float tanS = tan(shadowSoftness);
     float lit = 0.0;
     const int N = 6;
     [unroll] for (int s = 0; s < N; ++s) {
-        // Stratified 2D seed per sample.
-        float seed0 = hash(screenPos + float2(float(s) * 3.7, 1.3));
-        float seed1 = hash(screenPos + float2(1.9, float(s) * 5.1));
-        // Disk sample within the penumbra cone.
-        float angle  = seed0 * 6.2832;
-        float radius = sqrt(seed1) * tan(shadowSoftness);
-        float3 jitter = (st * cos(angle) + sb * sin(angle)) * radius;
-        float3 dir = normalize(sunD + jitter);
+        // Vogel-disk tap inside the penumbra cone, rotated per pixel.
+        float2 d   = vogelDisk(s, N, rot) * tanS;
+        float3 dir = normalize(sunD + st * d.x + sb * d.y);
         lit += occludedRay(hp + nrm * 0.02, dir, 160) ? 0.0 : 1.0;
     }
     return lit / float(N);
@@ -151,19 +158,19 @@ float ambientOcclusion(float3 hp, float3 nrm, float2 screenPos) {
     float3 t, b;
     buildBasis(nrm, t, b);
 
+    float rot   = ign(screenPos + 23.71) * 6.2832;  // decorrelated from the shadow kernel
+    int   steps = (int)clamp(aoRadius, 2.0, 24.0);
+    const float GOLDEN_ANGLE = 2.39996323;
     float occ = 0.0;
     const int M = 5;
     [unroll] for (int r = 0; r < M; ++r) {
-        // Cosine-weighted hemisphere sample.
-        float seed0 = hash(screenPos + float2(float(r) * 7.3, 2.7));
-        float seed1 = hash(screenPos + float2(3.1, float(r) * 4.9));
-        float phi    = seed0 * 6.2832;
-        float cosT   = sqrt(seed1);           // cosine-weighted
-        float sinT   = sqrt(1.0 - seed1);
-        float3 dir   = normalize(nrm * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
-
-        // March a short distance only (aoRadius steps max).
-        int steps = (int)clamp(aoRadius, 2.0, 24.0);
+        // Low-discrepancy cosine-weighted hemisphere sample, rotated per pixel:
+        // radial strata -> elevation, golden-angle azimuth -> even spread.
+        float u    = (float(r) + 0.5) / float(M);
+        float phi  = float(r) * GOLDEN_ANGLE + rot;
+        float cosT = sqrt(1.0 - u);           // cosine-weighted toward the normal
+        float sinT = sqrt(u);
+        float3 dir = normalize(nrm * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
         if (occludedRay(hp + nrm * 0.02, dir, steps)) occ += 1.0;
     }
     float visibility = 1.0 - (occ / float(M)) * aoStrength;
