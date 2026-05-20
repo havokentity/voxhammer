@@ -28,13 +28,14 @@ constexpr UINT kGrid = 64;  // 64^3 procedural voxel volume
 // D3DCompile (SM 5.1 DXBC -> accepted by DX12), so no DXC dependency.
 const char* kShader = R"HLSL(
 cbuffer Camera : register(b0) {
-    float3 camPos;   float fov;
-    float3 camFwd;   float timeSec;
-    float3 camRight; float aspect;
-    float3 camUp;    int   gridDim;
-    float3 clearCol; float exposure;
-    float2 viewport; int   hdr; float pad;
-    float3 sunDir;   float ambient;
+    float3 camPos;         float fov;
+    float3 camFwd;         float timeSec;
+    float3 camRight;       float aspect;
+    float3 camUp;          int   gridDim;
+    float3 clearCol;       float exposure;
+    float2 viewport;       int   hdr;          float shadowSoftness;
+    float3 sunDir;         float ambient;
+    float  aoStrength;     float aoRadius;     float pad0; float pad1;
 };
 StructuredBuffer<uint> Voxels : register(t0);
 
@@ -60,13 +61,43 @@ float3 tonemapACES(float3 x) {
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
+// Improved sky: horizon-to-zenith gradient + soft sun disk/glow, clearCol as tint.
 float3 sky(float3 rd) {
-    float k = saturate(rd.y);                       // 0 at horizon, 1 at zenith
-    return lerp(clearCol * 1.30, clearCol * 0.80, k);
+    float k = saturate(rd.y);
+    // horizon tint is warm/bright, zenith is deep blue-ish
+    float3 horiz  = clearCol * 1.60;
+    float3 zenith = clearCol * float3(0.40, 0.52, 0.80);
+    float3 base   = lerp(horiz, zenith, k * k);
+
+    // soft sun glow: broad halo + tight disk
+    float cosTheta = saturate(dot(rd, sunDir));
+    float halo     = pow(cosTheta, 8.0)  * 0.25;
+    float disk     = pow(cosTheta, 256.0) * 3.0;
+    float3 sunCol  = float3(1.10, 0.95, 0.75);
+    base += sunCol * (halo + disk) * saturate(sunDir.y + 0.15);  // fade when sun below horizon
+
+    return base;
 }
 
-// Shadow ray: DDA from p along d; true if it hits a solid voxel before exiting.
-bool occluded(float3 p, float3 d) {
+// Cheap hash for deterministic sub-pixel pseudo-random offsets.
+float hash(float2 p) {
+    p = frac(p * float2(443.897, 441.423));
+    p += dot(p, p.yx + 19.19);
+    return frac(p.x * p.y);
+}
+
+// Build an orthonormal basis given a normal n (Frisvad / Duff et al.).
+void buildBasis(float3 n, out float3 t, out float3 b) {
+    if (abs(n.z) < 0.9) {
+        t = normalize(cross(n, float3(0,0,1)));
+    } else {
+        t = normalize(cross(n, float3(0,1,0)));
+    }
+    b = cross(n, t);
+}
+
+// DDA ray: returns true if a solid voxel is hit within maxSteps.
+bool occludedRay(float3 p, float3 d, int maxSteps) {
     if (abs(d.x) < 1e-5) d.x = 1e-5;
     if (abs(d.y) < 1e-5) d.y = 1e-5;
     if (abs(d.z) < 1e-5) d.z = 1e-5;
@@ -74,7 +105,7 @@ bool occluded(float3 p, float3 d) {
     float3 s = sign(d);
     float3 tD = abs(1.0 / d);
     float3 tM = ((cell + (s * 0.5 + 0.5)) - p) / d;
-    [loop] for (int i = 0; i < 160; ++i) {
+    [loop] for (int i = 0; i < maxSteps; ++i) {
         if (tM.x < tM.y && tM.x < tM.z) { cell.x += s.x; tM.x += tD.x; }
         else if (tM.y < tM.z)           { cell.y += s.y; tM.y += tD.y; }
         else                            { cell.z += s.z; tM.z += tD.z; }
@@ -83,6 +114,60 @@ bool occluded(float3 p, float3 d) {
         if (Voxels[(uint)(cell.z * gridDim * gridDim + cell.y * gridDim + cell.x)] != 0) return true;
     }
     return false;
+}
+
+// Soft shadow: average N jittered shadow rays within a cone of half-angle shadowSoftness.
+// Uses a deterministic screen-space seed so no temporal flicker.
+float softShadow(float3 hp, float3 nrm, float3 sunD, float2 screenPos) {
+    [branch] if (shadowSoftness < 1e-4) {
+        // Hard shadow fast path.
+        return occludedRay(hp + nrm * 0.02, sunD, 160) ? 0.0 : 1.0;
+    }
+
+    // Build a tangent frame around sunDir to jitter within the cone.
+    float3 st, sb;
+    buildBasis(sunD, st, sb);
+
+    float lit = 0.0;
+    const int N = 6;
+    [unroll] for (int s = 0; s < N; ++s) {
+        // Stratified 2D seed per sample.
+        float seed0 = hash(screenPos + float2(float(s) * 3.7, 1.3));
+        float seed1 = hash(screenPos + float2(1.9, float(s) * 5.1));
+        // Disk sample within the penumbra cone.
+        float angle  = seed0 * 6.2832;
+        float radius = sqrt(seed1) * tan(shadowSoftness);
+        float3 jitter = (st * cos(angle) + sb * sin(angle)) * radius;
+        float3 dir = normalize(sunD + jitter);
+        lit += occludedRay(hp + nrm * 0.02, dir, 160) ? 0.0 : 1.0;
+    }
+    return lit / float(N);
+}
+
+// Ambient occlusion: sample hemisphere oriented around nrm.
+float ambientOcclusion(float3 hp, float3 nrm, float2 screenPos) {
+    [branch] if (aoStrength < 1e-4) return 1.0;
+
+    float3 t, b;
+    buildBasis(nrm, t, b);
+
+    float occ = 0.0;
+    const int M = 5;
+    [unroll] for (int r = 0; r < M; ++r) {
+        // Cosine-weighted hemisphere sample.
+        float seed0 = hash(screenPos + float2(float(r) * 7.3, 2.7));
+        float seed1 = hash(screenPos + float2(3.1, float(r) * 4.9));
+        float phi    = seed0 * 6.2832;
+        float cosT   = sqrt(seed1);           // cosine-weighted
+        float sinT   = sqrt(1.0 - seed1);
+        float3 dir   = normalize(nrm * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
+
+        // March a short distance only (aoRadius steps max).
+        int steps = (int)clamp(aoRadius, 2.0, 24.0);
+        if (occludedRay(hp + nrm * 0.02, dir, steps)) occ += 1.0;
+    }
+    float visibility = 1.0 - (occ / float(M)) * aoStrength;
+    return saturate(visibility);
 }
 
 float4 PSMain(VSOut i) : SV_Target {
@@ -125,9 +210,16 @@ float4 PSMain(VSOut i) : SV_Target {
         if (hit) {
             float3 hp = ro + rd * tEnter;
             float ndl = saturate(dot(nrm, sunDir));
-            float shadow = occluded(hp + nrm * 0.02, sunDir) ? 0.0 : 1.0;
+
+            // Soft penumbra shadow (6 rays, jittered within shadowSoftness cone).
+            float shadow = softShadow(hp, nrm, sunDir, i.pos.xy);
+
+            // Short-range ambient occlusion (5 hemisphere rays, aoRadius steps each).
+            float ao = ambientOcclusion(hp, nrm, i.pos.xy);
+
             float3 alb = palette(mat);
-            col = alb * (ambient + (1.0 - ambient) * ndl * shadow);   // fill + shadowed sun
+            float3 ambientLight = float3(ambient, ambient, ambient) * ao;
+            col = alb * (ambientLight + (1.0 - ambient) * ndl * shadow);
         } else {
             col = sky(rd);
         }
@@ -140,13 +232,14 @@ float4 PSMain(VSOut i) : SV_Target {
 )HLSL";
 
 struct CamCB {
-    float camPos[3]; float fov;
-    float camFwd[3]; float timeSec;
-    float camRight[3]; float aspect;
-    float camUp[3]; int gridDim;
-    float clearCol[3]; float exposure;
-    float viewport[2]; int hdr; float pad;
-    float sunDir[3]; float ambient;
+    float camPos[3];       float fov;             // row 0
+    float camFwd[3];       float timeSec;         // row 1
+    float camRight[3];     float aspect;           // row 2
+    float camUp[3];        int   gridDim;          // row 3
+    float clearCol[3];     float exposure;         // row 4
+    float viewport[2];     int   hdr;              float shadowSoftness; // row 5 (pad repurposed)
+    float sunDir[3];       float ambient;          // row 6
+    float aoStrength;      float aoRadius;         float pad0; float pad1; // row 7
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -392,6 +485,11 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.ambient = fp.ambient;
     cb.viewport[0] = float(d.width);
     cb.viewport[1] = float(d.height);
+    cb.shadowSoftness = fp.shadow_softness;
+    cb.aoStrength     = fp.ao_strength;
+    cb.aoRadius       = fp.ao_radius;
+    cb.pad0 = 0.0f;
+    cb.pad1 = 0.0f;
     std::memcpy(d.camPtr, &cb, sizeof(cb));
 
     d.alloc->Reset();
