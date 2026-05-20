@@ -442,11 +442,13 @@ struct Renderer::Impl {
     ComPtr<ID3D12RootSignature>       rootSig;
     ComPtr<ID3D12PipelineState>       pso;
     ComPtr<ID3D12Resource>            voxelBuf;
+    std::uint32_t*                    voxelPtr   = nullptr;      // persistent map into voxelBuf
     ComPtr<ID3D12Resource>            camBuf;
     std::uint8_t*                     camPtr = nullptr;
     ComPtr<ID3D12Resource>            accumBuf;       // GI temporal accumulation (RWStructuredBuffer<float4>)
     ComPtr<ID3D12Resource>            blueNoiseBuf;   // 64x64 blue-noise tile (StructuredBuffer<float> t1)
     ComPtr<ID3D12Resource>            paletteBuf;     // 256-entry RGBA8 palette (StructuredBuffer<uint> t2)
+    std::uint32_t*                    palettePtr = nullptr;      // persistent map into paletteBuf
     float*                            bnPtr      = nullptr;      // persistent map into blueNoiseBuf
     std::vector<float>                bnTile;                   // async-baked real tile (worker writes here)
     std::thread                       bnThread;                 // background void-and-cluster bake
@@ -631,11 +633,14 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     std::vector<std::uint32_t> scene = (voxels && voxels->size() == voxNeed) ? *voxels : GenerateScene(kGrid);
     d.voxelBuf = d.MakeUpload(scene.size() * sizeof(std::uint32_t));
     if (!d.voxelBuf) return false;
-    void* p = nullptr;
-    D3D12_RANGE none{0, 0};
-    d.voxelBuf->Map(0, &none, &p);
-    std::memcpy(p, scene.data(), scene.size() * sizeof(std::uint32_t));
-    d.voxelBuf->Unmap(0, nullptr);
+    D3D12_RANGE none{0, 0};  // read range "nothing" — used for all persistently-mapped upload buffers
+    {
+        void* p = nullptr;
+        d.voxelBuf->Map(0, &none, &p);
+        d.voxelPtr = static_cast<std::uint32_t*>(p);  // keep persistently mapped
+        std::memcpy(d.voxelPtr, scene.data(), scene.size() * sizeof(std::uint32_t));
+        // Do NOT Unmap — kept open for hot SetVoxels updates.
+    }
 
     // --- camera CBV (persistently mapped) ---
     d.camBuf = d.MakeUpload(256);
@@ -822,11 +827,13 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
 
         d.paletteBuf = d.MakeUpload(256 * sizeof(std::uint32_t));
         if (!d.paletteBuf) return false;
-        void* pp = nullptr;
-        D3D12_RANGE none2{0, 0};
-        d.paletteBuf->Map(0, &none2, &pp);
-        std::memcpy(pp, pal, 256 * sizeof(std::uint32_t));
-        d.paletteBuf->Unmap(0, nullptr);
+        {
+            void* pp = nullptr;
+            d.paletteBuf->Map(0, &none, &pp);
+            d.palettePtr = static_cast<std::uint32_t*>(pp);  // keep persistently mapped
+            std::memcpy(d.palettePtr, pal, 256 * sizeof(std::uint32_t));
+            // Do NOT Unmap — kept open for hot SetVoxels updates.
+        }
     }
 
     valid_ = true;
@@ -954,6 +961,33 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     d.WaitIdle();
 }
 
+void Renderer::SetVoxels(const std::vector<std::uint32_t>& grid, const std::uint32_t* palette256) {
+    if (!valid_) return;
+    Impl& d = *impl_;
+    d.WaitIdle();  // ensure GPU is not reading either buffer mid-frame
+
+    constexpr std::size_t kVoxels = static_cast<std::size_t>(kGrid) * kGrid * kGrid;
+    constexpr std::size_t kPalEntries = 256;
+
+    // Copy voxel grid (clamp to buffer size).
+    if (d.voxelPtr) {
+        const std::size_t toCopy = std::min(grid.size(), kVoxels);
+        std::memcpy(d.voxelPtr, grid.data(), toCopy * sizeof(std::uint32_t));
+        // Zero-fill any remainder (in case caller supplies a smaller grid).
+        if (toCopy < kVoxels)
+            std::memset(d.voxelPtr + toCopy, 0, (kVoxels - toCopy) * sizeof(std::uint32_t));
+    }
+
+    // Copy palette.
+    if (d.palettePtr && palette256) {
+        std::memcpy(d.palettePtr, palette256, kPalEntries * sizeof(std::uint32_t));
+    }
+
+    // Reset GI accumulation so the new geometry doesn't ghost.
+    d.accumFrame = 0;
+    d.accHave    = false;
+}
+
 void Renderer::Shutdown() {
     if (impl_) {
         // Join the background bake thread before tearing down DX12 resources.
@@ -977,6 +1011,7 @@ Renderer::Renderer() : impl_(std::make_unique<Impl>()) {}
 Renderer::~Renderer() {}
 bool Renderer::Init(void*, int, int, const std::vector<std::uint32_t>*, const std::uint32_t*) { return false; }
 void Renderer::RenderFrame(const FrameParams&) {}
+void Renderer::SetVoxels(const std::vector<std::uint32_t>&, const std::uint32_t*) {}
 void Renderer::Shutdown() {}
 }  // namespace vox::render
 

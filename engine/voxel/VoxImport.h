@@ -20,9 +20,8 @@
 
 namespace vox::voxel {
 
-// Default MagicaVoxel palette (index 0 unused; indices 1-255 are colours).
-// Each entry is RGBA (R at byte 0, G at 1, B at 2, A at 3).
-using VoxPalette = std::array<std::uint32_t, 256>;
+// VoxPalette is defined in VoxelWorld.h (included above).
+// 256-entry RGBA8 array; index 0 = empty/air, 1..255 = material colours.
 
 struct VoxScene {
     VoxelWorld world;         // populated voxels (material = palette index 1-255)

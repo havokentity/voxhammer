@@ -56,6 +56,12 @@ public:
 
     void RenderFrame(const FrameParams& fp);
 
+    // Hot-update the voxel grid and palette without restarting.
+    // grid must contain exactly kGrid^3 (64^3 = 262144) uint32 entries.
+    // palette256 must point to 256 RGBA8 uints (VoxPalette::data()).
+    // Call from the main thread (WaitIdle is used internally to sync the GPU).
+    void SetVoxels(const std::vector<std::uint32_t>& grid, const std::uint32_t* palette256);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
