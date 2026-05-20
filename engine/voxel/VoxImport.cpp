@@ -125,8 +125,14 @@ bool ParseVox(Reader& r, VoxScene& out) {
                 ++out.voxelCount;
             }
         } else if (matchTag(tag, "RGBA")) {
+            // MagicaVoxel spec: the on-disk color[i] (i = 0..254) maps to palette
+            // INDEX i+1 -- i.e. palette[i+1] = color[i]. Voxel material indices in
+            // XYZI are 1..255. The 256th on-disk entry (i==255) is unused. Reading
+            // straight into palette[i] shifts every colour by one slot (wrong hues)
+            // and leaves top-index voxels on the unused slot (renders black/missing).
             for (int i = 0; i < 256 && r.canRead(4); ++i) {
-                out.palette[i] = r.u32();
+                const std::uint32_t rgba = r.u32();
+                if (i < 255) out.palette[static_cast<std::size_t>(i) + 1] = rgba;
             }
         }
 
