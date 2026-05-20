@@ -109,9 +109,9 @@ void RegisterCoreCvars() {
     reg("voxel.streaming.horizon_meters", "256", "Voxel streaming horizon.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 64.0f, .range_max = 512.0f, .range_step = 8.0f});
     reg("voxel.lod.aggressive_eviction", "0", "Aggressively evict distant chunks.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("voxel.import_path", "", "MagicaVoxel .vox file to load at startup (empty = procedural demo scene).", {.type = CVarType::String, .flags = CVAR_ARCHIVE});
-    reg("voxel.cursor.x", "0", "3D cursor X for voxel.place (0..63).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 63, .range_step = 1});
-    reg("voxel.cursor.y", "0", "3D cursor Y for voxel.place (0..63).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 63, .range_step = 1});
-    reg("voxel.cursor.z", "0", "3D cursor Z for voxel.place (0..63).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 63, .range_step = 1});
+    reg("voxel.cursor.x", "0", "3D cursor X for voxel.place (0..127).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 127, .range_step = 1});
+    reg("voxel.cursor.y", "0", "3D cursor Y for voxel.place (0..127).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 127, .range_step = 1});
+    reg("voxel.cursor.z", "0", "3D cursor Z for voxel.place (0..127).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 127, .range_step = 1});
     reg("audio.master_volume", "0.8", "Master output volume.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
     reg("camera.pos", "32 40 -24", "Free-fly camera position (world units).", {.type = CVarType::Vec3, .flags = CVAR_ARCHIVE});
     reg("camera.yaw", "0.0", "Camera yaw (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = -3.1416f, .range_max = 3.1416f, .range_step = 0.02f});
@@ -178,7 +178,7 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
         Console& cc = Console::Get();
         float p[3] = {0.0f, 0.0f, 0.0f};
         if (CVar* cp = cc.FindCVar("camera.pos")) ParseRGB(cp->value, p[0], p[1], p[2]);
-        auto clampi = [](float v) { int i = static_cast<int>(std::lround(v)); return i < 0 ? 0 : (i > 63 ? 63 : i); };
+        auto clampi = [](float v) { int i = static_cast<int>(std::lround(v)); return i < 0 ? 0 : (i > 127 ? 127 : i); };
         int x = clampi(p[0]), y = clampi(p[1]), z = clampi(p[2]);
         cc.SetCVarOverride("voxel.cursor.x", std::to_string(x));
         cc.SetCVarOverride("voxel.cursor.y", std::to_string(y));
@@ -339,7 +339,7 @@ int main(int argc, char** argv) {
     if (CVar* ip = console.FindCVar("voxel.import_path"); ip && !ip->value.empty()) {
         if (vox::voxel::LoadVox(ip->value, vs)) {
             world = std::move(vs.world);
-            voxelGrid = world.BakeFlatGrid(64);  // 64 = renderer kGrid
+            voxelGrid = world.BakeFlatGrid(vox::voxel::kWorldDim);
             haveVoxels = true;
             palettePtr = vs.palette.data();
             vox::log::Info("voxel: imported {} ({} voxels, {} chunks)", ip->value, vs.voxelCount, world.ResidentChunks());
@@ -391,7 +391,7 @@ int main(int argc, char** argv) {
                 vox::voxel::VoxScene vs;
                 if (vox::voxel::LoadVox(path, vs)) {
                     world.StampVox(vs.world, vs.palette, cx, cy, cz);
-                    auto grid = world.BakeFlatGrid(64);
+                    auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
                     renderer.SetVoxels(grid, world.Palette().data());
                     o.Format("placed {} at ({},{},{}) - {} voxels", path, cx, cy, cz, vs.voxelCount);
                 } else {
@@ -403,7 +403,7 @@ int main(int argc, char** argv) {
             "Clear all voxels from the world.",
             [&world, &renderer](std::span<const std::string_view>, Output& o) {
                 world.Clear();
-                auto grid = world.BakeFlatGrid(64);
+                auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
                 renderer.SetVoxels(grid, world.Palette().data());
                 o.Print("voxel world cleared");
             });

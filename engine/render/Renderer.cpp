@@ -4,6 +4,7 @@
 
 #include "platform/Log.h"
 #include "platform/Platform.h"
+#include "voxel/VoxelWorld.h"
 
 #if defined(VOX_HAVE_DX12)
 
@@ -31,7 +32,7 @@ using Microsoft::WRL::ComPtr;
 namespace vox::render {
 namespace {
 
-constexpr UINT kGrid = 64;  // 64^3 procedural voxel volume
+constexpr UINT kGrid = vox::voxel::kWorldDim;  // 128^3 voxel volume
 
 // Full-screen-triangle VS + DDA voxel-raymarch PS. Compiled at runtime with
 // D3DCompile (SM 5.1 DXBC -> accepted by DX12), so no DXC dependency.
@@ -152,7 +153,7 @@ bool occludedRay(float3 p, float3 d, int maxSteps) {
 float softShadow(float3 hp, float3 nrm, float3 sunD, float2 screenPos) {
     [branch] if (shadowSoftness < 1e-4) {
         // Hard shadow fast path.
-        return occludedRay(hp + nrm * 0.02, sunD, 160) ? 0.0 : 1.0;
+        return occludedRay(hp + nrm * 0.02, sunD, 256) ? 0.0 : 1.0;
     }
 
     // Build a tangent frame around sunDir to jitter within the cone.
@@ -181,7 +182,7 @@ float softShadow(float3 hp, float3 nrm, float3 sunD, float2 screenPos) {
 
         float2 d   = vogelDisk((int)effIdx, N, rot) * (tanS * radMul);
         float3 dir = normalize(sunD + st * d.x + sb * d.y);
-        lit += occludedRay(hp + nrm * 0.02, dir, 160) ? 0.0 : 1.0;
+        lit += occludedRay(hp + nrm * 0.02, dir, 256) ? 0.0 : 1.0;
     }
     return lit / float(N);
 }
@@ -293,7 +294,7 @@ float2 sampleXi(float2 screenPos, int frame, int saltK) {
 float3 directSun(float3 hp, float3 nrm, float3 sd) {
     float ndl = saturate(dot(nrm, sd));
     if (ndl <= 0.0) return float3(0,0,0);
-    float vis = occludedRay(hp + nrm * 0.02, sd, 200) ? 0.0 : 1.0;
+    float vis = occludedRay(hp + nrm * 0.02, sd, 256) ? 0.0 : 1.0;
     return float3(1.15, 1.06, 0.90) * (ndl * vis);
 }
 
@@ -324,7 +325,7 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
         float3 bd   = normalize(nrm * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
         float3 bhp, bnrm; uint bmat;
         float3 indirect;
-        if (traceVoxel(hp + nrm * 0.02, bd, 128, bhp, bnrm, bmat)) {
+        if (traceVoxel(hp + nrm * 0.02, bd, 256, bhp, bnrm, bmat)) {
             indirect = palette(bmat) * directSun(bhp, bnrm, sunDir);  // light off the bounce surface (color bleed)
         } else {
             indirect = sky(bd);                                       // sky/ambient from that direction
@@ -344,7 +345,7 @@ float4 PSMain(VSOut i) : SV_Target {
 
     float3 hp, nrm; uint mat;
     float3 col;
-    if (!traceVoxel(ro, rd, 512, hp, nrm, mat)) {
+    if (!traceVoxel(ro, rd, 768, hp, nrm, mat)) {
         col = sky(rd);
     } else if (lightingMode == 1) {
         col = giRadiance(hp, nrm, mat, i.pos.xy);
@@ -401,14 +402,24 @@ struct CamCB {
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
     std::vector<std::uint32_t> v(static_cast<size_t>(g) * g * g, 0);
+    // Scale all geometry proportionally with grid size so the demo fills the
+    // volume like it did at 64^3: terrain height ~g*0.34, sphere at
+    // (g*0.69, g*0.66, g*0.625), radius ~g*0.125.
+    const float fg = float(g);
+    const float baseH  = fg * 0.34f;  // terrain base height
+    const float ampH   = fg * 0.125f; // terrain amplitude
+    const float sphCx  = fg * 0.69f;
+    const float sphCy  = fg * 0.66f;
+    const float sphCz  = fg * 0.625f;
+    const float sphR2  = (fg * 0.125f) * (fg * 0.125f);  // radius^2
     for (UINT z = 0; z < g; ++z)
         for (UINT x = 0; x < g; ++x) {
-            float h = 22.0f + 8.0f * std::sin(x * 0.20f) * std::cos(z * 0.18f);
+            float h = baseH + ampH * std::sin(x * 0.20f) * std::cos(z * 0.18f);
             for (UINT y = 0; y < g; ++y) {
                 std::uint32_t m = 0;
-                if (y < h) m = (y > h - 1.5f) ? 1u : (y > h - 5.0f ? 2u : 3u);
-                float dx = float(x) - 44, dy = float(y) - 42, dz = float(z) - 40;
-                if (dx * dx + dy * dy + dz * dz < 64.0f) m = 4;  // floating sphere r=8 (casts a clear shadow)
+                if (float(y) < h) m = (float(y) > h - 1.5f) ? 1u : (float(y) > h - 5.0f ? 2u : 3u);
+                float dx = float(x) - sphCx, dy = float(y) - sphCy, dz = float(z) - sphCz;
+                if (dx * dx + dy * dy + dz * dz < sphR2) m = 4;  // floating sphere (casts a clear shadow)
                 v[size_t(z) * g * g + size_t(y) * g + x] = m;
             }
         }
