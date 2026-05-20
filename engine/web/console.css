@@ -30,7 +30,13 @@ body {
     background: radial-gradient(1100px 760px at 85% -12%, var(--glow), transparent 60%), linear-gradient(180deg, var(--bg2), var(--bg));
     display: grid; grid-template-rows: auto 1fr auto; overflow: hidden;
     -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent;
+    /* Chrome/labels/telemetry are display-only -- no text-selection or I-beam.
+       Selection is re-enabled below only where copy/edit is meaningful. */
+    user-select: none; -webkit-user-select: none;
 }
+/* Copyable / editable: the log (you'd copy lines) + any text field. These get
+   the I-beam back. */
+.log, .log *, input, textarea { user-select: text; -webkit-user-select: text; cursor: text; }
 .fx { position: fixed; inset: 0; pointer-events: none; z-index: 0; }
 [data-skin="tactical"] .fx { background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px); background-size: 34px 34px; mask-image: radial-gradient(ellipse 95% 85% at 50% 35%, #000 35%, transparent 95%); }
 [data-skin="tactical"] .fx::after { content: ""; position: absolute; inset: 0; background: repeating-linear-gradient(0deg, rgba(0,0,0,.16) 0 1px, transparent 1px 3px); opacity: .3; mix-blend-mode: multiply; }
