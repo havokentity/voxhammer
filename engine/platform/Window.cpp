@@ -94,10 +94,10 @@ void* Window::NativeHandle() const { return win_ ? static_cast<void*>(glfwGetWin
 Window::CameraInput Window::PollCameraInput() {
     CameraInput ci;
     if (!win_) return ci;
-    bool rmb = glfwGetMouseButton(win_, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+    bool look = glfwGetMouseButton(win_, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
     double mx = 0, my = 0;
     glfwGetCursorPos(win_, &mx, &my);
-    if (rmb) {
+    if (look) {
         ci.active = true;
         auto kd = [&](int k) { return glfwGetKey(win_, k) == GLFW_PRESS ? 1.0f : 0.0f; };
         ci.move_strafe = kd(GLFW_KEY_D) - kd(GLFW_KEY_A);

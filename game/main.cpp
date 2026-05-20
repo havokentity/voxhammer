@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
                     Console::Get().Execute(line);
                 });
             });
-            vox::log::Info("camera: hold RIGHT-MOUSE + WASD/QE to fly (Shift=fast); mouse looks");
+            vox::log::Info("camera: hold LEFT-MOUSE + WASD/QE to fly (Shift=fast); mouse looks");
         }
     }
 
@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
         float dt = std::chrono::duration<float>(now - prev).count();
         prev = now;
 
-        // Fly-cam: hold RIGHT-MOUSE + WASD/QE to move, mouse to look, Shift=fast.
+        // Fly-cam: hold LEFT-MOUSE + WASD/QE to move, mouse to look, Shift=fast.
         // Writes the camera.* cvars (so the web console reflects it live).
         if (hasWindow) {
             pf::Window::CameraInput ci = window.PollCameraInput();

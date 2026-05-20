@@ -37,7 +37,7 @@ public:
     void DispatchKey(const std::string& key, std::uint32_t mods);
 
     // Editor-style fly-cam input, polled per frame. Movement/look are only
-    // active while the right mouse button is held (so the cursor is otherwise
+    // active while the left mouse button is held (so the cursor is otherwise
     // free). WASD = move, Q/E = down/up, Shift = fast, mouse = look.
     struct CameraInput {
         float move_strafe = 0.0f;  // A/D (-1..1)
@@ -46,7 +46,7 @@ public:
         float look_dx = 0.0f;      // cursor delta px (while RMB held)
         float look_dy = 0.0f;
         bool  fast = false;        // Shift held
-        bool  active = false;      // RMB held
+        bool  active = false;      // LMB held
     };
     CameraInput PollCameraInput();
 
