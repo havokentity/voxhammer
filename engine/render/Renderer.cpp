@@ -3,6 +3,7 @@
 #include "render/Renderer.h"
 
 #include "platform/Log.h"
+#include "platform/Platform.h"
 
 #if defined(VOX_HAVE_DX12)
 
@@ -15,6 +16,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -641,6 +644,26 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     {
         constexpr int BN = 64;
         constexpr int BN2 = BN * BN;
+        std::vector<float> bn(BN2);
+
+        // Bake the void-and-cluster tile at most once per machine; cache it in the
+        // user data dir so later boots load instantly (generation costs a few seconds).
+        const std::filesystem::path cachePath =
+            std::filesystem::path(vox::platform::UserDataDir()) / "bluenoise64.bin";
+        bool loaded = false;
+        {
+            std::ifstream cacheIn(cachePath, std::ios::binary);
+            if (cacheIn) {
+                cacheIn.read(reinterpret_cast<char*>(bn.data()), std::streamsize(BN2 * sizeof(float)));
+                if (cacheIn.gcount() == std::streamsize(BN2 * sizeof(float))) {
+                    loaded = true;
+                    vox::log::Info("DX12: loaded cached blue-noise tile");
+                }
+            }
+        }
+
+        if (!loaded) {
+        vox::log::Info("DX12: baking blue-noise tile (one-time, a few seconds)...");
 
         // Gaussian kernel sigma for cluster/void energy (wrapping toroidal distance).
         auto energy = [&](const std::vector<int>& pat, int cx, int cy) -> float {
@@ -729,9 +752,14 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
             cur[voidIdx]  = 1;
         }
 
-        std::vector<float> bn(BN2);
         for (int i = 0; i < BN2; ++i)
             bn[i] = (rank[i] >= 0) ? (float(rank[i]) + 0.5f) / float(BN2) : 0.0f;
+
+        std::error_code mkec;
+        std::filesystem::create_directories(cachePath.parent_path(), mkec);
+        std::ofstream of(cachePath, std::ios::binary);
+        if (of) of.write(reinterpret_cast<const char*>(bn.data()), std::streamsize(BN2 * sizeof(float)));
+        }  // end if (!loaded)
 
         d.blueNoiseBuf = d.MakeUpload(static_cast<UINT64>(BN2) * sizeof(float));
         if (!d.blueNoiseBuf) return false;
