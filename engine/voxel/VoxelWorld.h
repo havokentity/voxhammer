@@ -2,16 +2,97 @@
 // Copyright (c) 2026 Rajesh D'Monte
 #pragma once
 
+#include <array>
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
 namespace vox::voxel {
 
-// Sparse 32^3 chunk world (chunk -> 8^3 brick hierarchy), 0.1 m voxels,
-// 8-bit material + 8-bit palette + 4-bit state. DirectStorage + GDeflate
-// streaming, .vox import, and ISPC destruction land in M1/M2. Stub this pass.
+// ---------------------------------------------------------------------------
+// Chunk constants
+// ---------------------------------------------------------------------------
+inline constexpr unsigned kChunkSize = 32;  // voxels per side
+inline constexpr unsigned kChunkVoxels = kChunkSize * kChunkSize * kChunkSize;
+
+// ---------------------------------------------------------------------------
+// ChunkCoord  (integer grid coordinates of a chunk)
+// ---------------------------------------------------------------------------
+struct ChunkCoord {
+    int x = 0, y = 0, z = 0;
+    bool operator==(const ChunkCoord& o) const noexcept {
+        return x == o.x && y == o.y && z == o.z;
+    }
+};
+
+struct ChunkCoordHash {
+    std::size_t operator()(const ChunkCoord& c) const noexcept {
+        // FNV-style mix of three ints
+        std::size_t h = 2166136261ULL;
+        auto mix = [&](int v) { h ^= static_cast<std::size_t>(v + 0x80000000U); h *= 16777619ULL; };
+        mix(c.x); mix(c.y); mix(c.z);
+        return h;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Chunk  – flat 32^3 array of 8-bit material IDs; 0 = empty
+// ---------------------------------------------------------------------------
+struct Chunk {
+    std::array<std::uint8_t, kChunkVoxels> mats{};
+
+    std::uint8_t  Get(unsigned lx, unsigned ly, unsigned lz) const noexcept {
+        return mats[lz * kChunkSize * kChunkSize + ly * kChunkSize + lx];
+    }
+    void Set(unsigned lx, unsigned ly, unsigned lz, std::uint8_t m) noexcept {
+        mats[lz * kChunkSize * kChunkSize + ly * kChunkSize + lx] = m;
+    }
+    bool Empty() const noexcept {
+        for (auto v : mats) if (v) return false;
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// VoxelWorld  – sparse chunk map; voxels addressed by world-space integer coords
+// ---------------------------------------------------------------------------
 class VoxelWorld {
 public:
     void Init();
     void Shutdown();
-    unsigned ResidentChunks() const { return 0; }
+
+    // Set/get a voxel by absolute world-space integer coordinate.
+    void SetVoxel(int x, int y, int z, std::uint8_t mat);
+    std::uint8_t GetVoxel(int x, int y, int z) const noexcept;
+
+    // Number of live (non-evicted) chunks in the resident map.
+    unsigned ResidentChunks() const { return static_cast<unsigned>(chunks_.size()); }
+
+    // Clear all voxel data.
+    void Clear();
+
+    // Produce the flat uint32 grid that the DX12 renderer reads via StructuredBuffer<uint>.
+    // Encoding (matches Renderer.cpp GenerateScene / HLSL PSMain):
+    //   index = z * dim * dim + y * dim + x
+    //   value = material id as uint32_t (0 = empty)
+    // dim is clamped to the bounding box of populated voxels; pass an explicit dim
+    // to force a specific cube size (e.g. 64 to match the renderer's kGrid=64).
+    std::vector<std::uint32_t> BakeFlatGrid(unsigned dim) const;
+
+    // World-space bounds of all set voxels (min inclusive, max exclusive).
+    void Bounds(int& xmin, int& ymin, int& zmin,
+                int& xmax, int& ymax, int& zmax) const noexcept;
+
+private:
+    using ChunkMap = std::unordered_map<ChunkCoord, Chunk, ChunkCoordHash>;
+    ChunkMap chunks_;
+
+    static ChunkCoord WorldToChunk(int x, int y, int z) noexcept;
+    static void       ChunkLocal(int x, int y, int z,
+                                 unsigned& lx, unsigned& ly, unsigned& lz) noexcept;
+
+    Chunk& GetOrCreateChunk(const ChunkCoord& cc);
+    const Chunk* FindChunk(const ChunkCoord& cc) const noexcept;
 };
 
 }  // namespace vox::voxel

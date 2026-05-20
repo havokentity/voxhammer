@@ -14,3 +14,4 @@ endfunction()
 
 vox_add_test(cvar_roundtrip SOURCES cvar_roundtrip_test.cpp LINK vox_cvar)
 vox_add_test(ispc_kernel    SOURCES ispc_kernel_test.cpp    LINK vox_ispc)
+vox_add_test(voxel SOURCES voxel_test.cpp LINK vox_voxel)
