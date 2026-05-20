@@ -22,10 +22,16 @@ extern "C" const unsigned long web_console_css_size;
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <vector>
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include <civetweb.h>
 #include <nlohmann/json.hpp>
@@ -184,6 +190,13 @@ struct ConsoleServer::Impl {
     int ttl_seconds = 3600;
     bool tls = false;
     std::uint16_t port = 27960;
+
+    // TCP line-protocol automation listener.
+    SOCKET line_sock = INVALID_SOCKET;
+    std::thread line_thread;
+    std::vector<std::thread> line_workers;
+    std::atomic<bool> line_run{false};
+    bool wsa_started = false;
 
     bool OriginAllowed(const char* origin) const {
         if (!origin) return true;  // non-browser (raw) clients send no Origin
@@ -402,6 +415,100 @@ void ConsoleServer::HandleMessage(const mg_connection* conn, const std::string& 
     }
 }
 
+// ---- TCP line protocol ----------------------------------------------------
+void ConsoleServer::StartLineServer() {
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        vox::log::Warn("console: WSAStartup failed; TCP automation disabled");
+        return;
+    }
+    impl_->wsa_started = true;
+    SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
+        vox::log::Warn("console: line socket() failed");
+        return;
+    }
+    BOOL yes = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(config_.line_port);
+    InetPtonA(AF_INET, config_.bind_address.c_str(), &addr.sin_addr);
+    if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR || ::listen(s, 4) == SOCKET_ERROR) {
+        vox::log::Warn("console: line bind/listen on {}:{} failed", config_.bind_address, config_.line_port);
+        closesocket(s);
+        return;
+    }
+    impl_->line_sock = s;
+    impl_->line_run = true;
+    impl_->line_thread = std::thread([this] { LineAcceptLoop(); });
+    vox::log::Info("console: TCP automation listening on {}:{} (password on first line)", config_.bind_address,
+                   config_.line_port);
+}
+
+void ConsoleServer::LineAcceptLoop() {
+    while (impl_->line_run.load()) {
+        SOCKET c = ::accept(impl_->line_sock, nullptr, nullptr);
+        if (c == INVALID_SOCKET) {
+            if (!impl_->line_run.load()) break;
+            continue;
+        }
+        DWORD tmo = 1000;  // 1s recv timeout so workers notice shutdown
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+        impl_->line_workers.emplace_back([this, c] { LineClientLoop(static_cast<std::uintptr_t>(c)); });
+    }
+}
+
+void ConsoleServer::LineClientLoop(std::uintptr_t client) {
+    SOCKET sock = static_cast<SOCKET>(client);
+    std::string buf;
+    auto readLine = [&](std::string& out) -> bool {
+        for (;;) {
+            auto nl = buf.find('\n');
+            if (nl != std::string::npos) {
+                out = buf.substr(0, nl);
+                if (!out.empty() && out.back() == '\r') out.pop_back();
+                buf.erase(0, nl + 1);
+                return true;
+            }
+            char tmp[512];
+            int n = ::recv(sock, tmp, sizeof(tmp), 0);
+            if (n > 0) {
+                buf.append(tmp, n);
+                continue;
+            }
+            if (n == 0) return false;  // peer closed
+            if (!impl_->line_run.load()) return false;
+            if (WSAGetLastError() == WSAETIMEDOUT) continue;
+            return false;
+        }
+    };
+    auto sendStr = [&](const std::string& s) { ::send(sock, s.data(), static_cast<int>(s.size()), 0); };
+
+    std::string pw;
+    if (!readLine(pw) || !VerifyPassword(pw, config_.password_hash)) {
+        sendStr("error: authentication failed\n");
+        closesocket(sock);
+        return;
+    }
+    sendStr("ok: authenticated\n");
+
+    std::string line;
+    while (impl_->line_run.load() && readLine(line)) {
+        if (line.empty()) continue;
+        if (line == "quit" || line == "exit") break;
+        auto prom = std::make_shared<std::promise<std::string>>();
+        auto fut = prom->get_future();
+        console_->QueueTask([this, line, prom] {
+            ExecuteResult r = console_->Execute(line);
+            prom->set_value(r.ok ? (r.output.empty() ? "ok\n" : r.output + "\n") : ("error: " + r.error + "\n"));
+        });
+        if (fut.wait_for(std::chrono::seconds(2)) == std::future_status::ready) sendStr(fut.get());
+        else sendStr("error: timeout\n");
+    }
+    closesocket(sock);
+}
+
 // ---- lifecycle ------------------------------------------------------------
 ConsoleServer::ConsoleServer() : impl_(std::make_unique<Impl>()) {}
 ConsoleServer::~ConsoleServer() { Stop(); }
@@ -484,8 +591,9 @@ bool ConsoleServer::Start(const Config& cfg, Console* console) {
     });
 
     running_ = true;
-    vox::log::Info("console: serving {}://{}:{}/  (TCP automation port {} TODO)", impl_->tls ? "https" : "http",
-                   config_.bind_address, config_.http_port, config_.line_port);
+    StartLineServer();
+    vox::log::Info("console: serving {}://{}:{}/", impl_->tls ? "https" : "http", config_.bind_address,
+                   config_.http_port);
     return true;
 }
 
@@ -495,6 +603,21 @@ void ConsoleServer::Stop() {
     if (impl_->ctx) {
         mg_stop(impl_->ctx);
         impl_->ctx = nullptr;
+    }
+    // Tear down the TCP line server.
+    impl_->line_run = false;
+    if (impl_->line_sock != INVALID_SOCKET) {
+        closesocket(impl_->line_sock);
+        impl_->line_sock = INVALID_SOCKET;
+    }
+    if (impl_->line_thread.joinable()) impl_->line_thread.join();
+    for (auto& w : impl_->line_workers) {
+        if (w.joinable()) w.join();
+    }
+    impl_->line_workers.clear();
+    if (impl_->wsa_started) {
+        WSACleanup();
+        impl_->wsa_started = false;
     }
     running_ = false;
 }

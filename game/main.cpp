@@ -72,6 +72,10 @@ void RegisterCoreCvars() {
     reg("voxel.streaming.horizon_meters", "256", "Voxel streaming horizon.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 64.0f, .range_max = 512.0f, .range_step = 8.0f});
     reg("voxel.lod.aggressive_eviction", "0", "Aggressively evict distant chunks.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("audio.master_volume", "0.8", "Master output volume.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
+    reg("camera.pos", "32 40 -24", "Free-fly camera position (world units).", {.type = CVarType::Vec3, .flags = CVAR_ARCHIVE});
+    reg("camera.yaw", "0.0", "Camera yaw (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = -3.1416f, .range_max = 3.1416f, .range_step = 0.02f});
+    reg("camera.pitch", "-0.5", "Camera pitch (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = -1.5f, .range_max = 1.5f, .range_step = 0.02f});
+    reg("camera.fov", "1.2", "Camera vertical FOV (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.4f, .range_max = 2.4f, .range_step = 0.02f});
     reg("editor.active", "0", "Editor mode (vs play).", {.type = CVarType::Bool});
     reg("debug.show_brick_grid", "0", "Overlay the brick grid.", {.type = CVarType::Bool, .flags = CVAR_DEVELOPER});
     reg("debug.show_physx_wireframe", "0", "Overlay PhysX collision wireframe.", {.type = CVarType::Bool, .flags = CVAR_DEVELOPER});
@@ -281,9 +285,13 @@ int main(int argc, char** argv) {
         prev = now;
 
         if (renderer.Valid()) {
-            float r, g, b;
-            ParseRGB(console.FindCVar("renderer.debug.clear_color")->value, r, g, b);
-            renderer.RenderFrame(r, g, b);  // vsync caps the loop
+            vox::render::FrameParams fp;
+            ParseRGB(console.FindCVar("renderer.debug.clear_color")->value, fp.clear[0], fp.clear[1], fp.clear[2]);
+            ParseRGB(console.FindCVar("camera.pos")->value, fp.cam_pos[0], fp.cam_pos[1], fp.cam_pos[2]);
+            fp.cam_yaw = console.FindCVar("camera.yaw")->GetFloat();
+            fp.cam_pitch = console.FindCVar("camera.pitch")->GetFloat();
+            fp.cam_fov = console.FindCVar("camera.fov")->GetFloat();
+            renderer.RenderFrame(fp);  // vsync caps the loop
         }
 
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTele).count() >= 100) {

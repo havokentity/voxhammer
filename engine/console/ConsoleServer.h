@@ -77,6 +77,13 @@ private:
     void HandleMessage(const mg_connection* conn, const std::string& text);  // main thread
     void SendWs(const mg_connection* conn, const std::string& text);
 
+    // TCP line-protocol automation (port line_port): plain socket on
+    // bind_address, password-authed on the first line, then one console line
+    // per line. Dedicated threads; execs route through Console::QueueTask.
+    void StartLineServer();
+    void LineAcceptLoop();
+    void LineClientLoop(std::uintptr_t client);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
     Config   config_;

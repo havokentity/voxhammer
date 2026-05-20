@@ -12,5 +12,5 @@ vox_configure_target(vox_render)
 # window feature. Full Agility/DirectStorage/DXR/DLSS land in M1/M4.
 if(VOX_ENABLE_WINDOW)
     target_compile_definitions(vox_render PRIVATE VOX_HAVE_DX12=1)
-    target_link_libraries(vox_render PRIVATE d3d12 dxgi dxguid)
+    target_link_libraries(vox_render PRIVATE d3d12 dxgi dxguid d3dcompiler)
 endif()

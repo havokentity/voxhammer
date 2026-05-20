@@ -6,11 +6,22 @@
 
 namespace vox::render {
 
-// Minimal DX12 presenter for the M0 window bring-up: device + flip-discard
-// swapchain + per-frame clear to a color, then present. The full voxel path
-// tracer (DXR brickmap AS, ReSTIR, DLSS/FSR) lands in M1/M4. DX12 types are
-// PIMPL'd out of this header. When the window/DX12 feature is off, this is a
-// no-op stub (Init returns false) and the engine runs headless.
+// Per-frame inputs the renderer needs from the engine (filled from cvars in
+// main): the clear/sky color and a free-fly camera.
+struct FrameParams {
+    float clear[3]   = {0.05f, 0.05f, 0.08f};
+    float cam_pos[3] = {32.0f, 40.0f, -24.0f};
+    float cam_yaw    = 0.0f;    // radians, around +Y
+    float cam_pitch  = -0.5f;   // radians
+    float cam_fov    = 1.2f;    // radians (vertical)
+    float time_sec   = 0.0f;
+};
+
+// DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen
+// fragment pass that DDA-raymarches a procedural voxel volume (StructuredBuffer
+// SRV) with a free-fly camera. This is the foundation the DXR brickmap path
+// tracer (ReSTIR, DLSS/FSR) replaces in M1/M4. DX12 types are PIMPL'd out.
+// When the window/DX12 feature is off this is a no-op stub.
 class Renderer {
 public:
     Renderer();
@@ -22,8 +33,7 @@ public:
     void Shutdown();
     bool Valid() const { return valid_; }
 
-    // Clear the backbuffer to (r,g,b) in 0..1 and present.
-    void RenderFrame(float r, float g, float b);
+    void RenderFrame(const FrameParams& fp);
 
 private:
     struct Impl;
