@@ -560,6 +560,26 @@ int main(int argc, char** argv) {
             });
     }
 
+    // Reset all non-readonly cvars to their registered defaults and persist.
+    {
+        Console& c = Console::Get();
+        c.RegisterCommand("cvars.reset",
+            "Reset all user-tunable cvars to factory defaults and save cvars.toml. "
+            "Read-only cvars (ports, password hash) are skipped.",
+            [&console, cvars_path = args.cvars_path](std::span<const std::string_view>, Output& o) {
+                // Collect (name, default_value) pairs first -- never mutate during enumeration.
+                std::vector<std::pair<std::string, std::string>> resets;
+                console.EnumerateCVars("", [&resets](CVar& cv) {
+                    if (cv.flags & CVAR_READONLY) return;
+                    resets.emplace_back(cv.name, cv.default_value);
+                });
+                for (const auto& [name, def] : resets)
+                    console.SetCVarOverride(name, def);
+                console.SaveCvarsToml(cvars_path);
+                o.Format("reset {} settings to defaults", resets.size());
+            });
+    }
+
     // Web drag-drop .vox upload handler.
     // Called on the main thread (via QueueTask / Drain) -- SetVoxels is safe.
     server.SetVoxUploadHandler([&](std::string name, std::vector<std::uint8_t> bytes) {

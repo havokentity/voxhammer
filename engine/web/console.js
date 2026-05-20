@@ -109,6 +109,7 @@ const ABILITY_DEFS = [
     { name: "lua", ico: "✦", lbl: "Lua" },
     { name: "bluenoise.clear_cache", ico: "⟲", lbl: "Clear BN", danger: true, hold: 1100 },
     { name: "open_data_folder", ico: "📂", lbl: "AppData" },
+    { name: "cvars.reset", ico: "↺", lbl: "Reset Cfg", danger: true, hold: 1100 },
     { name: "keybindings.reset", ico: "⌫", lbl: "Reset Keys", danger: true, hold: 1100 },
     { name: "quit", ico: "⏻", lbl: "Quit", danger: true },
 ];
