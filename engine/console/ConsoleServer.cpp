@@ -102,6 +102,32 @@ std::string QueryParam(const char* qs, const std::string& name) {
     return n > 0 ? std::string(buf, n) : std::string{};
 }
 
+// Standard base64 decoder (~15 lines). Returns true on success.
+// Ignores whitespace; rejects invalid characters.
+bool Base64Decode(const std::string& in, std::vector<std::uint8_t>& out) {
+    static const int8_t T[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-2,-2,-2,-2,-2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-3,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    };
+    out.clear(); out.reserve((in.size() / 4) * 3);
+    std::uint32_t acc = 0; int bits = 0;
+    for (unsigned char c : in) {
+        int8_t v = T[c];
+        if (v == -2) continue;          // whitespace
+        if (v == -3) break;             // '=' padding: stop
+        if (v == -1) return false;      // invalid char
+        acc = (acc << 6) | static_cast<unsigned>(v); bits += 6;
+        if (bits >= 8) { bits -= 8; out.push_back(static_cast<std::uint8_t>(acc >> bits)); }
+    }
+    return true;
+}
+
 #if defined(VOX_HAVE_TLS)
 std::string Sha256Fingerprint(X509* cert) {
     unsigned char md[EVP_MAX_MD_SIZE];
@@ -418,6 +444,28 @@ void ConsoleServer::HandleMessage(const mg_connection* conn, const std::string& 
                 else it->second.erase(t.get<std::string>());
             }
         }
+    } else if (type == "load_vox") {
+        // Decode and hand off to app on main thread (same thread we are on now).
+        if (!vox_upload_handler_) {
+            reply({{"ok", false}, {"error", "no vox upload handler registered"}});
+            return;
+        }
+        std::string name = msg.value("name", "unknown.vox");
+        std::string b64  = msg.value("data", "");
+        static constexpr std::size_t kMaxVoxBytes = 16 * 1024 * 1024;  // 16 MB
+        std::vector<std::uint8_t> bytes;
+        if (!Base64Decode(b64, bytes)) {
+            reply({{"ok", false}, {"error", "load_vox: base64 decode failed"}});
+            return;
+        }
+        if (bytes.size() > kMaxVoxBytes) {
+            reply({{"ok", false}, {"error", "load_vox: file too large (max 16 MB)"}});
+            return;
+        }
+        // We are already on the main thread (HandleMessage is called from QueueTask
+        // via WsData -> console_->QueueTask -> Drain). Invoke the handler directly.
+        vox_upload_handler_(std::move(name), std::move(bytes));
+        reply({{"ok", true}});
     } else {
         reply({{"ok", false}, {"error", "unknown message type: " + type}});
     }
@@ -678,6 +726,10 @@ std::string ConsoleServer::ListSessions() const {
     return out;
 }
 
+void ConsoleServer::SetVoxUploadHandler(std::function<void(std::string, std::vector<std::uint8_t>)> fn) {
+    vox_upload_handler_ = std::move(fn);
+}
+
 }  // namespace vox::console
 
 #else  // ---- console server disabled (stub) ----
@@ -704,6 +756,7 @@ void ConsoleServer::BroadcastEvent(std::string_view, std::string_view) {}
 void ConsoleServer::RotateCert() {}
 void ConsoleServer::RotateSessions() {}
 std::string ConsoleServer::ListSessions() const { return {}; }
+void ConsoleServer::SetVoxUploadHandler(std::function<void(std::string, std::vector<std::uint8_t>)>) {}
 }  // namespace vox::console
 
 #endif

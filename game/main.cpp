@@ -445,6 +445,23 @@ int main(int argc, char** argv) {
             });
     }
 
+    // Web drag-drop .vox upload handler.
+    // Called on the main thread (via QueueTask / Drain) -- SetVoxels is safe.
+    server.SetVoxUploadHandler([&](std::string name, std::vector<std::uint8_t> bytes) {
+        vox::voxel::VoxScene vs;
+        if (vox::voxel::LoadVoxFromMemory(bytes.data(), bytes.size(), vs)) {
+            int cx = console.FindCVar("voxel.cursor.x") ? console.FindCVar("voxel.cursor.x")->GetInt() : 0;
+            int cy = console.FindCVar("voxel.cursor.y") ? console.FindCVar("voxel.cursor.y")->GetInt() : 0;
+            int cz = console.FindCVar("voxel.cursor.z") ? console.FindCVar("voxel.cursor.z")->GetInt() : 0;
+            world.StampVox(vs.world, vs.palette, cx, cy, cz);
+            auto grid = world.BakeFlatGrid(64);
+            renderer.SetVoxels(grid, world.Palette().data());
+            vox::log::Info("voxel: dropped {} ({} voxels) at ({},{},{})", name, vs.voxelCount, cx, cy, cz);
+        } else {
+            vox::log::Warn("voxel: bad .vox upload {}", name);
+        }
+    });
+
     // Engine loop.
     vox::log::Info("entering main loop ({})", hasWindow ? "windowed" : "headless");
     using clk = std::chrono::steady_clock;

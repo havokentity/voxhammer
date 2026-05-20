@@ -11,9 +11,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 struct mg_context;
 struct mg_connection;
@@ -56,6 +58,11 @@ public:
     // Set after 20 failed auths; the engine loop should Stop() the server.
     bool UnbindRequested() const;
 
+    // Register a callback invoked on the main thread (via QueueTask) when a
+    // load_vox WS message arrives and passes auth+size checks.
+    // Mirror of SetCVarChangeSink -- call before Start().
+    void SetVoxUploadHandler(std::function<void(std::string name, std::vector<std::uint8_t> bytes)> fn);
+
     // Push a telemetry event to clients subscribed to `topic`. Envelope:
     // {"type":"event","topic":..,"ts":..,"data":<data_json>}
     void BroadcastEvent(std::string_view topic, std::string_view data_json);
@@ -89,6 +96,7 @@ private:
     Config   config_;
     Console* console_ = nullptr;
     bool     running_ = false;
+    std::function<void(std::string, std::vector<std::uint8_t>)> vox_upload_handler_;
 };
 
 }  // namespace vox::console
