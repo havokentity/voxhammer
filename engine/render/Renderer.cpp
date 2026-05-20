@@ -388,6 +388,17 @@ float3 directSun(float3 hp, float3 nrm, float3 sd) {
     return float3(1.15, 1.06, 0.90) * (ndl * vis);
 }
 
+// Bright sky-dome irradiance used ONLY for GI indirect bounces. Decoupled from
+// the background sky()/clearCol (kept dark by the user) so QUALITY GI gets real
+// fill light instead of the near-black background -- otherwise shadowed/sky-
+// facing surfaces (which PERFORMANCE fills with `ambient`) go black under GI.
+// The `ambient` cvar is the fill-strength knob, same role as in PERFORMANCE.
+float3 giSky(float3 rd) {
+    float up = saturate(rd.y * 0.5 + 0.5);
+    float3 dome = lerp(float3(0.85, 0.90, 1.00), float3(0.42, 0.60, 1.00), up);  // pale horizon -> blue zenith
+    return dome * (ambient * 2.0);
+}
+
 // One-bounce diffuse path-traced radiance at the primary hit.
 // giSamples indirect bounces are averaged per frame; temporal accumulation converges the result.
 float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
@@ -418,7 +429,7 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
         if (traceVoxel(hp + nrm * 0.02, bd, 256, bhp, bnrm, bmat)) {
             indirect = palette(bmat) * directSun(bhp, bnrm, sunDir);  // light off the bounce surface (color bleed)
         } else {
-            indirect = sky(bd);                                       // sky/ambient from that direction
+            indirect = giSky(bd);                                     // bright sky-dome fill (not the dark background)
         }
         indirectSum += indirect;
     }

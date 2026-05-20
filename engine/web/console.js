@@ -674,7 +674,7 @@ function captureKey(btn) {
 // lighting mode.  Cards are kept in their stable positions — the caller adds a
 // `ctrl-inactive` class instead of removing them from the DOM.
 const LIGHTING_INACTIVE_PERFORMANCE = new Set(["renderer.gi.samples"]);
-const LIGHTING_INACTIVE_QUALITY     = new Set(["renderer.ao.samples", "renderer.ao.strength", "renderer.ao.radius", "renderer.ambient"]);
+const LIGHTING_INACTIVE_QUALITY     = new Set(["renderer.ao.samples", "renderer.ao.strength", "renderer.ao.radius"]);
 function isInactiveForLightingMode(name) {
     const mode = (state.cvars.get("renderer.lighting.mode") || {}).value || "PERFORMANCE";
     if (mode === "PERFORMANCE") return LIGHTING_INACTIVE_PERFORMANCE.has(name);
