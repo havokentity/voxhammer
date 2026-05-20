@@ -91,6 +91,32 @@ void Window::RequestClose() { if (win_) glfwSetWindowShouldClose(win_, GLFW_TRUE
 void Window::PollEvents() { if (win_) glfwPollEvents(); }
 void* Window::NativeHandle() const { return win_ ? static_cast<void*>(glfwGetWin32Window(win_)) : nullptr; }
 
+Window::CameraInput Window::PollCameraInput() {
+    CameraInput ci;
+    if (!win_) return ci;
+    bool rmb = glfwGetMouseButton(win_, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+    double mx = 0, my = 0;
+    glfwGetCursorPos(win_, &mx, &my);
+    if (rmb) {
+        ci.active = true;
+        auto kd = [&](int k) { return glfwGetKey(win_, k) == GLFW_PRESS ? 1.0f : 0.0f; };
+        ci.move_strafe = kd(GLFW_KEY_D) - kd(GLFW_KEY_A);
+        ci.move_up = kd(GLFW_KEY_E) - kd(GLFW_KEY_Q);
+        ci.move_fwd = kd(GLFW_KEY_W) - kd(GLFW_KEY_S);
+        ci.fast = glfwGetKey(win_, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(win_, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+        if (looking_) {
+            ci.look_dx = static_cast<float>(mx - last_cx_);
+            ci.look_dy = static_cast<float>(my - last_cy_);
+        }
+        looking_ = true;
+    } else {
+        looking_ = false;
+    }
+    last_cx_ = mx;
+    last_cy_ = my;
+    return ci;
+}
+
 }  // namespace vox::platform
 
 #else  // ---- headless stub ----
@@ -102,6 +128,7 @@ bool Window::ShouldClose() const { return true; }
 void Window::RequestClose() {}
 void Window::PollEvents() {}
 void* Window::NativeHandle() const { return nullptr; }
+Window::CameraInput Window::PollCameraInput() { return {}; }
 }  // namespace vox::platform
 
 #endif

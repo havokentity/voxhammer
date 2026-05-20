@@ -16,8 +16,10 @@
 #include "platform/Window.h"
 #include "render/Renderer.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <optional>
@@ -264,6 +266,7 @@ int main(int argc, char** argv) {
                     Console::Get().Execute(line);
                 });
             });
+            vox::log::Info("camera: hold RIGHT-MOUSE + WASD/QE to fly (Shift=fast); mouse looks");
         }
     }
 
@@ -284,6 +287,34 @@ int main(int argc, char** argv) {
         auto now = clk::now();
         float dt = std::chrono::duration<float>(now - prev).count();
         prev = now;
+
+        // Fly-cam: hold RIGHT-MOUSE + WASD/QE to move, mouse to look, Shift=fast.
+        // Writes the camera.* cvars (so the web console reflects it live).
+        if (hasWindow) {
+            pf::Window::CameraInput ci = window.PollCameraInput();
+            if (ci.active && (ci.move_strafe || ci.move_up || ci.move_fwd || ci.look_dx || ci.look_dy)) {
+                float yaw = console.FindCVar("camera.yaw")->GetFloat();
+                float pitch = console.FindCVar("camera.pitch")->GetFloat();
+                float pos[3] = {0, 0, 0};
+                ParseRGB(console.FindCVar("camera.pos")->value, pos[0], pos[1], pos[2]);
+                const float sens = 0.0025f, PI = 3.14159265f;
+                yaw += ci.look_dx * sens;
+                pitch -= ci.look_dy * sens;
+                while (yaw > PI) yaw -= 2 * PI;
+                while (yaw < -PI) yaw += 2 * PI;
+                pitch = std::clamp(pitch, -1.5f, 1.5f);
+                float cp = std::cos(pitch), sp = std::sin(pitch), cy = std::cos(yaw), sy = std::sin(yaw);
+                float fwd[3] = {cp * sy, sp, cp * cy};
+                float rl = std::sqrt(fwd[0] * fwd[0] + fwd[2] * fwd[2]);
+                float right[3] = {rl > 1e-5f ? -fwd[2] / rl : 1.0f, 0.0f, rl > 1e-5f ? fwd[0] / rl : 0.0f};
+                float speed = (ci.fast ? 46.0f : 15.0f) * dt;
+                for (int i = 0; i < 3; ++i)
+                    pos[i] += (right[i] * ci.move_strafe + (i == 1 ? ci.move_up : 0.0f) + fwd[i] * ci.move_fwd) * speed;
+                console.SetCVarOverride("camera.yaw", fmt::format("{:.4f}", yaw));
+                console.SetCVarOverride("camera.pitch", fmt::format("{:.4f}", pitch));
+                console.SetCVarOverride("camera.pos", fmt::format("{:.2f} {:.2f} {:.2f}", pos[0], pos[1], pos[2]));
+            }
+        }
 
         if (renderer.Valid()) {
             vox::render::FrameParams fp;

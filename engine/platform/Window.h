@@ -36,11 +36,27 @@ public:
     // free C callback can reach it without a friend declaration.
     void DispatchKey(const std::string& key, std::uint32_t mods);
 
+    // Editor-style fly-cam input, polled per frame. Movement/look are only
+    // active while the right mouse button is held (so the cursor is otherwise
+    // free). WASD = move, Q/E = down/up, Shift = fast, mouse = look.
+    struct CameraInput {
+        float move_strafe = 0.0f;  // A/D (-1..1)
+        float move_up = 0.0f;      // Q/E
+        float move_fwd = 0.0f;     // S/W
+        float look_dx = 0.0f;      // cursor delta px (while RMB held)
+        float look_dy = 0.0f;
+        bool  fast = false;        // Shift held
+        bool  active = false;      // RMB held
+    };
+    CameraInput PollCameraInput();
+
 private:
     GLFWwindow* win_ = nullptr;
     int width_ = 0;
     int height_ = 0;
     KeyHandler key_handler_;
+    double last_cx_ = 0.0, last_cy_ = 0.0;
+    bool looking_ = false;
 };
 
 }  // namespace vox::platform
