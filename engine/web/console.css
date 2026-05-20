@@ -433,3 +433,21 @@ body {
     .palette-search-wrap input { font-size: 16px; } /* avoid iOS zoom */
     .palette-btn { width: 44px; height: 44px; }
 }
+
+/* ---------- .vox drag-drop upload card ---------- */
+.vox-upload-card { gap: 10px; }
+.vox-dropzone {
+    display: flex; align-items: center; justify-content: center;
+    height: 72px; border-radius: var(--r); border: 2px dashed var(--edge-hi);
+    color: var(--faint); font-size: 12px; letter-spacing: .5px;
+    background: var(--panel-2); cursor: pointer;
+    transition: border-color .15s, color .15s, background .15s;
+    user-select: none; -webkit-user-select: none;
+}
+.vox-dropzone:hover { border-color: var(--accent); color: var(--accent); background: rgba(110,139,255,.06); }
+.vox-dropzone.vox-drop-hover {
+    border-color: var(--accent); color: var(--on-accent);
+    background: var(--accent); box-shadow: 0 0 18px -4px var(--glow);
+}
+[data-skin="tactical"] .vox-dropzone { border-radius: 0; }
+.vox-btn-row { display: flex; gap: 8px; flex-wrap: wrap; }

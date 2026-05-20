@@ -108,6 +108,50 @@ const ABILITY_DEFS = [
     { name: "quit", ico: "⏻", lbl: "Quit", danger: true },
 ];
 
+// ---------- base64 encoder (handles large buffers in 8 KB chunks) ----------
+function bytesToBase64(bytes) {
+    const CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    let out = "";
+    const CHUNK = 8192;  // process in chunks to avoid call stack overflow
+    for (let i = 0; i < u8.length; i += CHUNK) {
+        const slice = u8.subarray(i, Math.min(i + CHUNK, u8.length));
+        out += String.fromCharCode(...slice);
+    }
+    return btoa(out);
+}
+
+// ---------- .vox upload via WS ----------
+function sendVoxFile(file) {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+        const b64 = bytesToBase64(new Uint8Array(ev.target.result));
+        if (state.demo) {
+            pushLog("info", "(demo) would load " + file.name + " (" + file.size + " bytes)");
+            return;
+        }
+        bus.send({ type: "load_vox", name: file.name, data: b64 });
+        pushLog("info", "uploading " + file.name + " (" + (file.size / 1024).toFixed(1) + " KB)...", "echo");
+    };
+    reader.onerror = () => pushLog("error", "FileReader error for " + file.name);
+    reader.readAsArrayBuffer(file);
+}
+
+function attachVoxDropZone(el) {
+    el.addEventListener("dragover", (e) => {
+        if ([...e.dataTransfer.items].some((i) => i.kind === "file")) {
+            e.preventDefault(); el.classList.add("vox-drop-hover");
+        }
+    });
+    el.addEventListener("dragleave", () => el.classList.remove("vox-drop-hover"));
+    el.addEventListener("drop", (e) => {
+        e.preventDefault(); el.classList.remove("vox-drop-hover");
+        const files = [...e.dataTransfer.files].filter((f) => f.name.toLowerCase().endsWith(".vox"));
+        if (!files.length) { pushLog("warn", "drop a .vox file"); return; }
+        for (const f of files) sendVoxFile(f);
+    });
+}
+
 // ---------- colour helpers (clear_color is "r g b" floats 0..1) ----------
 function floatsToHex(s) {
     const p = String(s).trim().split(/\s+/).map(Number);
@@ -431,6 +475,8 @@ function renderDeck() {
     $("#deck-icon").textContent = meta.icon;
     $("#deck-name").textContent = meta.label || state.cat;
     const host = $("#controls"); host.innerHTML = "";
+    // Inject the vox upload card at the top of the World (voxel) deck.
+    if (state.cat === "voxel") { const vc = buildVoxCard(); vc.style.gridColumn = "1 / -1"; host.appendChild(vc); }
     let list = visibleCvars();
     // Context-sensitive inactive state: in the Render (and Pinned) category, cards
     // that don't apply to the current lighting mode are kept in their stable
@@ -706,6 +752,55 @@ function renderGraphicsDeck() {
     }
     advSection.appendChild(grid);
     host.appendChild(advSection);
+}
+
+// ---------- vox drop / upload card (injected at the top of the World deck) ----------
+function buildVoxCard() {
+    const card = el("div", "ctrl vox-upload-card");
+
+    // Header
+    const head = el("div", "ctrl-head");
+    head.innerHTML = `<span class="ctrl-name"><span class="ctrl-cat">voxel.</span>drop &amp; place</span>`;
+    card.appendChild(head);
+
+    // Drop zone
+    const zone = el("div", "vox-dropzone", "Drop a .vox file here");
+    zone.id = "vox-dropzone";
+    attachVoxDropZone(zone);
+    card.appendChild(zone);
+
+    // File picker button
+    const fileInput = el("input");
+    fileInput.type = "file"; fileInput.accept = ".vox"; fileInput.style.display = "none";
+    fileInput.multiple = false;
+    fileInput.onchange = () => { if (fileInput.files.length) sendVoxFile(fileInput.files[0]); fileInput.value = ""; };
+    card.appendChild(fileInput);
+
+    const btnRow = el("div", "vox-btn-row");
+
+    const pick = el("button", "seg-opt", "Browse .vox…");
+    pick.type = "button";
+    pick.onclick = () => fileInput.click();
+    btnRow.appendChild(pick);
+
+    const place = el("button", "seg-opt", "Place");
+    place.type = "button";
+    place.title = "exec voxel.place (stamp voxel.import_path at cursor)";
+    place.onclick = () => { pushLog("info", "❯ voxel.place", "echo"); bus.send({ type: "exec", line: "voxel.place" }); };
+    btnRow.appendChild(place);
+
+    const clear = el("button", "seg-opt", "Clear");
+    clear.type = "button";
+    clear.title = "exec voxel.clear (wipe the world)";
+    clear.onclick = () => { if (!confirm("Clear voxel world?")) return; pushLog("info", "❯ voxel.clear", "echo"); bus.send({ type: "exec", line: "voxel.clear" }); };
+    btnRow.appendChild(clear);
+
+    card.appendChild(btnRow);
+
+    const desc = el("div", "ctrl-desc", "Drag-drop a .vox or browse — stamped at voxel.cursor.x/y/z. Place re-stamps import_path; Clear wipes world.");
+    card.appendChild(desc);
+
+    return card;
 }
 
 // ---------- resources + telemetry ----------
