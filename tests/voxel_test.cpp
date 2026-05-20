@@ -183,15 +183,15 @@ TEST_CASE("VoxImport: parse minimal in-memory .vox") {
     CHECK(scene.world.ResidentChunks() >= 1);
 
     // Materials at expected positions
-    CHECK(scene.world.GetVoxel(1, 2, 3) == 1);
+    CHECK(scene.world.GetVoxel(1, 3, 2) == 1);  // vox (1,2,3) -> world (1,3,2): MagicaVoxel Z-up -> engine Y-up
     CHECK(scene.world.GetVoxel(0, 0, 0) == 2);
     CHECK(scene.world.GetVoxel(3, 3, 3) == 3);
     CHECK(scene.world.GetVoxel(2, 2, 2) == 0);  // not set
 
-    // BakeFlatGrid round-trip: voxel (1,2,3) at index 3*4*4+2*4+1 = 57
+    // BakeFlatGrid round-trip: vox (1,2,3) -> world (1,3,2) at index 2*4*4+3*4+1 = 45
     auto grid = scene.world.BakeFlatGrid(4);
     REQUIRE(grid.size() == 64u);
-    CHECK(grid[3u * 4u * 4u + 2u * 4u + 1u] == 1u);  // (1,2,3)
+    CHECK(grid[2u * 4u * 4u + 3u * 4u + 1u] == 1u);  // world (1,3,2)
     CHECK(grid[0u * 4u * 4u + 0u * 4u + 0u] == 2u);  // (0,0,0)
     CHECK(grid[3u * 4u * 4u + 3u * 4u + 3u] == 3u);  // (3,3,3)
 }

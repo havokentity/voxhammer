@@ -117,9 +117,11 @@ bool ParseVox(Reader& r, VoxScene& out) {
                 const std::uint8_t z = r.u8();
                 std::uint8_t       m = r.u8();
                 if (m == 0) m = 1;  // spec: palette index 0 unused in XYZI; clamp
+                // MagicaVoxel is Z-up; the engine is Y-up. Swap Y/Z so the model
+                // stands upright (vox z -> world y = up, vox y -> world z = depth).
                 out.world.SetVoxel(static_cast<int>(x),
-                                   static_cast<int>(y),
-                                   static_cast<int>(z), m);
+                                   static_cast<int>(z),
+                                   static_cast<int>(y), m);
                 ++out.voxelCount;
             }
         } else if (matchTag(tag, "RGBA")) {

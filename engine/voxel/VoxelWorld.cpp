@@ -73,6 +73,20 @@ void VoxelWorld::StampVox(const VoxelWorld& srcWorld, const VoxPalette& srcPalet
     int xmin, ymin, zmin, xmax, ymax, zmax;
     srcWorld.Bounds(xmin, ymin, zmin, xmax, ymax, zmax);
 
+    // Clamp the placement offset so the WHOLE model fits in [0,kMaxCoord) instead of
+    // clipping to a thin slice when the cursor sits near an edge (max bounds are
+    // exclusive). If the model is larger than the grid on an axis, align its min to 0
+    // (the far side still clips -- the 64^3 world is the hard limit for now).
+    auto fitOffset = [&](int off, int lo, int hiExcl) -> int {
+        const int minOff = -lo;                 // so dest-min (off+lo) >= 0
+        const int maxOff = kMaxCoord - hiExcl;  // so dest-max (off+hiExcl-1) <= kMaxCoord-1
+        if (minOff > maxOff) return minOff;      // model bigger than the grid on this axis
+        return off < minOff ? minOff : (off > maxOff ? maxOff : off);
+    };
+    ox = fitOffset(ox, xmin, xmax);
+    oy = fitOffset(oy, ymin, ymax);
+    oz = fitOffset(oz, zmin, zmax);
+
     for (int wz = zmin; wz < zmax; ++wz) {
         for (int wy = ymin; wy < ymax; ++wy) {
             for (int wx = xmin; wx < xmax; ++wx) {
