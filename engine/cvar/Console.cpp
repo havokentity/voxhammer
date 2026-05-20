@@ -128,6 +128,9 @@ std::string Console::ApplySet(CVar& cv, std::string_view value, bool override_re
     if (cv.on_change) {
         cv.on_change(cv);
     }
+    if (change_sink_) {
+        change_sink_(cv);
+    }
     return {};
 }
 

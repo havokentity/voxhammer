@@ -148,6 +148,11 @@ public:
     void QueueTask(std::function<void()> task);
     void Drain();
 
+    // Fires after ANY successful cvar change (set/override), from any source.
+    // The ConsoleServer wires this to broadcast a "cvar" event so changes from
+    // keybindings / TCP / another client appear live in every web client.
+    void SetCVarChangeSink(std::function<void(const CVar&)> sink) { change_sink_ = std::move(sink); }
+
     // --- Persistence (TOML, ADR-001) --------------------------------------
     // Save: writes [meta].schema_version + a [cvars] table of every
     // CVAR_ARCHIVE cvar whose value differs from default, plus any unknown
@@ -176,6 +181,7 @@ private:
 
     std::mutex                          task_mutex_;
     std::vector<std::function<void()>>  tasks_;
+    std::function<void(const CVar&)>    change_sink_;
 
     // Keys present in a loaded cvars.toml that didn't match a registered cvar.
     // Preserved verbatim so a save round-trips a forward-compatible file.

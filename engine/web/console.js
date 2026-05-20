@@ -611,6 +611,14 @@ function onMessage(msg) {
     } else if (msg.type === "event") {
         if (msg.topic === "frame_stats") onFrameStats(msg.data || {});
         else if (msg.topic === "log" && msg.data) pushLog(msg.data.level || "info", msg.data.message || "", "evt");
+        else if (msg.topic === "cvar" && msg.data && msg.data.name) {
+            // Live update from another source (keybinding/TCP/other client).
+            const cur = state.cvars.get(msg.data.name);
+            state.cvars.set(msg.data.name, msg.data);
+            // Only rebuild the widget if the value actually changed -- avoids
+            // interrupting an in-progress drag echoing our own set.
+            if (!cur || cur.value !== msg.data.value) { syncControl(msg.data.name); updateViewport(); }
+        }
     }
 }
 
@@ -618,7 +626,7 @@ function onMessage(msg) {
 let booted = false;
 function boot() {
     if (booted) return; booted = true;
-    bus.send({ type: "list_cvars" }); bus.send({ type: "list_commands" }); bus.send({ type: "subscribe", topics: ["log", "frame_stats"] });
+    bus.send({ type: "list_cvars" }); bus.send({ type: "list_commands" }); bus.send({ type: "subscribe", topics: ["log", "frame_stats", "cvar"] });
     pushLog("info", state.demo ? "demo mode — no live engine; driving an in-page mock" : "connected to engine");
 }
 function init() {

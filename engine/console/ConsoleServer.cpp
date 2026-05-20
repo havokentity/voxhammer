@@ -589,6 +589,9 @@ bool ConsoleServer::Start(const Config& cfg, Console* console) {
     vox::log::SetSink([this](vox::log::Level lvl, const std::string& body) {
         BroadcastEvent("log", json{{"level", vox::log::LevelName(lvl)}, {"message", body}}.dump());
     });
+    // Broadcast every cvar change (keybindings / TCP / other clients) so all
+    // web clients update live -- not just the one that made the change.
+    console_->SetCVarChangeSink([this](const CVar& cv) { BroadcastEvent("cvar", CvarToJson(cv).dump()); });
 
     running_ = true;
     StartLineServer();
@@ -600,6 +603,7 @@ bool ConsoleServer::Start(const Config& cfg, Console* console) {
 void ConsoleServer::Stop() {
     if (!running_) return;
     vox::log::SetSink({});
+    if (console_) console_->SetCVarChangeSink({});
     if (impl_->ctx) {
         mg_stop(impl_->ctx);
         impl_->ctx = nullptr;
