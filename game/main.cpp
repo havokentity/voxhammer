@@ -173,6 +173,17 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
     c.RegisterCommand("reload_scene", "Reload the current scene (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("reload_scene: stub"); });
     c.RegisterCommand("physics.dump_islands", "Dump active PhysX islands (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("0 active islands"); });
     c.RegisterCommand("voxel.dump_chunks", "Dump resident voxel chunks (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("0 chunks resident"); });
+    c.RegisterCommand("setcursor", "Snap the voxel placement cursor (voxel.cursor.*) to the current camera position.", [](std::span<const std::string_view>, Output& o) {
+        Console& cc = Console::Get();
+        float p[3] = {0.0f, 0.0f, 0.0f};
+        if (CVar* cp = cc.FindCVar("camera.pos")) ParseRGB(cp->value, p[0], p[1], p[2]);
+        auto clampi = [](float v) { int i = static_cast<int>(std::lround(v)); return i < 0 ? 0 : (i > 63 ? 63 : i); };
+        int x = clampi(p[0]), y = clampi(p[1]), z = clampi(p[2]);
+        cc.SetCVarOverride("voxel.cursor.x", std::to_string(x));
+        cc.SetCVarOverride("voxel.cursor.y", std::to_string(y));
+        cc.SetCVarOverride("voxel.cursor.z", std::to_string(z));
+        o.Format("cursor set to ({}, {}, {})", x, y, z);
+    });
     // `lua` command is registered by ScriptHost::Init() (engine/script) when scripting is enabled.
 
     c.RegisterCommand("console.rotate_cert", "Regenerate the TLS cert.", [&server](std::span<const std::string_view>, Output& o) { server.RotateCert(); o.Print("ok"); });

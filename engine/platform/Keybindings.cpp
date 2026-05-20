@@ -22,6 +22,7 @@ std::vector<KeyBinding> DefaultBindings() {
         {"F4", MOD_NONE, "cvar.toggle debug.show_physx_wireframe"},
         {"F5", MOD_NONE, "cvar.toggle debug.pause_simulation"},
         {"F6", MOD_NONE, "command physics.dump_islands"},
+        {"F7", MOD_NONE, "command setcursor"},
         {"F11", MOD_NONE, "cvar.toggle renderer.hdr.enabled"},
         {"PrintScreen", MOD_NONE, "command pix_capture_next_frame"},
     };
