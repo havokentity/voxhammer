@@ -23,6 +23,11 @@ inline constexpr unsigned kChunkSize = 32;  // voxels per side
 inline constexpr unsigned kChunkVoxels = kChunkSize * kChunkSize * kChunkSize;
 
 // ---------------------------------------------------------------------------
+// World grid dimension  (single shared constant; renderer + world use this)
+// ---------------------------------------------------------------------------
+inline constexpr unsigned kWorldDim = 128;  // 128^3 voxel grid
+
+// ---------------------------------------------------------------------------
 // ChunkCoord  (integer grid coordinates of a chunk)
 // ---------------------------------------------------------------------------
 struct ChunkCoord {
@@ -81,7 +86,7 @@ public:
     // Stamp a source VoxScene's voxels into this world at offset (ox,oy,oz).
     // Additive: existing voxels are NOT erased.  Source palette entries are merged
     // into the world's global palette (palette_); indices are remapped accordingly.
-    // Coordinates outside [0,64) are clipped (matches the renderer's 64^3 grid).
+    // Coordinates outside [0,kWorldDim) are clipped (matches the renderer's grid).
     void StampVox(const VoxelWorld& srcWorld, const VoxPalette& srcPalette,
                   int ox, int oy, int oz);
 
@@ -93,7 +98,7 @@ public:
     //   index = z * dim * dim + y * dim + x
     //   value = material id as uint32_t (0 = empty)
     // dim is clamped to the bounding box of populated voxels; pass an explicit dim
-    // to force a specific cube size (e.g. 64 to match the renderer's kGrid=64).
+    // to force a specific cube size (e.g. kWorldDim to match the renderer's kGrid).
     std::vector<std::uint32_t> BakeFlatGrid(unsigned dim) const;
 
     // World-space bounds of all set voxels (min inclusive, max exclusive).
