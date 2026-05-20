@@ -64,6 +64,7 @@ void RegisterCoreCvars() {
     reg("renderer.hdr.peak_nits", "1000", "HDR peak luminance target.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 400, .range_max = 4000, .range_step = 50});
     reg("renderer.debug.clear_color", "0.05 0.05 0.08", "Swapchain clear color (RGB 0..1).", {.type = CVarType::Color, .flags = CVAR_ARCHIVE});
     reg("renderer.vsync", "1", "Vertical sync.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("renderer.exposure", "1.0", "Render exposure (pre-tonemap multiplier).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.1f, .range_max = 4.0f, .range_step = 0.05f});
     reg("physics.gpu_rigids.enabled", "1", "GPU rigid bodies (NVIDIA).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("physics.gpu_rigids.max_islands", "10000", "Max active dynamic islands.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 256, .range_max = 16384, .range_step = 256});
     reg("physics.solver.position_iters", "8", "Solver position iterations.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
@@ -291,6 +292,8 @@ int main(int argc, char** argv) {
             fp.cam_yaw = console.FindCVar("camera.yaw")->GetFloat();
             fp.cam_pitch = console.FindCVar("camera.pitch")->GetFloat();
             fp.cam_fov = console.FindCVar("camera.fov")->GetFloat();
+            fp.exposure = console.FindCVar("renderer.exposure")->GetFloat();
+            fp.hdr = console.FindCVar("renderer.hdr.enabled")->GetBool() ? 1 : 0;
             renderer.RenderFrame(fp);  // vsync caps the loop
         }
 

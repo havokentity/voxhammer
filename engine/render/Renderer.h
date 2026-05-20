@@ -15,6 +15,8 @@ struct FrameParams {
     float cam_pitch  = -0.5f;   // radians
     float cam_fov    = 1.2f;    // radians (vertical)
     float time_sec   = 0.0f;
+    float exposure   = 1.0f;
+    int   hdr        = 0;       // 1 = ACES tonemap (stand-in for HDR10 output)
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen

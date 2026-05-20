@@ -32,10 +32,12 @@ cbuffer Camera : register(b0) {
     float3 camFwd;   float timeSec;
     float3 camRight; float aspect;
     float3 camUp;    int   gridDim;
-    float3 clearCol; float pad0;
-    float2 viewport; float2 pad1;
+    float3 clearCol; float exposure;
+    float2 viewport; int   hdr; float pad;
 };
 StructuredBuffer<uint> Voxels : register(t0);
+
+static const float3 SUN = float3(0.4268, 0.8536, 0.2988);  // normalize(0.5,1.0,0.35)
 
 struct VSOut { float4 pos : SV_Position; };
 VSOut VSMain(uint vid : SV_VertexID) {
@@ -53,6 +55,37 @@ float3 palette(uint m) {
     return float3(0.7, 0.7, 0.7);
 }
 
+// Narkowicz ACES filmic tonemap.
+float3 tonemapACES(float3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+float3 sky(float3 rd) {
+    float k = saturate(rd.y);                       // 0 at horizon, 1 at zenith
+    return lerp(clearCol * 1.30, clearCol * 0.80, k);
+}
+
+// Shadow ray: DDA from p along d; true if it hits a solid voxel before exiting.
+bool occluded(float3 p, float3 d) {
+    if (abs(d.x) < 1e-5) d.x = 1e-5;
+    if (abs(d.y) < 1e-5) d.y = 1e-5;
+    if (abs(d.z) < 1e-5) d.z = 1e-5;
+    float3 cell = floor(p);
+    float3 s = sign(d);
+    float3 tD = abs(1.0 / d);
+    float3 tM = ((cell + (s * 0.5 + 0.5)) - p) / d;
+    [loop] for (int i = 0; i < 160; ++i) {
+        if (tM.x < tM.y && tM.x < tM.z) { cell.x += s.x; tM.x += tD.x; }
+        else if (tM.y < tM.z)           { cell.y += s.y; tM.y += tD.y; }
+        else                            { cell.z += s.z; tM.z += tD.z; }
+        if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
+            cell.x >= gridDim || cell.y >= gridDim || cell.z >= gridDim) return false;
+        if (Voxels[(uint)(cell.z * gridDim * gridDim + cell.y * gridDim + cell.x)] != 0) return true;
+    }
+    return false;
+}
+
 float4 PSMain(VSOut i) : SV_Target {
     float2 ndc = (i.pos.xy / viewport) * 2.0 - 1.0;
     ndc.y = -ndc.y;
@@ -63,38 +96,47 @@ float4 PSMain(VSOut i) : SV_Target {
     if (abs(rd.z) < 1e-5) rd.z = 1e-5;
     float3 ro = camPos;
 
-    // advance to the grid AABB [0, gridDim]
+    float3 col;
     float3 bmin = float3(0,0,0), bmax = float3(gridDim, gridDim, gridDim);
     float3 t0 = (bmin - ro) / rd, t1 = (bmax - ro) / rd;
     float3 ts = min(t0, t1), tb = max(t0, t1);
-    float tEnter = max(max(ts.x, ts.y), ts.z);
-    float tExit  = min(min(tb.x, tb.y), tb.z);
-    if (tExit < max(tEnter, 0.0)) return float4(clearCol, 1);
-    ro = ro + rd * (max(tEnter, 0.0) + 0.001);
+    float tBox  = max(max(ts.x, ts.y), ts.z);
+    float tExit = min(min(tb.x, tb.y), tb.z);
 
-    float3 cell = floor(ro);
-    float3 stepv = sign(rd);
-    float3 tDelta = abs(1.0 / rd);
-    float3 bound = cell + (stepv * 0.5 + 0.5);
-    float3 tMax = (bound - ro) / rd;
-    float3 nrm = float3(0,1,0);
-
-    [loop] for (int k = 0; k < 512; ++k) {
-        if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
-            cell.x >= gridDim || cell.y >= gridDim || cell.z >= gridDim) return float4(clearCol, 1);
-        uint idx = (uint)(cell.z * gridDim * gridDim + cell.y * gridDim + cell.x);
-        uint v = Voxels[idx];
-        if (v != 0) {
-            float3 sun = normalize(float3(0.5, 1.0, 0.35));
-            float ndl = saturate(dot(nrm, sun));
-            float3 col = palette(v) * (0.30 + 0.70 * ndl);
-            return float4(col, 1);
+    if (tExit < max(tBox, 0.0)) {
+        col = sky(rd);
+    } else {
+        ro = ro + rd * (max(tBox, 0.0) + 0.001);
+        float3 cell = floor(ro);
+        float3 stepv = sign(rd);
+        float3 tDelta = abs(1.0 / rd);
+        float3 tMax = ((cell + (stepv * 0.5 + 0.5)) - ro) / rd;
+        float3 nrm = float3(0, 1, 0);
+        float tEnter = 0.0;
+        bool hit = false; uint mat = 0;
+        [loop] for (int k = 0; k < 512; ++k) {
+            if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
+                cell.x >= gridDim || cell.y >= gridDim || cell.z >= gridDim) break;
+            uint v = Voxels[(uint)(cell.z * gridDim * gridDim + cell.y * gridDim + cell.x)];
+            if (v != 0) { hit = true; mat = v; break; }
+            if (tMax.x < tMax.y && tMax.x < tMax.z) { tEnter = tMax.x; cell.x += stepv.x; tMax.x += tDelta.x; nrm = float3(-stepv.x, 0, 0); }
+            else if (tMax.y < tMax.z)               { tEnter = tMax.y; cell.y += stepv.y; tMax.y += tDelta.y; nrm = float3(0, -stepv.y, 0); }
+            else                                    { tEnter = tMax.z; cell.z += stepv.z; tMax.z += tDelta.z; nrm = float3(0, 0, -stepv.z); }
         }
-        if (tMax.x < tMax.y && tMax.x < tMax.z) { cell.x += stepv.x; tMax.x += tDelta.x; nrm = float3(-stepv.x, 0, 0); }
-        else if (tMax.y < tMax.z)               { cell.y += stepv.y; tMax.y += tDelta.y; nrm = float3(0, -stepv.y, 0); }
-        else                                    { cell.z += stepv.z; tMax.z += tDelta.z; nrm = float3(0, 0, -stepv.z); }
+        if (hit) {
+            float3 hp = ro + rd * tEnter;
+            float ndl = saturate(dot(nrm, SUN));
+            float shadow = occluded(hp + nrm * 0.02, SUN) ? 0.0 : 1.0;
+            float3 alb = palette(mat);
+            col = alb * (0.28 + 0.72 * ndl * shadow);   // ambient + shadowed sun
+        } else {
+            col = sky(rd);
+        }
     }
-    return float4(clearCol, 1);
+
+    col *= exposure;
+    col = (hdr != 0) ? tonemapACES(col) : saturate(col);
+    return float4(col, 1.0);
 }
 )HLSL";
 
@@ -103,8 +145,8 @@ struct CamCB {
     float camFwd[3]; float timeSec;
     float camRight[3]; float aspect;
     float camUp[3]; int gridDim;
-    float clearCol[3]; float pad0;
-    float viewport[2]; float pad1[2];
+    float clearCol[3]; float exposure;
+    float viewport[2]; int hdr; float pad;
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -344,6 +386,8 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.timeSec = fp.time_sec;
     cb.aspect = d.height ? float(d.width) / float(d.height) : 1.0f;
     cb.gridDim = static_cast<int>(kGrid);
+    cb.exposure = fp.exposure;
+    cb.hdr = fp.hdr;
     cb.viewport[0] = float(d.width);
     cb.viewport[1] = float(d.height);
     std::memcpy(d.camPtr, &cb, sizeof(cb));
