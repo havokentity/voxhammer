@@ -31,7 +31,8 @@ struct FrameParams {
     int   dither          = 1;       // 1 = triangular dither before 8-bit output; 0 = off
     int   ao_samples      = 8;       // AO hemisphere rays (1..32)
     int   shadow_samples  = 12;      // soft-shadow cone rays (1..16)
-    int   gi_samples      = 1;       // QUALITY indirect bounce samples averaged per frame (1..8)
+    int   gi_samples      = 1;       // QUALITY indirect samples (paths) averaged per frame (1..8)
+    int   gi_bounces      = 3;       // QUALITY path depth: bounces light walks per path (0..5; 1 = single bounce)
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen

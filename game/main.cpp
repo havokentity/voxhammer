@@ -121,7 +121,7 @@ void Usage() {
 void RegisterCoreCvars() {
     Console& c = Console::Get();
     auto reg = [&](const char* n, const char* d, const char* desc, CVarParams p) { c.RegisterCVar(n, d, desc, std::move(p)); };
-    reg("renderer.gi.bounces", "3", "Diffuse GI bounce count.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 6, .range_step = 1});
+    reg("renderer.gi.bounces", "3", "QUALITY GI path depth: how many times light bounces per path (1 = single bounce, 2-3 fills enclosed rooms; higher = slower).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 5, .range_step = 1});
     reg("renderer.gi.restir.spatial_passes", "2", "ReSTIR GI spatial resampling passes.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 4, .range_step = 1});
     reg("renderer.upscaling.mode", "DLSS_Q", "Super-resolution / upscaler preset.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"DLSS_DLAA", "DLSS_Q", "DLSS_B", "DLSS_P", "DLSS_UP", "FSR_Q", "FSR_B", "FSR_P", "NATIVE"}});
     reg("renderer.frame_gen.factor", "OFF", "Frame-generation multiplier.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"OFF", "2X", "3X", "4X"}});
@@ -630,6 +630,7 @@ int main(int argc, char** argv) {
             fp.ao_samples = console.FindCVar("renderer.ao.samples")->GetInt();
             fp.shadow_samples = console.FindCVar("renderer.shadow.samples")->GetInt();
             fp.gi_samples = console.FindCVar("renderer.gi.samples")->GetInt();
+            fp.gi_bounces = console.FindCVar("renderer.gi.bounces")->GetInt();
             renderer.SetGiDenoise(console.FindCVar("renderer.gi.denoise")->GetBool());  // self-guards; resets accum only on toggle
             renderer.SetEmptySpaceSkip(console.FindCVar("renderer.empty_space_skip")->GetBool());  // self-guards
             renderer.SetGiDebug(console.FindCVar("renderer.gi.debug")->GetBool());  // self-guards

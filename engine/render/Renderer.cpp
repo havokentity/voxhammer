@@ -55,7 +55,7 @@ cbuffer Camera : register(b0) {
     float  aoStrength;     float aoRadius;     int lightingMode; int accumFrame; // row 7
     int    dither;         int aoSamples;      int shadowSamples; int giSamples;  // row 8
     int    giDenoise;      float giHistMax;    int emptySkip;     int brickDim;   // row 9
-    int    giDebug;        int   giPad10a;     int giPad10b;      int giPad10c;   // row 10
+    int    giDebug;        int   giBounces;    int giPad10b;      int giPad10c;   // row 10
 };
 StructuredBuffer<uint> Voxels : register(t0);
 RWStructuredBuffer<float4> Accum : register(u0);  // per-pixel GI accumulation: rgb + sample count
@@ -413,27 +413,41 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
     float3 sd  = normalize(sunDir + (st * cos(ang) + sb * sin(ang)) * rad);
     float3 direct = directSun(hp, nrm, sd);
 
-    // N cosine-weighted indirect bounces averaged per frame; temporal accumulation does convergence.
-    int    numBounces = clamp(giSamples, 1, 8);
+    // Indirect: average giSamples hemisphere PATHS, each up to giBounces deep.
+    // Light "walks" surface->surface (sun -> floor -> wall -> ...) so enclosed
+    // rooms fill in, not just directly sun-lit faces. Lambertian + cosine-
+    // weighted sampling => the per-bounce estimator weight is just the surface
+    // albedo (the pi/pdf cancel). depth==1 reproduces the old single-bounce look;
+    // depth>=2 is real multi-bounce GI. Temporal accumulation converges it.
+    int    numSamples = clamp(giSamples, 1, 8);
+    int    maxDepth   = clamp(giBounces, 0, 5);
     float3 indirectSum = float3(0, 0, 0);
-    float3 t, b; buildBasis(nrm, t, b);
-    [loop] for (int gi = 0; gi < numBounces; ++gi) {
-        // Per-bounce saltK: k=6,7 for gi=0; k=8,9 for gi=1; etc.
-        int saltK = 6 + gi * 2;
-        float2 xb   = sampleXi(screenPos, accumFrame, saltK);
-        float  cosT = sqrt(1.0 - xb.x), sinT = sqrt(xb.x);
-        float  phi  = xb.y * 6.2832;
-        float3 bd   = normalize(nrm * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
-        float3 bhp, bnrm; uint bmat;
-        float3 indirect;
-        if (traceVoxel(hp + nrm * 0.02, bd, 256, bhp, bnrm, bmat)) {
-            indirect = palette(bmat) * directSun(bhp, bnrm, sunDir);  // light off the bounce surface (color bleed)
-        } else {
-            indirect = giSky(bd);                                     // bright sky-dome fill (not the dark background)
+    int    kSalt = 6;
+    [loop] for (int s = 0; s < numSamples; ++s) {
+        float3 L    = float3(0, 0, 0);   // radiance gathered along this path
+        float3 beta = float3(1, 1, 1);   // throughput (running albedo product)
+        float3 ro   = hp + nrm * 0.02;
+        float3 n    = nrm;
+        [loop] for (int d = 0; d < maxDepth; ++d) {
+            float3 t, b; buildBasis(n, t, b);
+            float2 xb   = sampleXi(screenPos, accumFrame, kSalt); kSalt += 2;
+            float  cosT = sqrt(1.0 - xb.x), sinT = sqrt(xb.x);
+            float  phi  = xb.y * 6.2832;
+            float3 bd   = normalize(n * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
+            float3 qhp, qn; uint qm;
+            if (traceVoxel(ro, bd, 256, qhp, qn, qm)) {
+                L    += beta * palette(qm) * directSun(qhp, qn, sunDir);  // sun light at this surface
+                beta *= palette(qm);                                     // carry albedo for the next bounce
+                ro    = qhp + qn * 0.02;
+                n     = qn;
+            } else {
+                L += beta * giSky(bd);                                    // escaped to the sky -> stop
+                break;
+            }
         }
-        indirectSum += indirect;
+        indirectSum += L;
     }
-    float3 indirectAvg = indirectSum / float(numBounces);
+    float3 indirectAvg = indirectSum / float(numSamples);
     if (giDebug != 0) return indirectAvg;   // GI debug view: show ONLY the indirect bounce radiance
     return alb * (direct + indirectAvg);
 }
@@ -506,7 +520,7 @@ struct CamCB {
     float aoStrength;      float aoRadius;         int lightingMode; int accumFrame; // row 7
     int   dither;          int   aoSamples;        int shadowSamples; int giSamples; // row 8
     int   giDenoise;       float giHistMax;        int emptySkip; int brickDim;      // row 9
-    int   giDebug;         int   giPad10a;         int giPad10b; int giPad10c;        // row 10
+    int   giDebug;         int   giBounces;        int giPad10b; int giPad10c;        // row 10
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -1071,6 +1085,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.aoSamples      = std::max(1, std::min(fp.ao_samples,     32));
     cb.shadowSamples  = std::max(1, std::min(fp.shadow_samples, 16));
     cb.giSamples      = std::max(1, std::min(fp.gi_samples,      8));
+    cb.giBounces      = std::max(0, std::min(fp.gi_bounces,      5));
 
     // Temporal accumulation with motion-adaptive denoise.
     //
@@ -1085,12 +1100,13 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     const float camKey[6] = {
         fp.cam_pos[0], fp.cam_pos[1], fp.cam_pos[2], fp.cam_yaw, fp.cam_pitch, fp.cam_fov,
     };
-    const float sceneKey[17] = {
+    const float sceneKey[18] = {
         fp.sun[0], fp.sun[1], fp.sun[2], fp.exposure, fp.ambient,
         fp.clear[0], fp.clear[1], fp.clear[2], fp.shadow_softness, fp.ao_strength, fp.ao_radius,
         static_cast<float>(fp.lighting_mode), static_cast<float>(fp.hdr),
         static_cast<float>(fp.dither), static_cast<float>(fp.ao_samples),
         static_cast<float>(fp.shadow_samples), static_cast<float>(fp.gi_samples),
+        static_cast<float>(fp.gi_bounces),
     };
     const bool sceneSame = d.accHave && std::memcmp(sceneKey, d.accSceneKey, sizeof(sceneKey)) == 0;
     const bool camSame   = d.accHave && std::memcmp(camKey,   d.accCamKey,   sizeof(camKey))   == 0;
