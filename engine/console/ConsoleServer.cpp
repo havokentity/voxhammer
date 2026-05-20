@@ -390,10 +390,18 @@ void ConsoleServer::HandleMessage(const mg_connection* conn, const std::string& 
     } else if (type == "set_cvar") {
         std::string name = msg.value("name", "");
         std::string value = msg.value("value", "");
-        ExecuteResult r = console_->Execute(name + " " + value);
-        json out{{"ok", r.ok}};
-        if (!r.error.empty()) out["error"] = r.error;
-        if (CVar* cv = console_->FindCVar(name)) out["cvar"] = CvarToJson(*cv);
+        // Set the value DIRECTLY (not via the command-line Execute): "name " + ""
+        // parses as a QUERY so an empty value never cleared, and a value with
+        // spaces (e.g. a file path) would be split into tokens. Reject read-only
+        // cvars so the network cannot mutate engine-set values (password hash, etc).
+        CVar* cv = console_->FindCVar(name);
+        bool ok = false;
+        if (cv && !(cv->flags & CVAR_READONLY)) {
+            ok = console_->SetCVarOverride(name, value);  // validates + fires sink; allows "" + spaces
+        }
+        json out{{"ok", ok}};
+        if (!ok) out["error"] = cv ? "read-only or invalid value" : "unknown cvar";
+        if (CVar* cv2 = console_->FindCVar(name)) out["cvar"] = CvarToJson(*cv2);
         reply(out);
     } else if (type == "exec") {
         ExecuteResult r = console_->Execute(msg.value("line", ""));
