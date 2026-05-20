@@ -454,7 +454,7 @@ int main(int argc, char** argv) {
             int cy = console.FindCVar("voxel.cursor.y") ? console.FindCVar("voxel.cursor.y")->GetInt() : 0;
             int cz = console.FindCVar("voxel.cursor.z") ? console.FindCVar("voxel.cursor.z")->GetInt() : 0;
             world.StampVox(vs.world, vs.palette, cx, cy, cz);
-            auto grid = world.BakeFlatGrid(64);
+            auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
             renderer.SetVoxels(grid, world.Palette().data());
             vox::log::Info("voxel: dropped {} ({} voxels) at ({},{},{})", name, vs.voxelCount, cx, cy, cz);
         } else {
