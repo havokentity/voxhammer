@@ -34,6 +34,54 @@ const CATS = {
     profiling: { label: "Profiler", icon: "◷" },
     remote:    { label: "Remote",   icon: "⌬" },
 };
+
+// ---------- Graphics quality presets ----------
+// Each preset lists the cvar values it sets. The active preset is detected by
+// comparing current cvar values against every preset's cvar map.
+const GFX_PRESETS = [
+    { id: "Low",    label: "Low",    cvars: { "renderer.lighting.mode": "PERFORMANCE", "renderer.ao.samples": "4",  "renderer.shadow.samples": "2", "renderer.dither": "1" } },
+    { id: "Medium", label: "Medium", cvars: { "renderer.lighting.mode": "PERFORMANCE", "renderer.ao.samples": "8",  "renderer.shadow.samples": "6", "renderer.dither": "1" } },
+    { id: "High",   label: "High",   cvars: { "renderer.lighting.mode": "QUALITY",     "renderer.gi.samples": "1",  "renderer.shadow.samples": "6", "renderer.dither": "1" } },
+    { id: "Ultra",  label: "Ultra",  cvars: { "renderer.lighting.mode": "QUALITY",     "renderer.gi.samples": "4",  "renderer.shadow.samples": "8", "renderer.dither": "1" } },
+];
+
+// Advanced renderer.* cvars shown in the Graphics "Advanced" subsection.
+// Only cvars that actually exist in state.cvars are surfaced.
+const GFX_ADVANCED_CVARS = [
+    "renderer.lighting.mode",
+    "renderer.ao.samples",
+    "renderer.ao.strength",
+    "renderer.ao.radius",
+    "renderer.shadow.samples",
+    "renderer.shadow.softness",
+    "renderer.gi.samples",
+    "renderer.dither",
+    "renderer.exposure",
+    "renderer.ambient",
+    "renderer.hdr.enabled",
+    "renderer.hdr.peak_nits",
+    "renderer.vsync",
+    "renderer.upscaling.mode",
+    "renderer.frame_gen.factor",
+];
+
+function activeGfxPreset() {
+    for (const p of GFX_PRESETS) {
+        let match = true;
+        let checkedAny = false;
+        for (const [k, v] of Object.entries(p.cvars)) {
+            const cv = state.cvars.get(k);
+            // If this cvar doesn't exist in the build, skip it — a missing cvar
+            // shouldn't prevent an otherwise-matching preset from being "active".
+            if (!cv) continue;
+            checkedAny = true;
+            if (cv.value !== v) { match = false; break; }
+        }
+        // Only claim a match if we actually found and checked at least one cvar.
+        if (match && checkedAny) return p.id;
+    }
+    return "Custom";
+}
 const catOf = (n) => n.split(".")[0];
 const shortName = (n) => n.split(".").slice(1).join(".") || n;
 
@@ -112,6 +160,14 @@ function mockCvars() {
         C("camera.move_speed", "15", "float", F.ARCHIVE, "Fly-cam move speed (units/sec).", R(1, 120, 1)),
         C("camera.boost", "3.0", "float", F.ARCHIVE, "Fly-cam Shift speed multiplier.", R(1, 10, 0.5)),
         C("camera.sensitivity", "0.0025", "float", F.ARCHIVE, "Mouse-look sensitivity (rad/px).", R(0.0005, 0.01, 0.0005)),
+        C("renderer.lighting.mode", "PERFORMANCE", "enum", F.ARCHIVE, "Lighting quality tier.", { enum_values: ["PERFORMANCE", "QUALITY"] }),
+        C("renderer.ao.samples", "8", "int", F.ARCHIVE, "Ambient occlusion sample count.", R(1, 32, 1)),
+        C("renderer.ao.strength", "0.75", "float", F.ARCHIVE, "Ambient occlusion strength.", R(0.0, 2.0, 0.05)),
+        C("renderer.ao.radius", "0.5", "float", F.ARCHIVE, "Ambient occlusion world-space radius.", R(0.05, 4.0, 0.05)),
+        C("renderer.shadow.samples", "6", "int", F.ARCHIVE, "Shadow PCF sample count.", R(1, 16, 1)),
+        C("renderer.shadow.softness", "1.0", "float", F.ARCHIVE, "Shadow edge softness (penumbra scale).", R(0.0, 4.0, 0.1)),
+        C("renderer.gi.samples", "1", "int", F.ARCHIVE, "Global illumination samples per frame.", R(1, 8, 1)),
+        C("renderer.dither", "1", "bool", F.ARCHIVE, "Bayer dither to reduce color banding."),
         C("debug.show_brick_grid", "0", "bool", F.DEVELOPER, "Overlay the brick grid."),
         C("debug.pause_simulation", "0", "bool", F.CHEAT, "Pause the simulation."),
         C("profiling.tracy_enabled", "0", "bool", 0, "Stream to the Tracy profiler."),
@@ -339,6 +395,11 @@ function renderRail() {
         rail.appendChild(b);
     }
     updateFavBtn();
+    // Graphics settings tab (always shown)
+    const gfx = el("button", "cat" + (state.cat === "graphics" ? " active" : ""));
+    gfx.innerHTML = `<span class="cat-icon">◈</span><span>Graphics</span>`;
+    gfx.onclick = () => { state.cat = "graphics"; renderRail(); renderDeck(); updateFavBtn(); };
+    rail.appendChild(gfx);
     const kb = el("button", "cat" + (state.cat === "keybindings" ? " active" : ""));
     kb.innerHTML = `<span class="cat-icon">⌨</span><span>Bindings</span>`;
     kb.onclick = () => { state.cat = "keybindings"; renderRail(); renderDeck(); updateFavBtn(); };
@@ -359,6 +420,7 @@ function visibleCvars() {
 }
 function renderDeck() {
     if (state.cat === "keybindings") { renderBindingsDeck(); return; }
+    if (state.cat === "graphics") { renderGraphicsDeck(); return; }
     const meta = CATS[state.cat] || { label: "Pinned", icon: "★" };
     $("#deck-icon").textContent = meta.icon;
     $("#deck-name").textContent = meta.label || state.cat;
@@ -537,6 +599,59 @@ function captureKey(btn) {
         document.removeEventListener("keydown", onKey, true);
     };
     document.addEventListener("keydown", onKey, true);
+}
+
+// ---------- graphics panel ----------
+function renderGraphicsDeck() {
+    $("#deck-icon").textContent = "◈";
+    $("#deck-name").textContent = "Graphics";
+    $("#deck-count").textContent = "";
+    const host = $("#controls");
+    host.innerHTML = "";
+
+    // --- Quality Presets section ---
+    const presetsSection = el("div", "gfx-section");
+    presetsSection.appendChild(el("div", "gfx-section-hd", "Quality Presets"));
+
+    const presetsRow = el("div", "gfx-presets");
+    const currentPreset = activeGfxPreset();
+    for (const p of GFX_PRESETS) {
+        const btn = el("button", "gfx-preset" + (currentPreset === p.id ? " active" : ""));
+        btn.textContent = p.label;
+        btn.title = Object.entries(p.cvars).map(([k, v]) => k + " = " + v).join("\n");
+        btn.onclick = () => {
+            for (const [k, v] of Object.entries(p.cvars)) {
+                if (state.cvars.has(k)) setCvar(k, v);
+            }
+            // Re-render the deck so the active state reflects the new selection
+            // and the Advanced controls update their widget values.
+            requestAnimationFrame(() => renderGraphicsDeck());
+        };
+        presetsRow.appendChild(btn);
+    }
+    // "Custom" indicator shown when no preset matches
+    const customBadge = el("span", "gfx-custom" + (currentPreset === "Custom" ? " visible" : ""), "Custom");
+    presetsSection.appendChild(presetsRow);
+    presetsSection.appendChild(customBadge);
+    host.appendChild(presetsSection);
+
+    // --- Advanced section ---
+    const advSection = el("div", "gfx-section gfx-advanced-section");
+    advSection.appendChild(el("div", "gfx-section-hd", "Advanced"));
+
+    const grid = el("div", "gfx-advanced-grid");
+    let shown = 0;
+    for (const name of GFX_ADVANCED_CVARS) {
+        const cv = state.cvars.get(name);
+        if (!cv) continue; // gracefully skip missing cvars
+        grid.appendChild(buildControl(cv));
+        shown++;
+    }
+    if (!shown) {
+        grid.appendChild(el("div", "ctrl-desc", "No advanced renderer cvars available in this build."));
+    }
+    advSection.appendChild(grid);
+    host.appendChild(advSection);
 }
 
 // ---------- resources + telemetry ----------
