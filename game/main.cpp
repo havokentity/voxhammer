@@ -316,14 +316,17 @@ int main(int argc, char** argv) {
     world.Init();
 
     // Optional .vox import overrides the renderer's procedural demo scene.
+    // vs must outlive renderer.Init so that vs.palette.data() stays valid.
+    vox::voxel::VoxScene vs;
     std::vector<std::uint32_t> voxelGrid;
     bool haveVoxels = false;
+    const std::uint32_t* palettePtr = nullptr;
     if (CVar* ip = console.FindCVar("voxel.import_path"); ip && !ip->value.empty()) {
-        vox::voxel::VoxScene vs;
         if (vox::voxel::LoadVox(ip->value, vs)) {
             world = std::move(vs.world);
             voxelGrid = world.BakeFlatGrid(64);  // 64 = renderer kGrid
             haveVoxels = true;
+            palettePtr = vs.palette.data();
             vox::log::Info("voxel: imported {} ({} voxels, {} chunks)", ip->value, vs.voxelCount, world.ResidentChunks());
         } else {
             vox::log::Warn("voxel: failed to import {}", ip->value);
@@ -337,7 +340,7 @@ int main(int argc, char** argv) {
     if (!args.no_window) {
         hasWindow = window.Create(1280, 720, "Voxhammer");
         if (hasWindow) {
-            renderer.Init(window.NativeHandle(), window.Width(), window.Height(), haveVoxels ? &voxelGrid : nullptr);
+            renderer.Init(window.NativeHandle(), window.Width(), window.Height(), haveVoxels ? &voxelGrid : nullptr, palettePtr);
             window.SetKeyHandler([&keybindings](const std::string& key, std::uint32_t mods) {
                 keybindings.Dispatch(key, mods, [](const std::string& line) {
                     vox::log::Info("keybind: {}", line);

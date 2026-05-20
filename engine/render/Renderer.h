@@ -47,7 +47,10 @@ public:
 
     // voxels: optional flat kGrid^3 uint32 material grid (from VoxelWorld::BakeFlatGrid)
     // that overrides the built-in procedural scene. nullptr => procedural demo scene.
-    bool Init(void* hwnd, int width, int height, const std::vector<std::uint32_t>* voxels = nullptr);
+    // palette256: optional pointer to 256 RGBA8 uints (VoxPalette::data()) from the imported .vox.
+    //             nullptr => built-in default palette reproducing the procedural demo scene colors.
+    bool Init(void* hwnd, int width, int height, const std::vector<std::uint32_t>* voxels = nullptr,
+              const std::uint32_t* palette256 = nullptr);
     void Shutdown();
     bool Valid() const { return valid_; }
 

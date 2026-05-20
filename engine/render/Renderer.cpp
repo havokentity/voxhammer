@@ -54,14 +54,6 @@ VSOut VSMain(uint vid : SV_VertexID) {
     return o;
 }
 
-float3 palette(uint m) {
-    if (m == 1) return float3(0.42, 0.66, 0.30);  // grass
-    if (m == 2) return float3(0.48, 0.36, 0.26);  // dirt
-    if (m == 3) return float3(0.55, 0.56, 0.60);  // stone
-    if (m == 4) return float3(0.82, 0.30, 0.24);  // sphere
-    return float3(0.7, 0.7, 0.7);
-}
-
 // Narkowicz ACES filmic tonemap.
 float3 tonemapACES(float3 x) {
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
@@ -84,6 +76,14 @@ float3 sky(float3 rd) {
     base += sunCol * (halo + disk) * saturate(sunDir.y + 0.15);  // fade when sun below horizon
 
     return base;
+}
+
+StructuredBuffer<uint> Palette : register(t2);
+
+float3 palette(uint m) {
+    uint p = Palette[m & 255u];
+    float3 c = float3(p & 255u, (p >> 8) & 255u, (p >> 16) & 255u) / 255.0;
+    return pow(c, 2.2);
 }
 
 // Blue-noise lookup: spatially uniform, spectrally high-frequency.
@@ -446,6 +446,7 @@ struct Renderer::Impl {
     std::uint8_t*                     camPtr = nullptr;
     ComPtr<ID3D12Resource>            accumBuf;       // GI temporal accumulation (RWStructuredBuffer<float4>)
     ComPtr<ID3D12Resource>            blueNoiseBuf;   // 64x64 blue-noise tile (StructuredBuffer<float> t1)
+    ComPtr<ID3D12Resource>            paletteBuf;     // 256-entry RGBA8 palette (StructuredBuffer<uint> t2)
     float*                            bnPtr      = nullptr;      // persistent map into blueNoiseBuf
     std::vector<float>                bnTile;                   // async-baked real tile (worker writes here)
     std::thread                       bnThread;                 // background void-and-cluster bake
@@ -504,7 +505,8 @@ struct Renderer::Impl {
 Renderer::Renderer() : impl_(std::make_unique<Impl>()) {}
 Renderer::~Renderer() { Shutdown(); }
 
-bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std::uint32_t>* voxels) {
+bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std::uint32_t>* voxels,
+                    const std::uint32_t* palette256) {
     HWND hwnd = static_cast<HWND>(hwndPtr);
     if (!hwnd) return false;
     Impl& d = *impl_;
@@ -558,8 +560,8 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     if (FAILED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&d.fence)))) return false;
     d.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-    // --- root signature: CBV(b0) + SRV(t0 Voxels) + UAV(u0 Accum) + SRV(t1 BlueNoise) ---
-    D3D12_ROOT_PARAMETER rp[4]{};
+    // --- root signature: CBV(b0) + SRV(t0 Voxels) + UAV(u0 Accum) + SRV(t1 BlueNoise) + SRV(t2 Palette) ---
+    D3D12_ROOT_PARAMETER rp[5]{};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister = 0;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -572,8 +574,11 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     rp[3].Descriptor.ShaderRegister = 1;   // t1
     rp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rp[4].Descriptor.ShaderRegister = 2;   // t2
+    rp[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 4;
+    rs.NumParameters = 5;
     rs.pParameters = rp;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> rsBlob, rsErr;
@@ -787,6 +792,43 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
         }
     }
 
+    // --- Palette buffer (256 RGBA8 uints, StructuredBuffer<uint> t2) ---
+    // If no external palette supplied, build the default that reproduces the
+    // old hardcoded linear colors: encode linear->sRGB so the shader's pow(c,2.2)
+    // round-trips back to the original linear value.
+    {
+        std::uint32_t pal[256]{};
+
+        // Helper: pack linear float3 as RGBA8 sRGB (R|G<<8|B<<16|A<<24).
+        auto packLinear = [](float r, float g, float b) -> std::uint32_t {
+            auto to8 = [](float v) -> std::uint32_t {
+                float s = std::pow(std::max(v, 0.0f), 1.0f / 2.2f);
+                return static_cast<std::uint32_t>(std::round(s * 255.0f));
+            };
+            return to8(r) | (to8(g) << 8) | (to8(b) << 16) | (255u << 24);
+        };
+
+        if (palette256) {
+            std::memcpy(pal, palette256, 256 * sizeof(std::uint32_t));
+        } else {
+            // Default palette: mirror old hardcoded palette() colors at indices 1-4.
+            std::uint32_t gray = packLinear(0.7f, 0.7f, 0.7f);
+            for (int i = 0; i < 256; ++i) pal[i] = gray;
+            pal[1] = packLinear(0.42f, 0.66f, 0.30f);  // grass
+            pal[2] = packLinear(0.48f, 0.36f, 0.26f);  // dirt
+            pal[3] = packLinear(0.55f, 0.56f, 0.60f);  // stone
+            pal[4] = packLinear(0.82f, 0.30f, 0.24f);  // sphere
+        }
+
+        d.paletteBuf = d.MakeUpload(256 * sizeof(std::uint32_t));
+        if (!d.paletteBuf) return false;
+        void* pp = nullptr;
+        D3D12_RANGE none2{0, 0};
+        d.paletteBuf->Map(0, &none2, &pp);
+        std::memcpy(pp, pal, 256 * sizeof(std::uint32_t));
+        d.paletteBuf->Unmap(0, nullptr);
+    }
+
     valid_ = true;
     vox::log::Info("DX12: voxel raymarcher ready ({}^3 grid, {}x{}, tearing={})", kGrid, width, height, d.tearing);
     return true;
@@ -897,6 +939,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     d.list->SetGraphicsRootShaderResourceView(1, d.voxelBuf->GetGPUVirtualAddress());
     d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf->GetGPUVirtualAddress());
     d.list->SetGraphicsRootShaderResourceView(3, d.blueNoiseBuf->GetGPUVirtualAddress());
+    d.list->SetGraphicsRootShaderResourceView(4, d.paletteBuf->GetGPUVirtualAddress());
     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     d.list->DrawInstanced(3, 1, 0, 0);
 
@@ -932,7 +975,7 @@ namespace vox::render {
 struct Renderer::Impl {};
 Renderer::Renderer() : impl_(std::make_unique<Impl>()) {}
 Renderer::~Renderer() {}
-bool Renderer::Init(void*, int, int, const std::vector<std::uint32_t>*) { return false; }
+bool Renderer::Init(void*, int, int, const std::vector<std::uint32_t>*, const std::uint32_t*) { return false; }
 void Renderer::RenderFrame(const FrameParams&) {}
 void Renderer::Shutdown() {}
 }  // namespace vox::render
