@@ -117,7 +117,7 @@ void Usage() {
     vox::log::Info("  --reset-cert            Regenerate the self-signed TLS cert before binding.");
     vox::log::Info("  --remote / --no-remote  Force the ConsoleServer on / off.");
     vox::log::Info("  --no-window             Run headless (no GLFW window / DX12).");
-    vox::log::Info("  --cvars=<path>          Override the cvars file (default cvars.toml).");
+    vox::log::Info("  --cvars=<path>          Override the cvars file (default: <userdata>/cvars.toml).");
     vox::log::Info("  --vsync=on|off          Override renderer.vsync for this run.");
     vox::log::Info("  --version / --help");
 }
@@ -300,7 +300,7 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
 
 struct Args {
     std::optional<std::string> remote_password;
-    std::string cvars_path = "cvars.toml";
+    std::string cvars_path;  // empty => default to UserDataDir()/cvars.toml (resolved in main)
     bool no_remote = false;
     bool no_window = false;
     bool reset_cert = false;
@@ -340,6 +340,14 @@ int main(int argc, char** argv) {
     RegisterCoreCvars();
     Console& console = Console::Get();
     vox::platform::LogSummary();
+
+    // Default the cvars file to the user-data dir (alongside keybindings.toml /
+    // shots / cert), NOT the working directory -- so settings persist regardless
+    // of where the exe is launched and live in one findable place.
+    if (args.cvars_path.empty()) {
+        args.cvars_path = (std::filesystem::path(vox::platform::UserDataDir()) / "cvars.toml").string();
+    }
+    vox::log::Info("cvars file: {}", args.cvars_path);
     console.LoadCvarsToml(args.cvars_path);
 
     for (int i = 1; i < argc; ++i) {
