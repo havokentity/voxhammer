@@ -35,9 +35,10 @@ cbuffer Camera : register(b0) {
     float3 clearCol;       float exposure;
     float2 viewport;       int   hdr;          float shadowSoftness;
     float3 sunDir;         float ambient;
-    float  aoStrength;     float aoRadius;     float pad0; float pad1;
+    float  aoStrength;     float aoRadius;     int lightingMode; int accumFrame;
 };
 StructuredBuffer<uint> Voxels : register(t0);
+RWStructuredBuffer<float4> Accum : register(u0);  // per-pixel GI accumulation: rgb + sample count
 
 struct VSOut { float4 pos : SV_Position; };
 VSOut VSMain(uint vid : SV_VertexID) {
@@ -177,59 +178,117 @@ float ambientOcclusion(float3 hp, float3 nrm, float2 screenPos) {
     return saturate(visibility);
 }
 
-float4 PSMain(VSOut i) : SV_Target {
-    float2 ndc = (i.pos.xy / viewport) * 2.0 - 1.0;
-    ndc.y = -ndc.y;
-    float tf = tan(fov * 0.5);
-    float3 rd = normalize(camFwd + camRight * (ndc.x * tf * aspect) + camUp * (ndc.y * tf));
+// ---- Path-traced GI (QUALITY tier) ---------------------------------------
+
+// Unified voxel DDA: trace from ro along rd; on hit fill hp/nrm/mat -> true.
+// Shared by the primary ray and the GI bounce ray.
+bool traceVoxel(float3 ro, float3 rd, int maxSteps, out float3 hp, out float3 nrm, out uint mat) {
+    nrm = float3(0, 1, 0); mat = 0; hp = ro;
     if (abs(rd.x) < 1e-5) rd.x = 1e-5;
     if (abs(rd.y) < 1e-5) rd.y = 1e-5;
     if (abs(rd.z) < 1e-5) rd.z = 1e-5;
-    float3 ro = camPos;
-
-    float3 col;
     float3 bmin = float3(0,0,0), bmax = float3(gridDim, gridDim, gridDim);
     float3 t0 = (bmin - ro) / rd, t1 = (bmax - ro) / rd;
     float3 ts = min(t0, t1), tb = max(t0, t1);
     float tBox  = max(max(ts.x, ts.y), ts.z);
     float tExit = min(min(tb.x, tb.y), tb.z);
+    if (tExit < max(tBox, 0.0)) return false;
+    float3 p = ro + rd * (max(tBox, 0.0) + 0.001);
+    float3 cell = floor(p);
+    float3 stepv = sign(rd);
+    float3 tDelta = abs(1.0 / rd);
+    float3 tMax = ((cell + (stepv * 0.5 + 0.5)) - p) / rd;
+    float tEnter = 0.0;
+    [loop] for (int k = 0; k < maxSteps; ++k) {
+        if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
+            cell.x >= gridDim || cell.y >= gridDim || cell.z >= gridDim) return false;
+        uint v = Voxels[(uint)(cell.z * gridDim * gridDim + cell.y * gridDim + cell.x)];
+        if (v != 0) { mat = v; hp = p + rd * tEnter; return true; }
+        if (tMax.x < tMax.y && tMax.x < tMax.z) { tEnter = tMax.x; cell.x += stepv.x; tMax.x += tDelta.x; nrm = float3(-stepv.x, 0, 0); }
+        else if (tMax.y < tMax.z)               { tEnter = tMax.y; cell.y += stepv.y; tMax.y += tDelta.y; nrm = float3(0, -stepv.y, 0); }
+        else                                    { tEnter = tMax.z; cell.z += stepv.z; tMax.z += tDelta.z; nrm = float3(0, 0, -stepv.z); }
+    }
+    return false;
+}
 
-    if (tExit < max(tBox, 0.0)) {
-        col = sky(rd);
+// Per-frame-varying low-discrepancy 2D sample: an R2 sequence advanced by the
+// accumulation frame, Cranley-Patterson rotated by a per-pixel IGN offset, so
+// each accumulated frame draws a fresh well-spread sample that converges.
+float2 sampleXi(float2 screenPos, int frame, float salt) {
+    float2 r2 = frac(0.5 + float2(0.7548776662, 0.5698402909) * float(frame));
+    float2 cp = float2(ign(screenPos + salt), ign(screenPos + salt + 19.19));
+    return frac(r2 + cp);
+}
+
+// Direct sun radiance at a point (single hard shadow ray, no albedo factor).
+float3 directSun(float3 hp, float3 nrm, float3 sd) {
+    float ndl = saturate(dot(nrm, sd));
+    if (ndl <= 0.0) return float3(0,0,0);
+    float vis = occludedRay(hp + nrm * 0.02, sd, 200) ? 0.0 : 1.0;
+    return float3(1.15, 1.06, 0.90) * (ndl * vis);
+}
+
+// One-bounce diffuse path-traced radiance at the primary hit (1 sample/frame;
+// temporal accumulation does the convergence).
+float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
+    float3 alb = palette(mat);
+
+    // Direct sun, jittered inside the penumbra cone (accumulates -> soft shadow).
+    float2 xs = sampleXi(screenPos, accumFrame, 11.0);
+    float3 st, sb; buildBasis(sunDir, st, sb);
+    float  ang = xs.y * 6.2832;
+    float  rad = sqrt(xs.x) * tan(max(shadowSoftness, 0.0008));
+    float3 sd  = normalize(sunDir + (st * cos(ang) + sb * sin(ang)) * rad);
+    float3 direct = directSun(hp, nrm, sd);
+
+    // One cosine-weighted indirect bounce, traced through the same voxel grid.
+    float2 xb = sampleXi(screenPos, accumFrame, 37.0);
+    float3 t, b; buildBasis(nrm, t, b);
+    float  cosT = sqrt(1.0 - xb.x), sinT = sqrt(xb.x);
+    float  phi  = xb.y * 6.2832;
+    float3 bd   = normalize(nrm * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
+    float3 bhp, bnrm; uint bmat;
+    float3 indirect;
+    if (traceVoxel(hp + nrm * 0.02, bd, 128, bhp, bnrm, bmat)) {
+        indirect = palette(bmat) * directSun(bhp, bnrm, sunDir);  // light off the bounce surface (color bleed)
     } else {
-        ro = ro + rd * (max(tBox, 0.0) + 0.001);
-        float3 cell = floor(ro);
-        float3 stepv = sign(rd);
-        float3 tDelta = abs(1.0 / rd);
-        float3 tMax = ((cell + (stepv * 0.5 + 0.5)) - ro) / rd;
-        float3 nrm = float3(0, 1, 0);
-        float tEnter = 0.0;
-        bool hit = false; uint mat = 0;
-        [loop] for (int k = 0; k < 512; ++k) {
-            if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
-                cell.x >= gridDim || cell.y >= gridDim || cell.z >= gridDim) break;
-            uint v = Voxels[(uint)(cell.z * gridDim * gridDim + cell.y * gridDim + cell.x)];
-            if (v != 0) { hit = true; mat = v; break; }
-            if (tMax.x < tMax.y && tMax.x < tMax.z) { tEnter = tMax.x; cell.x += stepv.x; tMax.x += tDelta.x; nrm = float3(-stepv.x, 0, 0); }
-            else if (tMax.y < tMax.z)               { tEnter = tMax.y; cell.y += stepv.y; tMax.y += tDelta.y; nrm = float3(0, -stepv.y, 0); }
-            else                                    { tEnter = tMax.z; cell.z += stepv.z; tMax.z += tDelta.z; nrm = float3(0, 0, -stepv.z); }
-        }
-        if (hit) {
-            float3 hp = ro + rd * tEnter;
-            float ndl = saturate(dot(nrm, sunDir));
+        indirect = sky(bd);                                       // sky/ambient from that direction
+    }
+    return alb * (direct + indirect);
+}
 
-            // Soft penumbra shadow (6 rays, jittered within shadowSoftness cone).
-            float shadow = softShadow(hp, nrm, sunDir, i.pos.xy);
+float4 PSMain(VSOut i) : SV_Target {
+    float2 ndc = (i.pos.xy / viewport) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float tf = tan(fov * 0.5);
+    float3 rd = normalize(camFwd + camRight * (ndc.x * tf * aspect) + camUp * (ndc.y * tf));
+    float3 ro = camPos;
 
-            // Short-range ambient occlusion (5 hemisphere rays, aoRadius steps each).
-            float ao = ambientOcclusion(hp, nrm, i.pos.xy);
+    float3 hp, nrm; uint mat;
+    float3 col;
+    if (!traceVoxel(ro, rd, 512, hp, nrm, mat)) {
+        col = sky(rd);
+    } else if (lightingMode == 1) {
+        col = giRadiance(hp, nrm, mat, i.pos.xy);
+    } else {
+        // PERFORMANCE tier: direct soft shadow + short-range AO + flat ambient.
+        float ndl = saturate(dot(nrm, sunDir));
+        float shadow = softShadow(hp, nrm, sunDir, i.pos.xy);
+        float ao = ambientOcclusion(hp, nrm, i.pos.xy);
+        float3 alb = palette(mat);
+        float3 ambientLight = float3(ambient, ambient, ambient) * ao;
+        col = alb * (ambientLight + (1.0 - ambient) * ndl * shadow);
+    }
 
-            float3 alb = palette(mat);
-            float3 ambientLight = float3(ambient, ambient, ambient) * ao;
-            col = alb * (ambientLight + (1.0 - ambient) * ndl * shadow);
-        } else {
-            col = sky(rd);
-        }
+    // QUALITY: progressive temporal accumulation (running average, linear space).
+    if (lightingMode == 1) {
+        uint w = (uint)viewport.x;
+        uint pix = (uint)i.pos.y * w + (uint)i.pos.x;
+        float4 hist = Accum[pix];
+        float n = (accumFrame == 0) ? 0.0 : min(hist.a, 2048.0);
+        float3 avg = (hist.rgb * n + col) / (n + 1.0);
+        Accum[pix] = float4(avg, n + 1.0);
+        col = avg;
     }
 
     col *= exposure;
@@ -246,7 +305,7 @@ struct CamCB {
     float clearCol[3];     float exposure;         // row 4
     float viewport[2];     int   hdr;              float shadowSoftness; // row 5 (pad repurposed)
     float sunDir[3];       float ambient;          // row 6
-    float aoStrength;      float aoRadius;         float pad0; float pad1; // row 7
+    float aoStrength;      float aoRadius;         int lightingMode; int accumFrame; // row 7
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -298,6 +357,10 @@ struct Renderer::Impl {
     ComPtr<ID3D12Resource>            voxelBuf;
     ComPtr<ID3D12Resource>            camBuf;
     std::uint8_t*                     camPtr = nullptr;
+    ComPtr<ID3D12Resource>            accumBuf;       // GI temporal accumulation (RWStructuredBuffer<float4>)
+    float                             accKey[19] = {};
+    bool                              accHave = false;
+    UINT                              accumFrame = 0;
 
     void WaitIdle() {
         if (!queue || !fence) return;
@@ -322,6 +385,24 @@ struct Renderer::Impl {
         rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         ComPtr<ID3D12Resource> r;
         device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                        IID_PPV_ARGS(&r));
+        return r;
+    }
+    ComPtr<ID3D12Resource> MakeDefaultUAV(UINT64 bytes) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = bytes;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_UNKNOWN;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ComPtr<ID3D12Resource> r;
+        device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                         IID_PPV_ARGS(&r));
         return r;
     }
@@ -384,16 +465,19 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     if (FAILED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&d.fence)))) return false;
     d.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-    // --- root signature: CBV(b0) + SRV(t0) as root descriptors ---
-    D3D12_ROOT_PARAMETER rp[2]{};
+    // --- root signature: CBV(b0) + SRV(t0) + UAV(u0) as root descriptors ---
+    D3D12_ROOT_PARAMETER rp[3]{};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister = 0;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     rp[1].Descriptor.ShaderRegister = 0;
     rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[2].Descriptor.ShaderRegister = 0;
+    rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 2;
+    rs.NumParameters = 3;
     rs.pParameters = rp;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> rsBlob, rsErr;
@@ -457,6 +541,10 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     if (!d.camBuf) return false;
     d.camBuf->Map(0, &none, reinterpret_cast<void**>(&d.camPtr));
 
+    // --- GI temporal-accumulation buffer (default-heap UAV: float4 per pixel) ---
+    d.accumBuf = d.MakeDefaultUAV(static_cast<UINT64>(d.width) * d.height * 16);
+    if (!d.accumBuf) return false;
+
     valid_ = true;
     vox::log::Info("DX12: voxel raymarcher ready ({}^3 grid, {}x{}, tearing={})", kGrid, width, height, d.tearing);
     return true;
@@ -498,8 +586,25 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.shadowSoftness = fp.shadow_softness;
     cb.aoStrength     = fp.ao_strength;
     cb.aoRadius       = fp.ao_radius;
-    cb.pad0 = 0.0f;
-    cb.pad1 = 0.0f;
+    cb.lightingMode   = fp.lighting_mode;
+
+    // Temporal accumulation: keep averaging GI while nothing that affects the
+    // image changes; reset the instant the camera/sun/lighting moves. Cheap
+    // "progressive refinement while you hold still".
+    const float key[19] = {
+        fp.cam_pos[0], fp.cam_pos[1], fp.cam_pos[2], fp.cam_yaw, fp.cam_pitch, fp.cam_fov,
+        fp.sun[0], fp.sun[1], fp.sun[2], fp.exposure, fp.ambient,
+        fp.clear[0], fp.clear[1], fp.clear[2], fp.shadow_softness, fp.ao_strength, fp.ao_radius,
+        static_cast<float>(fp.lighting_mode), static_cast<float>(fp.hdr),
+    };
+    if (fp.lighting_mode == 1 && d.accHave && std::memcmp(key, d.accKey, sizeof(key)) == 0) {
+        ++d.accumFrame;
+    } else {
+        d.accumFrame = 0;
+    }
+    std::memcpy(d.accKey, key, sizeof(key));
+    d.accHave = true;
+    cb.accumFrame = static_cast<int>(d.accumFrame);
     std::memcpy(d.camPtr, &cb, sizeof(cb));
 
     d.alloc->Reset();
@@ -529,6 +634,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     d.list->SetGraphicsRootSignature(d.rootSig.Get());
     d.list->SetGraphicsRootConstantBufferView(0, d.camBuf->GetGPUVirtualAddress());
     d.list->SetGraphicsRootShaderResourceView(1, d.voxelBuf->GetGPUVirtualAddress());
+    d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf->GetGPUVirtualAddress());
     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     d.list->DrawInstanced(3, 1, 0, 0);
 

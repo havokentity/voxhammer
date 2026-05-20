@@ -79,6 +79,7 @@ void RegisterCoreCvars() {
     reg("renderer.shadow.softness", "0.08", "Soft-shadow penumbra half-angle (radians; 0 = hard).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 0.5f, .range_step = 0.01f});
     reg("renderer.ao.strength", "0.55", "Ambient-occlusion darkening (0 = off).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
     reg("renderer.ao.radius", "4.0", "Ambient-occlusion ray reach (voxels).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 1.0f, .range_max = 24.0f, .range_step = 1.0f});
+    reg("renderer.lighting.mode", "PERFORMANCE", "Lighting tier: PERFORMANCE (raymarch + AO, high FPS) or QUALITY (path-traced GI; accumulates while the view is still).", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"PERFORMANCE", "QUALITY"}});
     reg("physics.gpu_rigids.enabled", "1", "GPU rigid bodies (NVIDIA).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("physics.gpu_rigids.max_islands", "10000", "Max active dynamic islands.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 256, .range_max = 16384, .range_step = 256});
     reg("physics.solver.position_iters", "8", "Solver position iterations.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
@@ -384,6 +385,7 @@ int main(int argc, char** argv) {
             fp.shadow_softness = console.FindCVar("renderer.shadow.softness")->GetFloat();
             fp.ao_strength = console.FindCVar("renderer.ao.strength")->GetFloat();
             fp.ao_radius = console.FindCVar("renderer.ao.radius")->GetFloat();
+            fp.lighting_mode = (console.FindCVar("renderer.lighting.mode")->value == "QUALITY") ? 1 : 0;
             renderer.RenderFrame(fp);  // vsync caps the loop
         }
 

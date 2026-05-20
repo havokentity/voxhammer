@@ -25,6 +25,7 @@ struct FrameParams {
     float shadow_softness = 0.08f;   // half-angle (rad) for penumbra jitter; 0 = hard shadow
     float ao_strength     = 0.55f;   // 0..1, how dark fully-occluded ambient gets
     float ao_radius       = 4.0f;    // world-space voxel radius for AO rays
+    int   lighting_mode   = 0;       // 0 = PERFORMANCE (raymarch + AO), 1 = QUALITY (path-traced GI)
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen
