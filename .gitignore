@@ -34,6 +34,14 @@ compile_commands.json
 # Build/run logs + scratch
 *.log
 
+# Vendored SDK source + build trees (pinned/documented, not committed).
+# PhysX 5 is acquired by a documented shallow clone into thirdparty/physx and
+# built out-of-source into thirdparty/physx_build -- see thirdparty/README.md.
+# The pin (repo/tag/commit) + the build patch live in the tracked README +
+# thirdparty/physx-voxhammer.patch, NOT the multi-GB source tree.
+/thirdparty/physx/
+/thirdparty/physx_build/
+
 # Runtime-generated config + state (the engine regenerates these)
 cvars.toml
 keybindings.toml

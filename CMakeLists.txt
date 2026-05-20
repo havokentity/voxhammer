@@ -43,6 +43,7 @@ option(VOX_ENABLE_ISPC          "Compile ISPC kernels (needs ispc on PATH / pinn
 option(VOX_ENABLE_TRACY         "Enable Tracy profiler client (needs vcpkg feature 'profiling')" OFF)
 option(VOX_ENABLE_JOBS          "enkiTS job system (needs vcpkg feature 'jobs')" OFF)
 option(VOX_ENABLE_ECS           "EnTT ECS (needs vcpkg feature 'ecs')"     OFF)
+option(VOX_ENABLE_PHYSX         "NVIDIA PhysX 5 rigid bodies (needs thirdparty/physx built; see thirdparty/README.md)" OFF)
 
 # --- Always-on dependencies (vcpkg core) -----------------------------------
 find_package(fmt CONFIG REQUIRED)
@@ -77,3 +78,4 @@ message(STATUS "  Tests / Tools     : ${VOX_BUILD_TESTS} / ${VOX_BUILD_TOOLS}")
 message(STATUS "  ConsoleServer/TLS : ${VOX_ENABLE_CONSOLE_SERVER} / ${VOX_ENABLE_TLS}")
 message(STATUS "  ISPC / Tracy      : ${VOX_ENABLE_ISPC} / ${VOX_ENABLE_TRACY}")
 message(STATUS "  Jobs / ECS        : ${VOX_ENABLE_JOBS} / ${VOX_ENABLE_ECS}")
+message(STATUS "  PhysX             : ${VOX_ENABLE_PHYSX}")
