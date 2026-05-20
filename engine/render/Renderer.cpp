@@ -81,12 +81,13 @@ float3 sky(float3 rd) {
     return base;
 }
 
-// Interleaved Gradient Noise (Jimenez 2014): a high-quality, low-discrepancy
-// per-pixel value in [0,1). Used to rotate the sample kernels per pixel so the
-// few taps read as fine film grain instead of the repeating tile a frac/sin
-// hash produces.
-float ign(float2 p) {
-    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+// Blue-noise lookup: spatially uniform, spectrally high-frequency.
+// px   = integer pixel coordinate (wraps mod 64 in each axis).
+// k    = sample index; offsets by (k*13, k*7) so successive samples within
+//        the same pixel draw decorrelated values from the tiled 64x64 texture.
+StructuredBuffer<float> BlueNoise : register(t1);
+float blue(int2 px, int k) {
+    return BlueNoise[((px.x + k * 13) & 63) + (((px.y + k * 7) & 63) << 6)];
 }
 
 // Vogel-disk sample k of n on the unit disk, spun by phi (a golden-angle
@@ -149,11 +150,12 @@ float softShadow(float3 hp, float3 nrm, float3 sunD, float2 screenPos) {
     float3 st, sb;
     buildBasis(sunD, st, sb);
 
-    // Primary rotation seed (same as before).
-    float rot     = ign(screenPos) * 6.2832;
-    // Secondary decorrelated seed — salt chosen to be far from the AO and
-    // dither salts (23.71, 47/31) so the three kernels stay independent.
-    float idxOff  = ign(screenPos + float2(73.19, 51.37));   // [0,1)
+    // Blue-noise rotation seeds — two decorrelated samples (k=0 and k=1).
+    // These replace the old IGN calls; blue noise gives the same well-spread
+    // rotation behaviour but without IGN's visible diagonal grid in still frames.
+    int2 isp = int2(screenPos);
+    float rot     = blue(isp, 0) * 6.2832;
+    float idxOff  = blue(isp, 1);   // [0,1)
 
     float tanS = tan(shadowSoftness);
     float lit  = 0.0;
@@ -183,7 +185,7 @@ float ambientOcclusion(float3 hp, float3 nrm, float2 screenPos) {
     float3 t, b;
     buildBasis(nrm, t, b);
 
-    float rot   = ign(screenPos + 23.71) * 6.2832;  // decorrelated from the shadow kernel
+    float rot   = blue(int2(screenPos), 2) * 6.2832;  // k=2 decorrelated from shadow (k=0,1)
     int   steps = (int)clamp(aoRadius, 2.0, 24.0);
     const float GOLDEN_ANGLE = 2.39996323;
     float occ   = 0.0;
@@ -268,11 +270,13 @@ bool traceVoxel(float3 ro, float3 rd, int maxSteps, out float3 hp, out float3 nr
 }
 
 // Per-frame-varying low-discrepancy 2D sample: an R2 sequence advanced by the
-// accumulation frame, Cranley-Patterson rotated by a per-pixel IGN offset, so
-// each accumulated frame draws a fresh well-spread sample that converges.
-float2 sampleXi(float2 screenPos, int frame, float salt) {
+// accumulation frame, Cranley-Patterson rotated by a per-pixel blue-noise offset,
+// so each accumulated frame draws a fresh well-spread sample that converges.
+// saltK: base blue-noise sample index (even/odd pair used for the 2D offset).
+float2 sampleXi(float2 screenPos, int frame, int saltK) {
     float2 r2 = frac(0.5 + float2(0.7548776662, 0.5698402909) * float(frame));
-    float2 cp = float2(ign(screenPos + salt), ign(screenPos + salt + 19.19));
+    int2 isp = int2(screenPos);
+    float2 cp = float2(blue(isp, saltK), blue(isp, saltK + 1));
     return frac(r2 + cp);
 }
 
@@ -290,7 +294,8 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
     float3 alb = palette(mat);
 
     // Direct sun, jittered inside the penumbra cone (accumulates -> soft shadow).
-    float2 xs = sampleXi(screenPos, accumFrame, 11.0);
+    // k=4,5 reserved for this pair (k=0..3 used by shadow/AO blue samples).
+    float2 xs = sampleXi(screenPos, accumFrame, 4);
     float3 st, sb; buildBasis(sunDir, st, sb);
     float  ang = xs.y * 6.2832;
     float  rad = sqrt(xs.x) * tan(max(shadowSoftness, 0.0008));
@@ -302,9 +307,9 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
     float3 indirectSum = float3(0, 0, 0);
     float3 t, b; buildBasis(nrm, t, b);
     [loop] for (int gi = 0; gi < numBounces; ++gi) {
-        // Per-bounce salt so each sample draws a different low-discrepancy point.
-        float salt = 37.0 + float(gi) * 17.31;
-        float2 xb   = sampleXi(screenPos, accumFrame, salt);
+        // Per-bounce saltK: k=6,7 for gi=0; k=8,9 for gi=1; etc.
+        int saltK = 6 + gi * 2;
+        float2 xb   = sampleXi(screenPos, accumFrame, saltK);
         float  cosT = sqrt(1.0 - xb.x), sinT = sqrt(xb.x);
         float  phi  = xb.y * 6.2832;
         float3 bd   = normalize(nrm * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
@@ -358,13 +363,13 @@ float4 PSMain(VSOut i) : SV_Target {
     col *= exposure;
     col = (hdr != 0) ? tonemapACES(col) : saturate(col);
 
-    // Triangular dither: converts the uniform IGN noise into a triangular PDF
-    // centered on 0 (range ±1/255).  Applied just before the 8-bit quantization
-    // so smooth gradients never produce visible banding on the R8G8B8A8 swapchain.
+    // Triangular dither: two decorrelated blue-noise samples -> triangular PDF
+    // centered on 0 (range ±1/255).  Applied just before 8-bit quantisation
+    // so smooth gradients never show banding on the R8G8B8A8 swapchain.
+    // k=22,23 chosen well past the GI bounce range (k≤21 for 8 bounces).
     [branch] if (dither != 0) {
-        // Two decorrelated uniform samples -> triangular by sum (central-limit trick).
-        float u1 = ign(i.pos.xy);
-        float u2 = ign(i.pos.xy + float2(47.0, 31.0));
+        float u1 = blue(int2(i.pos.xy), 22);
+        float u2 = blue(int2(i.pos.xy), 23);
         float tri = (u1 + u2 - 1.0) / 255.0;   // triangular PDF, range (-1/255, +1/255)
         col = saturate(col + tri);
     }
@@ -435,6 +440,7 @@ struct Renderer::Impl {
     ComPtr<ID3D12Resource>            camBuf;
     std::uint8_t*                     camPtr = nullptr;
     ComPtr<ID3D12Resource>            accumBuf;       // GI temporal accumulation (RWStructuredBuffer<float4>)
+    ComPtr<ID3D12Resource>            blueNoiseBuf;   // 64x64 blue-noise tile (StructuredBuffer<float> t1)
     float                             accKey[23] = {};
     bool                              accHave = false;
     UINT                              accumFrame = 0;
@@ -542,8 +548,8 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     if (FAILED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&d.fence)))) return false;
     d.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-    // --- root signature: CBV(b0) + SRV(t0) + UAV(u0) as root descriptors ---
-    D3D12_ROOT_PARAMETER rp[3]{};
+    // --- root signature: CBV(b0) + SRV(t0 Voxels) + UAV(u0 Accum) + SRV(t1 BlueNoise) ---
+    D3D12_ROOT_PARAMETER rp[4]{};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister = 0;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -553,8 +559,11 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     rp[2].Descriptor.ShaderRegister = 0;
     rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rp[3].Descriptor.ShaderRegister = 1;   // t1
+    rp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 3;
+    rs.NumParameters = 4;
     rs.pParameters = rp;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> rsBlob, rsErr;
@@ -621,6 +630,116 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     // --- GI temporal-accumulation buffer (default-heap UAV: float4 per pixel) ---
     d.accumBuf = d.MakeDefaultUAV(static_cast<UINT64>(d.width) * d.height * 16);
     if (!d.accumBuf) return false;
+
+    // --- Blue-noise tile: 64x64 floats generated via void-and-cluster on the CPU ---
+    // Reference: Ulichney 1993, "The void-and-cluster method for dither array generation."
+    // We use the classic iterative swap-based approximation:
+    //   1. Seed random binary pattern at target density ~10%.
+    //   2. Repeatedly find the tightest cluster and the largest void; swap them.
+    //      Repeat until stable.
+    //   3. Rank the 4096 entries by insertion order -> uniform float in [0,1).
+    {
+        constexpr int BN = 64;
+        constexpr int BN2 = BN * BN;
+
+        // Gaussian kernel sigma for cluster/void energy (wrapping toroidal distance).
+        auto energy = [&](const std::vector<int>& pat, int cx, int cy) -> float {
+            float e = 0.0f;
+            for (int dy = -7; dy <= 7; ++dy) {
+                for (int dx = -7; dx <= 7; ++dx) {
+                    int nx = (cx + dx + BN) & (BN - 1);
+                    int ny = (cy + dy + BN) & (BN - 1);
+                    if (pat[ny * BN + nx]) {
+                        float d2 = float(dx * dx + dy * dy);
+                        e += std::exp(-d2 * 0.4f);  // sigma≈1.58
+                    }
+                }
+            }
+            return e;
+        };
+
+        // Seed: deterministic LCG to avoid rand() platform drift.
+        std::vector<int> pat(BN2, 0);
+        std::uint32_t lcg = 0xA5F1C3B7u;
+        for (int i = 0; i < BN2; ++i) {
+            lcg = lcg * 1664525u + 1013904223u;
+            if ((lcg >> 24) < 26u) pat[i] = 1;   // ~10 % density
+        }
+
+        // Iterate void-and-cluster swaps until convergence (max 200 rounds).
+        for (int iter = 0; iter < 200; ++iter) {
+            // Find tightest cluster (highest energy among set pixels).
+            int clusterIdx = -1;
+            float maxE = -1.0f;
+            for (int i = 0; i < BN2; ++i) {
+                if (pat[i]) {
+                    float e = energy(pat, i % BN, i / BN);
+                    if (e > maxE) { maxE = e; clusterIdx = i; }
+                }
+            }
+            // Find largest void (lowest energy among unset pixels).
+            int voidIdx = -1;
+            float minE = 1e30f;
+            for (int i = 0; i < BN2; ++i) {
+                if (!pat[i]) {
+                    float e = energy(pat, i % BN, i / BN);
+                    if (e < minE) { minE = e; voidIdx = i; }
+                }
+            }
+            if (clusterIdx == voidIdx || voidIdx < 0 || clusterIdx < 0) break;
+            if (clusterIdx == voidIdx) break;
+            pat[clusterIdx] = 0;
+            pat[voidIdx]    = 1;
+        }
+
+        // Rank to produce a rank-based float tile.
+        // Phase 1: remove ones in cluster order, record removal rank.
+        std::vector<int> rank(BN2, -1);
+        std::vector<int> cur = pat;
+        int ones = 0;
+        for (auto v : cur) ones += v;
+
+        for (int r = ones - 1; r >= 0; --r) {
+            int clusterIdx = -1;
+            float maxE = -1.0f;
+            for (int i = 0; i < BN2; ++i) {
+                if (cur[i]) {
+                    float e = energy(cur, i % BN, i / BN);
+                    if (e > maxE) { maxE = e; clusterIdx = i; }
+                }
+            }
+            if (clusterIdx < 0) break;
+            rank[clusterIdx] = r;
+            cur[clusterIdx]  = 0;
+        }
+
+        // Phase 2: fill zeros in void order.
+        cur = pat;
+        for (int r = ones; r < BN2; ++r) {
+            int voidIdx = -1;
+            float minE = 1e30f;
+            for (int i = 0; i < BN2; ++i) {
+                if (!cur[i]) {
+                    float e = energy(cur, i % BN, i / BN);
+                    if (e < minE) { minE = e; voidIdx = i; }
+                }
+            }
+            if (voidIdx < 0) break;
+            rank[voidIdx] = r;
+            cur[voidIdx]  = 1;
+        }
+
+        std::vector<float> bn(BN2);
+        for (int i = 0; i < BN2; ++i)
+            bn[i] = (rank[i] >= 0) ? (float(rank[i]) + 0.5f) / float(BN2) : 0.0f;
+
+        d.blueNoiseBuf = d.MakeUpload(static_cast<UINT64>(BN2) * sizeof(float));
+        if (!d.blueNoiseBuf) return false;
+        void* bnPtr = nullptr;
+        d.blueNoiseBuf->Map(0, &none, &bnPtr);
+        std::memcpy(bnPtr, bn.data(), static_cast<UINT64>(BN2) * sizeof(float));
+        d.blueNoiseBuf->Unmap(0, nullptr);
+    }
 
     valid_ = true;
     vox::log::Info("DX12: voxel raymarcher ready ({}^3 grid, {}x{}, tearing={})", kGrid, width, height, d.tearing);
@@ -718,6 +837,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     d.list->SetGraphicsRootConstantBufferView(0, d.camBuf->GetGPUVirtualAddress());
     d.list->SetGraphicsRootShaderResourceView(1, d.voxelBuf->GetGPUVirtualAddress());
     d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf->GetGPUVirtualAddress());
+    d.list->SetGraphicsRootShaderResourceView(3, d.blueNoiseBuf->GetGPUVirtualAddress());
     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     d.list->DrawInstanced(3, 1, 0, 0);
 
