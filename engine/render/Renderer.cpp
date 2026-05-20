@@ -130,6 +130,15 @@ bool occludedRay(float3 p, float3 d, int maxSteps) {
 
 // Soft shadow: average N jittered shadow rays within a cone of half-angle shadowSoftness.
 // Uses a deterministic screen-space seed so no temporal flicker.
+//
+// Anti-banding strategy: two decorrelated IGN values per pixel.
+//   rot   — rotates the entire Vogel disk (breaks tile-repeat structure).
+//   idxOff — fractionally offsets the tap index before feeding vogelDisk, so
+//             neighbouring pixels sample different positions on the spiral rather
+//             than the same N discrete levels.  This converts the 0/1-averaged
+//             staircase into fine dithered grain that reads as a smooth gradient.
+//   radJitter — per-tap radius perturbation derived from idxOff, breaking the
+//               uniform ring spacing of the pure Vogel spiral.
 float softShadow(float3 hp, float3 nrm, float3 sunD, float2 screenPos) {
     [branch] if (shadowSoftness < 1e-4) {
         // Hard shadow fast path.
@@ -140,13 +149,26 @@ float softShadow(float3 hp, float3 nrm, float3 sunD, float2 screenPos) {
     float3 st, sb;
     buildBasis(sunD, st, sb);
 
-    float rot  = ign(screenPos) * 6.2832;   // per-pixel kernel rotation
+    // Primary rotation seed (same as before).
+    float rot     = ign(screenPos) * 6.2832;
+    // Secondary decorrelated seed — salt chosen to be far from the AO and
+    // dither salts (23.71, 47/31) so the three kernels stay independent.
+    float idxOff  = ign(screenPos + float2(73.19, 51.37));   // [0,1)
+
     float tanS = tan(shadowSoftness);
-    float lit = 0.0;
+    float lit  = 0.0;
     int N = clamp(shadowSamples, 1, 16);
     [loop] for (int s = 0; s < N; ++s) {
-        // Vogel-disk tap inside the penumbra cone, rotated per pixel.
-        float2 d   = vogelDisk(s, N, rot) * tanS;
+        // Shift the effective tap index by a per-pixel fraction so neighbours
+        // draw from a different part of the Vogel spiral — dithers the discrete
+        // penumbra levels into smooth grain.
+        float effIdx = frac((float(s) + idxOff) / float(N)) * float(N);
+
+        // Slight radius jitter: perturb sqrt factor by ±idxOff/N so the
+        // concentric ring spacing varies pixel-to-pixel, breaking moiré.
+        float radMul = 1.0 + (idxOff - 0.5) * (0.5 / float(N));
+
+        float2 d   = vogelDisk((int)effIdx, N, rot) * (tanS * radMul);
         float3 dir = normalize(sunD + st * d.x + sb * d.y);
         lit += occludedRay(hp + nrm * 0.02, dir, 160) ? 0.0 : 1.0;
     }

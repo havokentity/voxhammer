@@ -29,7 +29,7 @@ struct FrameParams {
     // Runtime-tunable sample counts (mapped to HLSL cbuffer; changing any resets GI accumulation)
     int   dither          = 1;       // 1 = triangular dither before 8-bit output; 0 = off
     int   ao_samples      = 8;       // AO hemisphere rays (1..32)
-    int   shadow_samples  = 6;       // soft-shadow cone rays (1..16)
+    int   shadow_samples  = 12;      // soft-shadow cone rays (1..16)
     int   gi_samples      = 1;       // QUALITY indirect bounce samples averaged per frame (1..8)
 };
 
