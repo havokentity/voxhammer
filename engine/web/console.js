@@ -103,6 +103,8 @@ const ABILITY_DEFS = [
     { name: "console.rotate_cert", ico: "⚿", lbl: "Cert" },
     { name: "console.list_sessions", ico: "⧉", lbl: "Sessions" },
     { name: "lua", ico: "✦", lbl: "Lua" },
+    { name: "bluenoise.clear_cache", ico: "⟲", lbl: "Clear BN" },
+    { name: "bluenoise.open_folder", ico: "📁", lbl: "BN Folder" },
     { name: "quit", ico: "⏻", lbl: "Quit", danger: true },
 ];
 

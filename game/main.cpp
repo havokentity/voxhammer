@@ -34,6 +34,22 @@
 #include <thread>
 #include <vector>
 
+// Windows Shell API for bluenoise.open_folder — included last to avoid macro
+// collisions (winuser.h defines MOD_SHIFT/MOD_ALT/MOD_CTRL which clash with
+// vox::platform::MOD_* constants used above).
+#include <windows.h>
+#include <shellapi.h>
+// Undefine the conflicting keyboard-modifier macros from winuser.h.
+#ifdef MOD_SHIFT
+#undef MOD_SHIFT
+#endif
+#ifdef MOD_CTRL
+#undef MOD_CTRL
+#endif
+#ifdef MOD_ALT
+#undef MOD_ALT
+#endif
+
 #ifndef VOX_VERSION_STRING
 #define VOX_VERSION_STRING "0.0.0-dev"
 #endif
@@ -159,6 +175,20 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
     c.RegisterCommand("console.rotate_cert", "Regenerate the TLS cert.", [&server](std::span<const std::string_view>, Output& o) { server.RotateCert(); o.Print("ok"); });
     c.RegisterCommand("console.rotate_sessions", "Invalidate all sessions.", [&server](std::span<const std::string_view>, Output& o) { server.RotateSessions(); o.Print("ok"); });
     c.RegisterCommand("console.list_sessions", "List active sessions.", [&server](std::span<const std::string_view>, Output& o) { o.Print(server.ListSessions()); });
+
+    // --- blue-noise cache utilities ---
+    c.RegisterCommand("bluenoise.clear_cache", "Delete the cached blue-noise tile (bluenoise64.bin); restart to re-bake.",
+        [](std::span<const std::string_view>, Output& o) {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::path(pf::UserDataDir()) / "bluenoise64.bin", ec);
+            o.Print("blue-noise cache cleared - restart the engine to re-bake");
+        });
+    c.RegisterCommand("bluenoise.open_folder", "Open the engine user-data directory in Explorer.",
+        [](std::span<const std::string_view>, Output& o) {
+            std::wstring widePath = std::filesystem::path(pf::UserDataDir()).wstring();
+            ShellExecuteW(nullptr, L"open", widePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            o.Format("opened {}", pf::UserDataDir());
+        });
 
     // --- keybindings management (the web editor drives these via `exec`) ---
     c.RegisterCommand("binds", "List keybindings as JSON.", [&kb](std::span<const std::string_view>, Output& o) {
