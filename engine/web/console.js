@@ -329,18 +329,19 @@ function renderRail() {
         if (!counts[id]) continue;
         const b = el("button", "cat" + (state.cat === id ? " active" : ""));
         b.innerHTML = `<span class="cat-icon">${CATS[id].icon}</span><span>${CATS[id].label}</span><span class="cat-n">${counts[id]}</span>`;
-        b.onclick = () => { state.cat = id; renderRail(); renderDeck(); };
+        b.onclick = () => { state.cat = id; renderRail(); renderDeck(); updateFavBtn(); };
         rail.appendChild(b);
     }
     if (state.pinned.size) {
         const b = el("button", "cat" + (state.cat === "pinned" ? " active" : ""));
         b.innerHTML = `<span class="cat-icon">★</span><span>Pinned</span><span class="cat-n">${state.pinned.size}</span>`;
-        b.onclick = () => { state.cat = "pinned"; renderRail(); renderDeck(); };
+        b.onclick = () => { state.cat = "pinned"; renderRail(); renderDeck(); updateFavBtn(); };
         rail.appendChild(b);
     }
+    updateFavBtn();
     const kb = el("button", "cat" + (state.cat === "keybindings" ? " active" : ""));
     kb.innerHTML = `<span class="cat-icon">⌨</span><span>Bindings</span>`;
-    kb.onclick = () => { state.cat = "keybindings"; renderRail(); renderDeck(); };
+    kb.onclick = () => { state.cat = "keybindings"; renderRail(); renderDeck(); updateFavBtn(); };
     rail.appendChild(kb);
     rail.appendChild(el("div", "rail-sep"));
     const cons = el("button", "cat ghost");
@@ -541,7 +542,74 @@ function captureKey(btn) {
 // ---------- resources + telemetry ----------
 const RES = [["fps", "fps", true], ["frame_ms", "ms"], ["gpu_mem_mb", "vram"], ["chunks", "chunks"], ["islands", "islands"]];
 function renderResbar() { const bar = $("#resbar"); bar.innerHTML = ""; for (const [k, lbl, hot] of RES) { const d = el("div", "res" + (hot ? " hot" : "")); d.innerHTML = `<b id="res-${k}">—</b><span>${lbl}</span>`; bar.appendChild(d); } }
-const samples = [];
+// ---------- telemetry rolling buffers (fps + frame_ms) ----------
+const GRAPH_LEN = 120;
+const samples = [];       // fps history (for legacy spark)
+const fpsSamples = [];    // fps for graph
+const msSamples = [];     // frame_ms for graph
+
+function graphAccent() { return getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#6e8bff"; }
+function graphAccent2() { return getComputedStyle(document.documentElement).getPropertyValue("--accent-2").trim() || "#33d6c2"; }
+
+function drawLineGraph(canvasId, data, color, labelId, labelFmt) {
+    const c = document.getElementById(canvasId); if (!c) return;
+    // Sync canvas pixel size to CSS layout size for crispness
+    const dpr = window.devicePixelRatio || 1;
+    const rect = c.getBoundingClientRect();
+    const cw = Math.round(rect.width * dpr) || c.width;
+    const ch = Math.round(rect.height * dpr) || c.height;
+    if (c.width !== cw || c.height !== ch) { c.width = cw; c.height = ch; }
+    const ctx = c.getContext("2d");
+    const w = c.width, h = c.height;
+    ctx.clearRect(0, 0, w, h);
+    if (data.length < 2) return;
+
+    const max = Math.max(...data), min = Math.min(...data);
+    const span = Math.max(max - min, max * 0.05, 0.001); // at least 5% or 0.001 to avoid flat line
+    const padT = Math.round(h * 0.08), padB = Math.round(h * 0.08);
+    const plotH = h - padT - padB;
+
+    // Faint horizontal grid lines (3)
+    ctx.strokeStyle = "rgba(255,255,255,0.06)"; ctx.lineWidth = 1;
+    for (let i = 0; i <= 2; i++) {
+        const y = padT + i * plotH / 2;
+        ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(w, y + 0.5); ctx.stroke();
+    }
+
+    // Fill under the line
+    const toY = (v) => padT + plotH - ((v - min) / span) * plotH;
+    ctx.beginPath();
+    data.forEach((v, i) => {
+        const x = (i / (data.length - 1)) * w;
+        const y = toY(v);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+    // Semi-transparent fill under the line
+    ctx.globalAlpha = 0.18; ctx.fillStyle = color; ctx.fill(); ctx.globalAlpha = 1;
+
+    // Stroke the line
+    ctx.beginPath();
+    data.forEach((v, i) => {
+        const x = (i / (data.length - 1)) * w;
+        const y = toY(v);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5 * dpr; ctx.lineJoin = "round"; ctx.stroke();
+
+    // Dot at latest sample
+    const last = data[data.length - 1];
+    const lx = w, ly = toY(last);
+    ctx.beginPath(); ctx.arc(lx - 1, ly, 3 * dpr, 0, Math.PI * 2);
+    ctx.fillStyle = color; ctx.fill();
+
+    // Update label
+    if (labelId) {
+        const el2 = document.getElementById(labelId);
+        if (el2) el2.textContent = labelFmt ? labelFmt(last) : last.toFixed(1);
+    }
+}
+
 function onFrameStats(d) {
     $("#tele-state").textContent = d.paused ? "paused" : "live";
     if (d.fps != null) { $("#res-fps").textContent = Math.round(d.fps); $("#fps-num").textContent = Math.round(d.fps); }
@@ -549,7 +617,18 @@ function onFrameStats(d) {
     if (d.gpu_mem_mb != null) $("#res-gpu_mem_mb").textContent = (d.gpu_mem_mb / 1024).toFixed(1) + "g";
     if (d.chunks != null) $("#res-chunks").textContent = d.chunks;
     if (d.islands != null) $("#res-islands").textContent = d.islands;
-    if (!d.paused && d.fps != null) { samples.push(d.fps); if (samples.length > 64) samples.shift(); drawSpark(); }
+    if (!d.paused) {
+        if (d.fps != null) {
+            samples.push(d.fps); if (samples.length > 64) samples.shift();
+            fpsSamples.push(d.fps); if (fpsSamples.length > GRAPH_LEN) fpsSamples.shift();
+            drawSpark();
+            drawLineGraph("graph-fps", fpsSamples, graphAccent(), "tg-fps-val", (v) => Math.round(v) + " fps");
+        }
+        if (d.frame_ms != null) {
+            msSamples.push(d.frame_ms); if (msSamples.length > GRAPH_LEN) msSamples.shift();
+            drawLineGraph("graph-ms", msSamples, graphAccent2(), "tg-ms-val", (v) => v.toFixed(2) + " ms");
+        }
+    }
     renderGauges(d);
 }
 function renderGauges(d) {
@@ -570,7 +649,7 @@ function drawSpark() {
     const c = $("#spark"), ctx = c.getContext("2d"), w = c.width, h = c.height;
     ctx.clearRect(0, 0, w, h); if (samples.length < 2) return;
     const max = Math.max(...samples) * 1.1, min = Math.min(...samples) * 0.9, span = Math.max(1, max - min);
-    const acc = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#6e8bff";
+    const acc = graphAccent();
     ctx.beginPath();
     samples.forEach((s, i) => { const x = i / (samples.length - 1) * w, y = h - (s - min) / span * h; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
     ctx.strokeStyle = acc; ctx.lineWidth = 1.6; ctx.stroke();
@@ -694,6 +773,205 @@ function onMessage(msg) {
     }
 }
 
+// ---------- command palette ----------
+const palette = {
+    open: false,
+    focusIdx: -1,
+    results: [],
+};
+
+function fuzzyMatch(query, text) {
+    // Returns { score, html } or null if no match.
+    // Simple character-order fuzzy: every char in query must appear in order in text.
+    if (!query) return { score: 1, html: escHtml(text) };
+    const q = query.toLowerCase(), t = text.toLowerCase();
+    let qi = 0, lastIdx = -1, score = 0;
+    const positions = [];
+    for (let i = 0; i < t.length && qi < q.length; i++) {
+        if (t[i] === q[qi]) { positions.push(i); score += (i - lastIdx === 1) ? 3 : 1; lastIdx = i; qi++; }
+    }
+    if (qi < q.length) return null;
+    // Build highlighted HTML
+    let html = "", prev = 0;
+    for (const pos of positions) {
+        html += escHtml(text.slice(prev, pos)) + "<mark>" + escHtml(text[pos]) + "</mark>";
+        prev = pos + 1;
+    }
+    html += escHtml(text.slice(prev));
+    return { score, html };
+}
+function escHtml(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+function paletteSearch(query) {
+    const q = query.trim();
+    const items = [];
+    // Cvars
+    for (const cv of state.cvars.values()) {
+        const m = fuzzyMatch(q, cv.name);
+        if (!m && q) {
+            // also try description
+            const md = fuzzyMatch(q, cv.description || "");
+            if (!md) continue;
+            items.push({ kind: "cvar", cv, score: md.score * 0.5, nameHtml: escHtml(cv.name), descHtml: md.html });
+        } else {
+            items.push({ kind: "cvar", cv, score: q ? m.score : 0.5, nameHtml: m ? m.html : escHtml(cv.name), descHtml: escHtml(cv.description || "") });
+        }
+    }
+    // Commands
+    for (const cmd of state.commands) {
+        const m = fuzzyMatch(q, cmd.name);
+        if (!m && q) {
+            const md = fuzzyMatch(q, cmd.description || "");
+            if (!md) continue;
+            items.push({ kind: "cmd", cmd, score: md.score * 0.5, nameHtml: escHtml(cmd.name), descHtml: md.html });
+        } else {
+            items.push({ kind: "cmd", cmd, score: q ? m.score : 0.5, nameHtml: m ? m.html : escHtml(cmd.name), descHtml: escHtml(cmd.description || "") });
+        }
+    }
+    // Sort: higher score first, then alphabetical
+    items.sort((a, b) => (b.score - a.score) || ((a.kind === "cvar" ? a.cv.name : a.cmd.name).localeCompare(b.kind === "cvar" ? b.cv.name : b.cmd.name)));
+    return items.slice(0, 60);
+}
+
+function renderPaletteResults() {
+    const q = $("#palette-input").value;
+    const items = paletteSearch(q);
+    palette.results = items;
+    palette.focusIdx = items.length > 0 ? 0 : -1;
+    const host = $("#palette-results");
+    host.innerHTML = "";
+    if (!items.length) {
+        host.innerHTML = `<div class="pal-empty">no matches</div>`;
+        return;
+    }
+    // Split into cvars and commands sections when no query
+    const cvars = items.filter((x) => x.kind === "cvar");
+    const cmds = items.filter((x) => x.kind === "cmd");
+    let idx = 0;
+    const addSection = (title, list) => {
+        if (!list.length) return;
+        const sec = el("div", "pal-section");
+        sec.appendChild(el("div", "pal-section-hd", title));
+        for (const item of list) {
+            const btn = el("button", "pal-item" + (idx === palette.focusIdx ? " focused" : ""));
+            btn.dataset.idx = idx;
+            if (item.kind === "cvar") {
+                const cv = item.cv;
+                const catIcon = (CATS[catOf(cv.name)] || {}).icon || "·";
+                const pinned = state.pinned.has(cv.name) ? " ★" : "";
+                btn.innerHTML = `<span class="pal-item-icon">${catIcon}</span><span class="pal-item-body"><span class="pal-item-name">${item.nameHtml}${escHtml(pinned)}</span><span class="pal-item-desc">${item.descHtml}</span></span><span class="pal-item-value">${escHtml(String(cv.value))}</span><span class="pal-item-badge">${escHtml(cv.type)}</span>`;
+                btn.title = cv.name + " = " + cv.value;
+                btn.onclick = () => { paletteActivate(item); };
+            } else {
+                const cmd = item.cmd;
+                btn.innerHTML = `<span class="pal-item-icon">❯</span><span class="pal-item-body"><span class="pal-item-name">${item.nameHtml}</span><span class="pal-item-desc">${item.descHtml}</span></span><span class="pal-item-badge cmd">cmd</span>`;
+                btn.title = cmd.name;
+                btn.onclick = () => { paletteActivate(item); };
+            }
+            sec.appendChild(btn);
+            idx++;
+        }
+        host.appendChild(sec);
+    };
+    if (q) {
+        addSection("results", items);
+    } else {
+        addSection("cvars", cvars);
+        addSection("commands", cmds);
+    }
+}
+
+function paletteActivate(item) {
+    closePalette();
+    if (item.kind === "cmd") {
+        pushLog("info", "❯ " + item.cmd.name, "echo");
+        if (item.cmd.name === "quit" && !confirm("Quit the engine?")) return;
+        bus.send({ type: "exec", line: item.cmd.name });
+    } else {
+        // Navigate to the cvar
+        const cv = item.cv;
+        const cat = catOf(cv.name);
+        if (cat in CATS) { state.cat = cat; } else { state.cat = "pinned"; }
+        state.search = "";
+        $("#search").value = "";
+        renderRail();
+        renderDeck();
+        // Switch to controls view on narrow layout
+        if (document.body.dataset.layout === "narrow") setView("controls");
+        // Scroll to the card
+        requestAnimationFrame(() => {
+            const card = document.querySelector(`.ctrl[data-name="${cssEsc(cv.name)}"]`);
+            if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+        });
+    }
+}
+
+function movePaletteFocus(delta) {
+    const items = palette.results; if (!items.length) return;
+    palette.focusIdx = clamp(palette.focusIdx + delta, 0, items.length - 1);
+    const host = $("#palette-results");
+    const allBtns = host.querySelectorAll(".pal-item");
+    allBtns.forEach((b, i) => b.classList.toggle("focused", i === palette.focusIdx));
+    const focused = allBtns[palette.focusIdx];
+    if (focused) focused.scrollIntoView({ block: "nearest" });
+}
+
+function openPalette() {
+    const ov = $("#palette-overlay"); ov.hidden = false;
+    palette.open = true;
+    const inp = $("#palette-input"); inp.value = ""; inp.focus();
+    renderPaletteResults();
+}
+function closePalette() {
+    const ov = $("#palette-overlay"); ov.hidden = true;
+    palette.open = false;
+}
+function wirePalette() {
+    $("#palette-btn").onclick = () => palette.open ? closePalette() : openPalette();
+    $("#palette-backdrop").onclick = () => closePalette();
+    $("#palette-input").oninput = () => renderPaletteResults();
+    $("#palette-input").onkeydown = (e) => {
+        if (e.key === "Escape") { e.preventDefault(); closePalette(); return; }
+        if (e.key === "ArrowDown") { e.preventDefault(); movePaletteFocus(1); return; }
+        if (e.key === "ArrowUp") { e.preventDefault(); movePaletteFocus(-1); return; }
+        if (e.key === "Enter") {
+            e.preventDefault();
+            const item = palette.results[palette.focusIdx];
+            if (item) paletteActivate(item);
+            return;
+        }
+    };
+    // Global Ctrl+K
+    document.addEventListener("keydown", (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+            e.preventDefault();
+            palette.open ? closePalette() : openPalette();
+        }
+    });
+}
+
+// ---------- favorites / pinned filter ----------
+function wireFavoritesBtn() {
+    const btn = $("#show-favorites");
+    if (!btn) return;
+    btn.onclick = () => {
+        if (state.cat === "pinned") {
+            // toggle off: go back to renderer
+            state.cat = "renderer";
+            btn.classList.remove("active");
+        } else {
+            state.cat = "pinned";
+            btn.classList.add("active");
+        }
+        renderRail();
+        renderDeck();
+    };
+}
+function updateFavBtn() {
+    const btn = $("#show-favorites"); if (!btn) return;
+    btn.classList.toggle("active", state.cat === "pinned");
+}
+
 // ---------- boot ----------
 let booted = false;
 function boot() {
@@ -705,10 +983,20 @@ function init() {
     applyPrefs(); renderSettings(); wireSettings();
     renderResbar(); renderRail(); renderDeck(); renderGauges({}); wireLogFilters(); wireViewtabs();
     applyLayout(); mqNarrow.addEventListener ? mqNarrow.addEventListener("change", applyLayout) : mqNarrow.addListener(applyLayout);
+    // Re-draw graphs when layout resizes (canvas DPR correction)
+    if (window.ResizeObserver) {
+        const ro = new ResizeObserver(() => {
+            if (fpsSamples.length > 1) drawLineGraph("graph-fps", fpsSamples, graphAccent(), "tg-fps-val", (v) => Math.round(v) + " fps");
+            if (msSamples.length > 1) drawLineGraph("graph-ms", msSamples, graphAccent2(), "tg-ms-val", (v) => v.toFixed(2) + " ms");
+        });
+        const tg = document.getElementById("tele-graphs"); if (tg) ro.observe(tg);
+    }
     $("#search").oninput = (e) => { state.search = e.target.value; renderDeck(); };
     $("#reset-group").onclick = () => { for (const cv of visibleCvars()) if (!(cv.flags & F.READONLY)) setCvar(cv.name, cv.default); renderDeck(); };
     $("#console-form").onsubmit = (e) => { e.preventDefault(); const v = $("#console-input").value.trim(); if (!v) return; pushLog("info", "❯ " + v, "echo"); bus.send({ type: "exec", line: v }); $("#console-input").value = ""; };
     $("#link").onclick = () => pushLog("info", state.demo ? "DEMO: open the engine at https://localhost:27960/ for a live link" : "link active");
+    wirePalette();
+    wireFavoritesBtn();
     startTransport();
 }
 init();

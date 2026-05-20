@@ -34,10 +34,24 @@
   <div class="brand"><span class="brand-mark">◆</span><span class="brand-name"><b>VOX</b>HAMMER</span><span class="brand-sub">console</span></div>
   <div class="resbar" id="resbar"><!-- live telemetry counters --></div>
   <div class="topbar-right">
+    <button class="palette-btn" id="palette-btn" title="Command palette (Ctrl+K)" aria-label="command palette">⌘</button>
     <button class="link link-init" id="link" title="connection status"><span class="link-dot"></span><span id="link-text">init…</span></button>
     <button class="gear" id="gear" title="settings" aria-label="settings">⚙</button>
   </div>
 </header>
+
+<!-- Command Palette Overlay -->
+<div class="palette-overlay" id="palette-overlay" hidden aria-modal="true" role="dialog" aria-label="Command palette">
+  <div class="palette-backdrop" id="palette-backdrop"></div>
+  <div class="palette-card">
+    <div class="palette-search-wrap">
+      <span class="palette-icon">⌕</span>
+      <input id="palette-input" type="text" placeholder="search cvars and commands…" spellcheck="false" autocomplete="off">
+      <span class="palette-hint">esc to close</span>
+    </div>
+    <div class="palette-results" id="palette-results"></div>
+  </div>
+</div>
 
 <div class="settings-pop" id="settings" hidden>
   <div class="set-row"><span class="set-k">preset</span><div class="seg" id="set-preset"></div></div>
@@ -54,7 +68,8 @@
     <div class="deck-head">
       <div class="deck-title"><span class="deck-icon" id="deck-icon">▣</span><h1 id="deck-name">Render</h1><span class="deck-count" id="deck-count"></span></div>
       <div class="deck-tools">
-        <label class="search"><span>⌕</span><input id="search" type="text" placeholder="filter" spellcheck="false" autocomplete="off"></label>
+        <label class="search"><span>⌕</span><input id="search" type="text" placeholder="filter cvars…" spellcheck="false" autocomplete="off"></label>
+        <button class="btn-ghost btn-fav" id="show-favorites" title="Show only favorites (★ to pin)">★</button>
         <button class="btn-ghost" id="reset-group" title="Reset this group to defaults">⟲ reset</button>
       </div>
     </div>
@@ -73,6 +88,16 @@
     <div class="panel tele-card">
       <div class="cap">telemetry <span class="cap-dim" id="tele-state">live</span></div>
       <div class="fps-big"><span id="fps-num">—</span><small>fps</small><canvas id="spark" class="spark" width="240" height="42"></canvas></div>
+      <div class="tele-graphs" id="tele-graphs">
+        <div class="tele-graph-row">
+          <div class="tele-graph-label"><span class="tg-k">FPS</span><span class="tg-v" id="tg-fps-val">—</span></div>
+          <canvas id="graph-fps" class="tele-canvas" width="240" height="52"></canvas>
+        </div>
+        <div class="tele-graph-row">
+          <div class="tele-graph-label"><span class="tg-k">Frame ms</span><span class="tg-v" id="tg-ms-val">—</span></div>
+          <canvas id="graph-ms" class="tele-canvas" width="240" height="52"></canvas>
+        </div>
+      </div>
       <div class="gauges" id="gauges"></div>
     </div>
     <div class="panel log-card">
