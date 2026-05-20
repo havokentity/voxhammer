@@ -100,6 +100,8 @@ function mockCvars() {
         C("voxel.lod.aggressive_eviction", "0", "bool", F.ARCHIVE, "Aggressively evict distant chunks."),
         C("audio.master_volume", "0.8", "float", F.ARCHIVE, "Master output volume.", R(0, 1, 0.01)),
         C("renderer.exposure", "1.0", "float", F.ARCHIVE, "Render exposure (pre-tonemap multiplier).", R(0.1, 4.0, 0.05)),
+        C("renderer.sun.azimuth", "0.7", "float", F.ARCHIVE, "Sun azimuth (radians).", R(0.0, 6.2832, 0.02)),
+        C("renderer.sun.elevation", "0.6", "float", F.ARCHIVE, "Sun elevation (radians; lower = longer shadows).", R(0.1, 1.5, 0.02)),
         C("camera.pos", "32 40 -24", "vec3", F.ARCHIVE, "Free-fly camera position (world units)."),
         C("camera.yaw", "0.0", "float", F.ARCHIVE, "Camera yaw (radians).", R(-3.1416, 3.1416, 0.02)),
         C("camera.pitch", "-0.5", "float", F.ARCHIVE, "Camera pitch (radians).", R(-1.5, 1.5, 0.02)),

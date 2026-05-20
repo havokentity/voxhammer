@@ -34,10 +34,9 @@ cbuffer Camera : register(b0) {
     float3 camUp;    int   gridDim;
     float3 clearCol; float exposure;
     float2 viewport; int   hdr; float pad;
+    float3 sunDir;   float pad2;
 };
 StructuredBuffer<uint> Voxels : register(t0);
-
-static const float3 SUN = float3(0.4268, 0.8536, 0.2988);  // normalize(0.5,1.0,0.35)
 
 struct VSOut { float4 pos : SV_Position; };
 VSOut VSMain(uint vid : SV_VertexID) {
@@ -125,8 +124,8 @@ float4 PSMain(VSOut i) : SV_Target {
         }
         if (hit) {
             float3 hp = ro + rd * tEnter;
-            float ndl = saturate(dot(nrm, SUN));
-            float shadow = occluded(hp + nrm * 0.02, SUN) ? 0.0 : 1.0;
+            float ndl = saturate(dot(nrm, sunDir));
+            float shadow = occluded(hp + nrm * 0.02, sunDir) ? 0.0 : 1.0;
             float3 alb = palette(mat);
             col = alb * (0.28 + 0.72 * ndl * shadow);   // ambient + shadowed sun
         } else {
@@ -147,6 +146,7 @@ struct CamCB {
     float camUp[3]; int gridDim;
     float clearCol[3]; float exposure;
     float viewport[2]; int hdr; float pad;
+    float sunDir[3]; float pad2;
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -157,8 +157,8 @@ std::vector<std::uint32_t> GenerateScene(UINT g) {
             for (UINT y = 0; y < g; ++y) {
                 std::uint32_t m = 0;
                 if (y < h) m = (y > h - 1.5f) ? 1u : (y > h - 5.0f ? 2u : 3u);
-                float dx = float(x) - 44, dy = float(y) - 30, dz = float(z) - 40;
-                if (dx * dx + dy * dy + dz * dz < 64.0f) m = 4;  // sphere r=8
+                float dx = float(x) - 44, dy = float(y) - 42, dz = float(z) - 40;
+                if (dx * dx + dy * dy + dz * dz < 64.0f) m = 4;  // floating sphere r=8 (casts a clear shadow)
                 v[size_t(z) * g * g + size_t(y) * g + x] = m;
             }
         }
@@ -381,6 +381,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         cb.camRight[i] = right[i];
         cb.camUp[i] = up[i];
         cb.clearCol[i] = fp.clear[i];
+        cb.sunDir[i] = fp.sun[i];
     }
     cb.fov = fp.cam_fov;
     cb.timeSec = fp.time_sec;
