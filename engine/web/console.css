@@ -112,6 +112,18 @@ body {
 .ctrl { background: var(--panel); border: 1px solid var(--edge); border-radius: var(--r); padding: 12px 13px; display: flex; flex-direction: column; gap: 10px; min-width: 0; overflow: hidden; }
 [data-skin="tactical"] .ctrl { border-radius: 0; }
 .ctrl.changed { box-shadow: inset 3px 0 0 var(--accent); }
+/* Inactive cards (not applicable for current lighting mode) stay in their stable
+   grid positions — they are dimmed and non-interactive, never removed. */
+.ctrl-inactive { opacity: 0.38; filter: saturate(0.35); transition: opacity .2s, filter .2s; }
+.ctrl-inactive .ctrl-body { pointer-events: none; }
+.ctrl-inactive .ctrl-body input,
+.ctrl-inactive .ctrl-body button,
+.ctrl-inactive .ctrl-body .toggle,
+.ctrl-inactive .ctrl-body .seg-opt,
+.ctrl-inactive .ctrl-body .nudge,
+.ctrl-inactive .ctrl-body .swatch { pointer-events: none; cursor: not-allowed; }
+/* inactive badge styling (reuses .badge base; accent-2 tint for distinction) */
+.inactive-badge { color: var(--faint) !important; border-color: var(--faint) !important; font-style: italic; }
 /* min-width:0 on flex row children prevents them from overflowing their card */
 .ctrl-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .ctrl-name { font-size: 13px; color: var(--fg); font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }

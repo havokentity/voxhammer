@@ -430,18 +430,22 @@ function renderDeck() {
     $("#deck-name").textContent = meta.label || state.cat;
     const host = $("#controls"); host.innerHTML = "";
     let list = visibleCvars();
-    // Context-sensitive visibility: in the Render category, filter cvars that are
-    // irrelevant for the current lighting mode (same rules as the Graphics deck).
-    if (state.cat === "renderer" || state.cat === "pinned") {
+    // Context-sensitive inactive state: in the Render (and Pinned) category, cards
+    // that don't apply to the current lighting mode are kept in their stable
+    // positions but visually dimmed via `ctrl-inactive` — no re-ordering.
+    const showLightingHint = (state.cat === "renderer" || state.cat === "pinned");
+    if (showLightingHint) {
         const hint = lightingModeHint();
-        if (hint && list.some((cv) => isHiddenByLightingMode(cv.name))) {
+        if (hint && list.some((cv) => isInactiveForLightingMode(cv.name))) {
             const hintEl = el("div", "ctrl-desc"); hintEl.style.gridColumn = "1 / -1"; hintEl.textContent = hint;
             host.appendChild(hintEl);
         }
-        list = list.filter((cv) => !isHiddenByLightingMode(cv.name));
     }
     $("#deck-count").textContent = `· ${list.length}`;
-    for (const cv of list) host.appendChild(buildControl(cv));
+    for (const cv of list) {
+        const inactive = showLightingHint && isInactiveForLightingMode(cv.name);
+        host.appendChild(buildControl(cv, inactive));
+    }
 }
 function badgeHtml(cv) {
     let h = "";
@@ -450,10 +454,11 @@ function badgeHtml(cv) {
     if (cv.flags & F.READONLY) h += `<span class="badge">lock</span>`;
     return h;
 }
-function buildControl(cv) {
-    const card = el("div", "ctrl" + (cv.value !== cv.default ? " changed" : "")); card.dataset.name = cv.name;
+function buildControl(cv, inactive) {
+    const inactiveCls = inactive ? " ctrl-inactive" : "";
+    const card = el("div", "ctrl" + (cv.value !== cv.default ? " changed" : "") + inactiveCls); card.dataset.name = cv.name;
     const head = el("div", "ctrl-head");
-    head.innerHTML = `<span class="ctrl-name" title="${cv.name}"><span class="ctrl-cat">${catOf(cv.name)}.</span>${shortName(cv.name)}</span><span class="ctrl-badges">${badgeHtml(cv)}</span>`;
+    head.innerHTML = `<span class="ctrl-name" title="${cv.name}"><span class="ctrl-cat">${catOf(cv.name)}.</span>${shortName(cv.name)}</span><span class="ctrl-badges">${badgeHtml(cv)}${inactive ? `<span class="badge inactive-badge">${inactiveModeLabel()}</span>` : ""}</span>`;
     const tools = el("div", "ctrl-tools");
     const pin = el("button", "icon-btn" + (state.pinned.has(cv.name) ? " pinned" : ""), "★"); pin.title = "pin";
     pin.onclick = () => { state.pinned.has(cv.name) ? state.pinned.delete(cv.name) : state.pinned.add(cv.name); persistPins(); pin.classList.toggle("pinned"); renderRail(); if (state.cat === "pinned") renderDeck(); };
@@ -615,22 +620,30 @@ function captureKey(btn) {
     document.addEventListener("keydown", onKey, true);
 }
 
-// ---------- lighting-mode cvar visibility ----------
-// Returns true if the given cvar name should be HIDDEN for the current lighting mode.
-// Missing cvars (not in state) are never hidden here — the callers already skip those.
-const LIGHTING_HIDE_PERFORMANCE = new Set(["renderer.gi.samples"]);
-const LIGHTING_HIDE_QUALITY     = new Set(["renderer.ao.samples", "renderer.ao.strength", "renderer.ao.radius", "renderer.ambient"]);
-function isHiddenByLightingMode(name) {
+// ---------- lighting-mode cvar inactive state ----------
+// Returns true if the given cvar name is INACTIVE (does not apply) for the current
+// lighting mode.  Cards are kept in their stable positions — the caller adds a
+// `ctrl-inactive` class instead of removing them from the DOM.
+const LIGHTING_INACTIVE_PERFORMANCE = new Set(["renderer.gi.samples"]);
+const LIGHTING_INACTIVE_QUALITY     = new Set(["renderer.ao.samples", "renderer.ao.strength", "renderer.ao.radius", "renderer.ambient"]);
+function isInactiveForLightingMode(name) {
     const mode = (state.cvars.get("renderer.lighting.mode") || {}).value || "PERFORMANCE";
-    if (mode === "PERFORMANCE") return LIGHTING_HIDE_PERFORMANCE.has(name);
-    if (mode === "QUALITY")     return LIGHTING_HIDE_QUALITY.has(name);
+    if (mode === "PERFORMANCE") return LIGHTING_INACTIVE_PERFORMANCE.has(name);
+    if (mode === "QUALITY")     return LIGHTING_INACTIVE_QUALITY.has(name);
     return false;
 }
 function lightingModeHint() {
     const mode = (state.cvars.get("renderer.lighting.mode") || {}).value || "PERFORMANCE";
-    if (mode === "QUALITY")     return "GI mode — AO settings hidden";
-    if (mode === "PERFORMANCE") return "Performance mode — GI settings hidden";
+    if (mode === "QUALITY")     return "GI mode active — AO cvars inactive";
+    if (mode === "PERFORMANCE") return "Performance mode — GI cvars inactive";
     return "";
+}
+// Returns a short label for the badge shown on inactive cards (e.g. "N/A in GI").
+function inactiveModeLabel() {
+    const mode = (state.cvars.get("renderer.lighting.mode") || {}).value || "PERFORMANCE";
+    if (mode === "QUALITY")     return "N/A in GI";
+    if (mode === "PERFORMANCE") return "N/A in Perf";
+    return "inactive";
 }
 
 // ---------- graphics panel ----------
@@ -671,7 +684,7 @@ function renderGraphicsDeck() {
     const advSection = el("div", "gfx-section gfx-advanced-section");
     advSection.appendChild(el("div", "gfx-section-hd", "Advanced"));
 
-    // Mode hint (e.g. "GI mode — AO settings hidden")
+    // Mode hint (e.g. "GI mode — AO cvars inactive")
     const hint = lightingModeHint();
     if (hint) advSection.appendChild(el("div", "ctrl-desc", hint));
 
@@ -680,8 +693,10 @@ function renderGraphicsDeck() {
     for (const name of GFX_ADVANCED_CVARS) {
         const cv = state.cvars.get(name);
         if (!cv) continue; // gracefully skip missing cvars
-        if (isHiddenByLightingMode(name)) continue; // context-sensitive visibility
-        grid.appendChild(buildControl(cv));
+        // Cards are always rendered in their stable order; inactive ones are
+        // dimmed and non-interactive rather than removed from the DOM.
+        const inactive = isInactiveForLightingMode(name);
+        grid.appendChild(buildControl(cv, inactive));
         shown++;
     }
     if (!shown) {
