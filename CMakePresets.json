@@ -29,6 +29,17 @@
       }
     },
     {
+      "name": "windows-clang-debug",
+      "displayName": "Windows · Debug (clang-cl)",
+      "inherits": "win-base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "VOX_BUILD_TESTS": "ON"
+      }
+    },
+    {
       "name": "windows-relwithdebinfo",
       "displayName": "Windows · RelWithDebInfo (clang-cl)",
       "inherits": "win-base",
@@ -53,11 +64,13 @@
   ],
   "buildPresets": [
     { "name": "windows-debug", "configurePreset": "windows-debug", "jobs": 0 },
+    { "name": "windows-clang-debug", "configurePreset": "windows-clang-debug", "jobs": 0 },
     { "name": "windows-relwithdebinfo", "configurePreset": "windows-relwithdebinfo", "jobs": 0 },
     { "name": "windows-release", "configurePreset": "windows-release", "jobs": 0 }
   ],
   "testPresets": [
     { "name": "windows-debug", "configurePreset": "windows-debug", "output": { "outputOnFailure": true } },
+    { "name": "windows-clang-debug", "configurePreset": "windows-clang-debug", "output": { "outputOnFailure": true } },
     { "name": "windows-release", "configurePreset": "windows-release", "output": { "outputOnFailure": true } }
   ]
 }
