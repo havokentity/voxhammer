@@ -112,6 +112,7 @@ void RegisterCoreCvars() {
     reg("voxel.cursor.x", "0", "3D cursor X for voxel.place (0..127).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 127, .range_step = 1});
     reg("voxel.cursor.y", "0", "3D cursor Y for voxel.place (0..127).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 127, .range_step = 1});
     reg("voxel.cursor.z", "0", "3D cursor Z for voxel.place (0..127).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 127, .range_step = 1});
+    reg("voxel.break_radius", "2", "Carve radius (voxels) for voxel.break.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 16, .range_step = 1});
     reg("audio.master_volume", "0.8", "Master output volume.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
     reg("camera.pos", "32 40 -24", "Free-fly camera position (world units).", {.type = CVarType::Vec3, .flags = CVAR_ARCHIVE});
     reg("camera.yaw", "0.0", "Camera yaw (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = -3.1416f, .range_max = 3.1416f, .range_step = 0.02f});
@@ -411,6 +412,38 @@ int main(int argc, char** argv) {
                 auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
                 renderer.SetVoxels(grid, world.Palette().data());
                 o.Print("voxel world cleared");
+            });
+
+        // voxel.break: ray-cast from the camera along its forward vector and carve
+        // a sphere (voxel.break_radius) out of the first solid voxel that's hit.
+        c.RegisterCommand("voxel.break",
+            "Carve a sphere (voxel.break_radius) out of the voxel the camera looks at.",
+            [&world, &renderer](std::span<const std::string_view>, Output& o) {
+                Console& cc = Console::Get();
+                float pos[3] = {0.0f, 0.0f, 0.0f};
+                if (CVar* cp = cc.FindCVar("camera.pos")) ParseRGB(cp->value, pos[0], pos[1], pos[2]);
+                const float yaw = cc.FindCVar("camera.yaw") ? cc.FindCVar("camera.yaw")->GetFloat() : 0.0f;
+                const float pitch = cc.FindCVar("camera.pitch") ? cc.FindCVar("camera.pitch")->GetFloat() : 0.0f;
+
+                // Forward convention -- MUST match the flycam in the run loop:
+                //   fwd = {cos(pitch)*sin(yaw), sin(pitch), cos(pitch)*cos(yaw)}
+                const float cp = std::cos(pitch), sp = std::sin(pitch);
+                const float cyw = std::cos(yaw), syw = std::sin(yaw);
+                const float fwd[3] = {cp * syw, sp, cp * cyw};
+
+                int hx = 0, hy = 0, hz = 0;
+                const float maxDist = static_cast<float>(vox::voxel::kWorldDim) * 2.0f;
+                if (!world.RaycastSolid(pos, fwd, maxDist, hx, hy, hz)) {
+                    o.Print("voxel.break: nothing solid in range");
+                    return;
+                }
+                const int radius = cc.FindCVar("voxel.break_radius")
+                                       ? cc.FindCVar("voxel.break_radius")->GetInt() : 2;
+                const int removed = world.CarveSphere(hx, hy, hz, radius);
+                auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
+                renderer.SetVoxels(grid, world.Palette().data());
+                o.Format("voxel.break: removed {} voxels around hit ({},{},{}) r={}",
+                         removed, hx, hy, hz, radius);
             });
     }
 

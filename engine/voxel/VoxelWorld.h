@@ -77,6 +77,20 @@ public:
     void SetVoxel(int x, int y, int z, std::uint8_t mat);
     std::uint8_t GetVoxel(int x, int y, int z) const noexcept;
 
+    // Destruction: erase every SOLID voxel whose center lies within Euclidean
+    // |radius| of (cx,cy,cz). Coordinates are clamped to [0,kWorldDim) per axis.
+    // Returns the number of voxels actually removed (i.e. solid -> empty).
+    int CarveSphere(int cx, int cy, int cz, int radius);
+
+    // CPU voxel ray-cast that matches the renderer's grid so picking is accurate.
+    // Walks an integer-voxel DDA from |origin| along |dir| (normalized internally)
+    // up to |maxDist| voxel-units. On the first SOLID voxel (GetVoxel != 0) found
+    // inside [0,kWorldDim) it returns true and writes the voxel coord to hitX/Y/Z.
+    // A ray that starts inside a solid voxel reports that start cell as the hit.
+    // Returns false if nothing solid is encountered within range.
+    bool RaycastSolid(const float origin[3], const float dir[3], float maxDist,
+                      int& hitX, int& hitY, int& hitZ) const noexcept;
+
     // Number of live (non-evicted) chunks in the resident map.
     unsigned ResidentChunks() const { return static_cast<unsigned>(chunks_.size()); }
 

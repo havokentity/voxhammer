@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <limits>
 
 namespace vox::voxel {
 
@@ -170,6 +171,116 @@ std::uint8_t VoxelWorld::GetVoxel(int x, int y, int z) const noexcept {
     unsigned lx, ly, lz;
     ChunkLocal(x, y, z, lx, ly, lz);
     return c->Get(lx, ly, lz);
+}
+
+int VoxelWorld::CarveSphere(int cx, int cy, int cz, int radius) {
+    if (radius < 0) return 0;
+
+    const int kDim = static_cast<int>(kWorldDim);
+    // Bounding box of the sphere, clamped to the valid voxel range [0,kDim).
+    const int x0 = std::max(0, cx - radius);
+    const int y0 = std::max(0, cy - radius);
+    const int z0 = std::max(0, cz - radius);
+    const int x1 = std::min(kDim - 1, cx + radius);
+    const int y1 = std::min(kDim - 1, cy + radius);
+    const int z1 = std::min(kDim - 1, cz + radius);
+
+    const long long r2 = static_cast<long long>(radius) * radius;
+    int removed = 0;
+    for (int z = z0; z <= z1; ++z) {
+        const long long dz = z - cz;
+        for (int y = y0; y <= y1; ++y) {
+            const long long dy = y - cy;
+            for (int x = x0; x <= x1; ++x) {
+                const long long dx = x - cx;
+                if (dx * dx + dy * dy + dz * dz > r2) continue;  // outside the sphere
+                if (GetVoxel(x, y, z) == 0) continue;            // already empty
+                SetVoxel(x, y, z, 0);                            // erase (auto-evicts empty chunks)
+                ++removed;
+            }
+        }
+    }
+    return removed;
+}
+
+bool VoxelWorld::RaycastSolid(const float origin[3], const float dir[3], float maxDist,
+                              int& hitX, int& hitY, int& hitZ) const noexcept {
+    // Normalize the direction; a degenerate (zero-length) ray cannot hit anything.
+    float dx = dir[0], dy = dir[1], dz = dir[2];
+    const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-12f) return false;
+    dx /= len; dy /= len; dz /= len;
+
+    const int kDim = static_cast<int>(kWorldDim);
+
+    // Current voxel cell (floor of the origin).
+    int vx = static_cast<int>(std::floor(origin[0]));
+    int vy = static_cast<int>(std::floor(origin[1]));
+    int vz = static_cast<int>(std::floor(origin[2]));
+
+    // If the ray starts inside a solid, in-bounds voxel, that cell is the hit.
+    auto inBounds = [kDim](int x, int y, int z) {
+        return x >= 0 && y >= 0 && z >= 0 && x < kDim && y < kDim && z < kDim;
+    };
+    if (inBounds(vx, vy, vz) && GetVoxel(vx, vy, vz) != 0) {
+        hitX = vx; hitY = vy; hitZ = vz;
+        return true;
+    }
+
+    // Amanatides & Woo voxel DDA setup.
+    const int stepX = (dx > 0.0f) ? 1 : (dx < 0.0f ? -1 : 0);
+    const int stepY = (dy > 0.0f) ? 1 : (dy < 0.0f ? -1 : 0);
+    const int stepZ = (dz > 0.0f) ? 1 : (dz < 0.0f ? -1 : 0);
+
+    const float kInf = std::numeric_limits<float>::infinity();
+    // tDelta: distance (in t, i.e. voxel-units along the normalized ray) to cross
+    // one full voxel on each axis. tMax: distance to the next voxel boundary.
+    const float tDeltaX = (stepX != 0) ? std::fabs(1.0f / dx) : kInf;
+    const float tDeltaY = (stepY != 0) ? std::fabs(1.0f / dy) : kInf;
+    const float tDeltaZ = (stepZ != 0) ? std::fabs(1.0f / dz) : kInf;
+
+    auto firstBoundary = [](float o, int v, int step, float invAbs) -> float {
+        if (step == 0) return std::numeric_limits<float>::infinity();
+        // Next integer boundary in the travel direction.
+        const float next = (step > 0) ? (static_cast<float>(v) + 1.0f) : static_cast<float>(v);
+        return (next - o) * (step > 0 ? invAbs : -invAbs);
+    };
+    float tMaxX = firstBoundary(origin[0], vx, stepX, tDeltaX);
+    float tMaxY = firstBoundary(origin[1], vy, stepY, tDeltaY);
+    float tMaxZ = firstBoundary(origin[2], vz, stepZ, tDeltaZ);
+
+    // March until we exceed maxDist or leave the grid for good.
+    float t = 0.0f;
+    // Safety cap on iterations (3 axes worth of cells across the grid + slack).
+    const int maxSteps = 3 * kDim + 3;
+    for (int i = 0; i < maxSteps; ++i) {
+        // Advance to the nearest axis boundary.
+        if (tMaxX <= tMaxY && tMaxX <= tMaxZ) {
+            vx += stepX; t = tMaxX; tMaxX += tDeltaX;
+        } else if (tMaxY <= tMaxZ) {
+            vy += stepY; t = tMaxY; tMaxY += tDeltaY;
+        } else {
+            vz += stepZ; t = tMaxZ; tMaxZ += tDeltaZ;
+        }
+
+        if (t > maxDist) return false;
+
+        if (inBounds(vx, vy, vz)) {
+            if (GetVoxel(vx, vy, vz) != 0) {
+                hitX = vx; hitY = vy; hitZ = vz;
+                return true;
+            }
+        } else {
+            // Once we've moved past the far side of the grid in the travel
+            // direction on any axis, no in-bounds voxel can ever be hit again.
+            if ((stepX > 0 && vx >= kDim) || (stepX < 0 && vx < 0) ||
+                (stepY > 0 && vy >= kDim) || (stepY < 0 && vy < 0) ||
+                (stepZ > 0 && vz >= kDim) || (stepZ < 0 && vz < 0)) {
+                return false;
+            }
+        }
+    }
+    return false;
 }
 
 void VoxelWorld::Bounds(int& xmin, int& ymin, int& zmin,

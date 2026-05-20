@@ -105,6 +105,132 @@ TEST_CASE("VoxelWorld: BakeFlatGrid clamps out-of-range voxels") {
 }
 
 // ---------------------------------------------------------------------------
+// VoxelWorld: CarveSphere destruction
+// ---------------------------------------------------------------------------
+TEST_CASE("VoxelWorld: CarveSphere removes a spherical region") {
+    vox::voxel::VoxelWorld w;
+    w.Init();
+
+    // Fill a solid 11^3 block centered on (20,20,20).
+    const int cx = 20, cy = 20, cz = 20;
+    for (int z = cx - 5; z <= cx + 5; ++z)
+        for (int y = cy - 5; y <= cy + 5; ++y)
+            for (int x = cz - 5; x <= cz + 5; ++x)
+                w.SetVoxel(x, y, z, 1);
+
+    // A voxel just outside the carve radius (radius 3) -- e.g. 5 units away on +X.
+    CHECK(w.GetVoxel(cx + 5, cy, cz) == 1);
+
+    const int removed = w.CarveSphere(cx, cy, cz, 3);
+
+    // Something was actually carved.
+    CHECK(removed > 0);
+
+    // Center is now empty.
+    CHECK(w.GetVoxel(cx, cy, cz) == 0);
+
+    // A voxel within the radius (2 units away) is gone.
+    CHECK(w.GetVoxel(cx + 2, cy, cz) == 0);
+
+    // A voxel outside the radius (5 units away, distance 5 > 3) survives.
+    CHECK(w.GetVoxel(cx + 5, cy, cz) == 1);
+
+    // Carving the same spot again removes nothing (already empty).
+    CHECK(w.CarveSphere(cx, cy, cz, 3) == 0);
+
+    w.Shutdown();
+}
+
+TEST_CASE("VoxelWorld: CarveSphere clamps to world bounds") {
+    vox::voxel::VoxelWorld w;
+    w.Init();
+
+    // Solid voxel at the world origin corner.
+    w.SetVoxel(0, 0, 0, 1);
+    // A large carve centered at the corner must not crash (negative coords clamped)
+    // and must still erase the in-bounds solid voxel.
+    const int removed = w.CarveSphere(0, 0, 0, 8);
+    CHECK(removed >= 1);
+    CHECK(w.GetVoxel(0, 0, 0) == 0);
+
+    w.Shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// VoxelWorld: RaycastSolid CPU picking
+// ---------------------------------------------------------------------------
+TEST_CASE("VoxelWorld: RaycastSolid hits a solid voxel along an axis") {
+    vox::voxel::VoxelWorld w;
+    w.Init();
+
+    // Single solid voxel at (10, 5, 5).
+    w.SetVoxel(10, 5, 5, 1);
+
+    // Cast from outside (x=0) straight along +X, aimed at the voxel center band.
+    const float origin[3] = {0.5f, 5.5f, 5.5f};
+    const float dir[3]    = {1.0f, 0.0f, 0.0f};
+    int hx = -1, hy = -1, hz = -1;
+    const bool hit = w.RaycastSolid(origin, dir, 128.0f, hx, hy, hz);
+    REQUIRE(hit);
+    CHECK(hx == 10);
+    CHECK(hy == 5);
+    CHECK(hz == 5);
+
+    w.Shutdown();
+}
+
+TEST_CASE("VoxelWorld: RaycastSolid misses through empty space") {
+    vox::voxel::VoxelWorld w;
+    w.Init();
+
+    // One solid voxel, but the ray is aimed well clear of it.
+    w.SetVoxel(10, 5, 5, 1);
+
+    const float origin[3] = {0.5f, 50.5f, 50.5f};  // far from the voxel
+    const float dir[3]    = {1.0f, 0.0f, 0.0f};
+    int hx = -1, hy = -1, hz = -1;
+    const bool hit = w.RaycastSolid(origin, dir, 128.0f, hx, hy, hz);
+    CHECK_FALSE(hit);
+
+    w.Shutdown();
+}
+
+TEST_CASE("VoxelWorld: RaycastSolid respects maxDist") {
+    vox::voxel::VoxelWorld w;
+    w.Init();
+
+    w.SetVoxel(50, 5, 5, 1);
+    const float origin[3] = {0.5f, 5.5f, 5.5f};
+    const float dir[3]    = {1.0f, 0.0f, 0.0f};
+    int hx = -1, hy = -1, hz = -1;
+
+    // Voxel is ~49 units away; a 10-unit ray must not reach it.
+    CHECK_FALSE(w.RaycastSolid(origin, dir, 10.0f, hx, hy, hz));
+    // A long-enough ray finds it.
+    CHECK(w.RaycastSolid(origin, dir, 100.0f, hx, hy, hz));
+    CHECK(hx == 50);
+
+    w.Shutdown();
+}
+
+TEST_CASE("VoxelWorld: RaycastSolid treats a start inside solid as a hit") {
+    vox::voxel::VoxelWorld w;
+    w.Init();
+
+    w.SetVoxel(7, 7, 7, 1);
+    // Origin sits inside the solid voxel (7,7,7).
+    const float origin[3] = {7.5f, 7.5f, 7.5f};
+    const float dir[3]    = {1.0f, 0.0f, 0.0f};
+    int hx = -1, hy = -1, hz = -1;
+    REQUIRE(w.RaycastSolid(origin, dir, 32.0f, hx, hy, hz));
+    CHECK(hx == 7);
+    CHECK(hy == 7);
+    CHECK(hz == 7);
+
+    w.Shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // VoxImport: parse a minimal hand-crafted .vox byte buffer
 // ---------------------------------------------------------------------------
 namespace {
