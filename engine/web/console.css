@@ -324,3 +324,79 @@ body {
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--edge-hi); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+
+/* ---------- command palette ---------- */
+.palette-btn { width: 38px; height: 38px; border-radius: var(--r-sm); background: var(--panel); border: 1px solid var(--edge); color: var(--dim); cursor: pointer; font-size: 16px; font-family: var(--mono); transition: color .12s, border-color .12s; }
+.palette-btn:hover { color: var(--accent); border-color: var(--accent); }
+[data-skin="tactical"] .palette-btn { border-radius: 0; }
+
+.palette-overlay { position: fixed; inset: 0; z-index: 90; display: flex; align-items: flex-start; justify-content: center; padding-top: 80px; }
+.palette-overlay[hidden] { display: none; }
+.palette-backdrop { position: absolute; inset: 0; background: rgba(6,9,14,.72); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+.palette-card { position: relative; z-index: 1; width: min(640px, 92vw); background: var(--panel-2); border: 1px solid var(--edge-hi); border-radius: var(--r); box-shadow: 0 32px 90px -20px rgba(0,0,0,.9), 0 0 0 1px rgba(255,255,255,.04); overflow: hidden; }
+[data-skin="tactical"] .palette-card { border-radius: 0; }
+[data-skin="tactical"] .palette-card::before, [data-skin="tactical"] .palette-card::after { content: ""; position: absolute; width: 13px; height: 13px; border: 2px solid var(--accent); pointer-events: none; z-index: 2; }
+[data-skin="tactical"] .palette-card::before { top: -1px; left: -1px; border-right: 0; border-bottom: 0; }
+[data-skin="tactical"] .palette-card::after  { bottom: -1px; right: -1px; border-left: 0; border-top: 0; }
+
+.palette-search-wrap { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--edge); }
+.palette-icon { color: var(--accent); font-size: 17px; flex: none; }
+.palette-search-wrap input { flex: 1; background: none; border: 0; color: var(--fg); font: inherit; font-size: 15px; outline: none; }
+.palette-search-wrap input::placeholder { color: var(--faint); }
+.palette-hint { font-size: 10px; color: var(--faint); text-transform: uppercase; letter-spacing: 1px; flex: none; }
+
+.palette-results { max-height: 400px; overflow-y: auto; }
+.pal-section { padding: 6px 0 2px; }
+.pal-section-hd { padding: 4px 16px; font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: var(--faint); }
+.pal-item { display: flex; align-items: center; gap: 12px; padding: 9px 16px; cursor: pointer; border: 0; background: none; width: 100%; text-align: left; font: inherit; color: var(--fg); }
+.pal-item:hover, .pal-item.focused { background: rgba(255,255,255,.05); }
+.pal-item.focused { background: linear-gradient(90deg, var(--glow), rgba(255,255,255,.03) 70%); border-left: 2px solid var(--accent); padding-left: 14px; }
+.pal-item-icon { font-size: 14px; color: var(--accent); width: 18px; text-align: center; flex: none; }
+.pal-item-body { flex: 1; min-width: 0; }
+.pal-item-name { font-size: 13px; font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pal-item-name mark { background: none; color: var(--accent); font-weight: 700; }
+.pal-item-desc { font-size: 11px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+.pal-item-badge { font-size: 9px; padding: 2px 7px; border-radius: 4px; background: var(--panel); border: 1px solid var(--edge-hi); color: var(--dim); flex: none; text-transform: uppercase; letter-spacing: .5px; }
+.pal-item-badge.cmd { color: var(--accent-2); border-color: var(--accent-2); }
+.pal-item-value { font-family: var(--mono); font-size: 11px; color: var(--accent); flex: none; max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pal-empty { padding: 28px 16px; text-align: center; color: var(--faint); font-size: 13px; }
+.pal-kbd { font-size: 9px; padding: 2px 6px; border-radius: 4px; background: var(--panel); border: 1px solid var(--edge-hi); color: var(--dim); font-family: var(--mono); letter-spacing: .5px; flex: none; }
+[data-skin="tactical"] .pal-item.focused { border-radius: 0; }
+[data-skin="tactical"] .pal-kbd, [data-skin="tactical"] .pal-item-badge { border-radius: 0; }
+
+/* ---------- telemetry graphs ---------- */
+.tele-graphs { display: flex; flex-direction: column; gap: 4px; padding: 4px 14px 8px; }
+.tele-graph-row { display: flex; flex-direction: column; gap: 3px; }
+.tele-graph-label { display: flex; justify-content: space-between; align-items: baseline; }
+.tg-k { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); }
+.tg-v { font-family: var(--mono); font-size: 12px; color: var(--accent); font-variant-numeric: tabular-nums; }
+.tele-canvas { width: 100%; height: 52px; display: block; border-radius: var(--r-sm); background: var(--panel-2); border: 1px solid var(--edge); }
+[data-skin="tactical"] .tele-canvas { border-radius: 0; }
+
+/* ---------- favorites button active state ---------- */
+.btn-fav { min-width: 36px; padding: 0 10px; font-size: 14px; }
+.btn-fav.active { color: var(--accent); border-color: var(--accent); background: rgba(110,139,255,.1); }
+
+/* ---------- tablet responsive additions ---------- */
+@media (min-width: 600px) and (max-width: 979px) {
+    .stage { padding: var(--gap); }
+    .tele-canvas { height: 44px; }
+    .controls { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+    .palette-card { width: min(580px, 95vw); }
+    .palette-hint { display: none; }
+}
+@media (max-width: 599px) {
+    .tele-graphs { padding: 4px 10px 8px; }
+    .tele-canvas { height: 38px; }
+    .palette-card { width: 96vw; }
+    .palette-results { max-height: 52vh; }
+    .palette-hint { display: none; }
+    .pal-item-desc { display: none; }
+}
+
+/* touch-device palette ergonomics */
+@media (pointer: coarse) {
+    .pal-item { padding: 13px 16px; }
+    .palette-search-wrap input { font-size: 16px; } /* avoid iOS zoom */
+    .palette-btn { width: 44px; height: 44px; }
+}
