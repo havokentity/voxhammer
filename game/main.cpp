@@ -507,8 +507,18 @@ int main(int argc, char** argv) {
                 const int radius = cc.FindCVar("voxel.break_radius")
                                        ? cc.FindCVar("voxel.break_radius")->GetInt() : 2;
                 const int removed = world.CarveSphere(hx, hy, hz, radius);
-                auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
-                renderer.SetVoxels(grid, world.Palette().data());
+                // Push ONLY the carved region to the GPU (incremental, no full
+                // re-bake and no GPU stall) so rapid carving stays smooth.
+                const int G = static_cast<int>(vox::voxel::kWorldDim);
+                const int x0 = std::max(0, hx - radius), y0 = std::max(0, hy - radius), z0 = std::max(0, hz - radius);
+                const int x1 = std::min(G, hx + radius + 1), y1 = std::min(G, hy + radius + 1), z1 = std::min(G, hz + radius + 1);
+                std::vector<std::uint32_t> region;
+                region.reserve(static_cast<std::size_t>(x1 - x0) * (y1 - y0) * (z1 - z0));
+                for (int z = z0; z < z1; ++z)
+                    for (int y = y0; y < y1; ++y)
+                        for (int x = x0; x < x1; ++x)
+                            region.push_back(static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
+                renderer.EditVoxels(x0, y0, z0, x1, y1, z1, region.data(), nullptr);  // palette unchanged by carve
                 o.Format("voxel.break: removed {} voxels around hit ({},{},{}) r={}",
                          removed, hx, hy, hz, radius);
             });

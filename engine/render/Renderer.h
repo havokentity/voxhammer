@@ -88,6 +88,17 @@ public:
     // Call from the main thread (WaitIdle is used internally to sync the GPU).
     void SetVoxels(const std::vector<std::uint32_t>& grid, const std::uint32_t* palette256);
 
+    // Incremental edit: update only the voxels in the box [x0,x1) x [y0,y1) x
+    // [z0,z1) (and the brick-occupancy cells they touch) from |region|, a flat
+    // (x1-x0)(y1-y0)(z1-z0) array indexed local-z*dy*dx + local-y*dx + local-x.
+    // No GPU stall -- writes the persistently-mapped buffer directly (uint32
+    // stores are atomic, so at most a 1-frame old/new mix on the edited cells,
+    // invisible for voxel edits). Use this for live carve/paint so the frame
+    // never freezes; SetVoxels remains for full-grid swaps (load/clear).
+    // palette256 may be null to leave the palette unchanged. Main thread.
+    void EditVoxels(int x0, int y0, int z0, int x1, int y1, int z1,
+                    const std::uint32_t* region, const std::uint32_t* palette256);
+
     // Capture the current backbuffer and save it to |path|.
     // png=true -> PNG (stb_image_write); png=false -> BMP.
     // Returns false if DX12 is not initialised or the write fails.

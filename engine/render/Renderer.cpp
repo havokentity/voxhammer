@@ -1259,6 +1259,60 @@ void Renderer::SetVoxels(const std::vector<std::uint32_t>& grid, const std::uint
     d.accHave    = false;
 }
 
+void Renderer::EditVoxels(int x0, int y0, int z0, int x1, int y1, int z1,
+                          const std::uint32_t* region, const std::uint32_t* palette256) {
+    if (!valid_ || !region) return;
+    Impl& d = *impl_;
+    const int G = static_cast<int>(kGrid);
+    x0 = std::max(0, x0); y0 = std::max(0, y0); z0 = std::max(0, z0);
+    x1 = std::min(G, x1); y1 = std::min(G, y1); z1 = std::min(G, z1);
+    if (x0 >= x1 || y0 >= y1 || z0 >= z1) return;
+    const int dx = x1 - x0, dy = y1 - y0;
+
+    // Write only the edited cells straight into the persistently-mapped buffer.
+    // NO WaitIdle: aligned uint32 stores are atomic, so the GPU reads either the
+    // old or new value per cell for at most one frame -- invisible for an edit.
+    if (d.voxelPtr) {
+        for (int z = z0; z < z1; ++z)
+            for (int y = y0; y < y1; ++y) {
+                const std::size_t dstRow = (static_cast<std::size_t>(z) * G + y) * G;
+                const std::size_t srcRow = (static_cast<std::size_t>(z - z0) * dy + (y - y0)) * dx;
+                for (int x = x0; x < x1; ++x)
+                    d.voxelPtr[dstRow + x] = region[srcRow + (x - x0)];
+            }
+    }
+    if (d.palettePtr && palette256)
+        std::memcpy(d.palettePtr, palette256, 256 * sizeof(std::uint32_t));
+
+    // Refresh only the brick-occupancy cells overlapping the edit box (rescan
+    // each affected brick's voxels in the buffer we just updated).
+    if (d.brickPtr && d.voxelPtr) {
+        const int BD = static_cast<int>(kBrickDim);
+        const int bx0 = x0 / BD, bx1 = (x1 - 1) / BD;
+        const int by0 = y0 / BD, by1 = (y1 - 1) / BD;
+        const int bz0 = z0 / BD, bz1 = (z1 - 1) / BD;
+        for (int bz = bz0; bz <= bz1; ++bz)
+            for (int by = by0; by <= by1; ++by)
+                for (int bx = bx0; bx <= bx1; ++bx) {
+                    std::uint32_t occ = 0u;
+                    const int cz1 = std::min(G, bz * BD + BD);
+                    const int cy1 = std::min(G, by * BD + BD);
+                    const int cx1 = std::min(G, bx * BD + BD);
+                    for (int z = bz * BD; z < cz1 && !occ; ++z)
+                        for (int y = by * BD; y < cy1 && !occ; ++y) {
+                            const std::size_t row = (static_cast<std::size_t>(z) * G + y) * G;
+                            for (int x = bx * BD; x < cx1; ++x)
+                                if (d.voxelPtr[row + x] != 0u) { occ = 1u; break; }
+                        }
+                    d.brickPtr[(static_cast<std::size_t>(bz) * kBrickGrid + by) * kBrickGrid + bx] = occ;
+                }
+    }
+
+    // Geometry changed -> restart GI accumulation (cheap; converges again).
+    d.accumFrame = 0;
+    d.accHave    = false;
+}
+
 void Renderer::SetGiDenoise(bool enabled) {
     if (!impl_) return;
     Impl& d = *impl_;
@@ -1418,6 +1472,7 @@ Renderer::~Renderer() {}
 bool Renderer::Init(void*, int, int, const std::vector<std::uint32_t>*, const std::uint32_t*) { return false; }
 void Renderer::RenderFrame(const FrameParams&) {}
 void Renderer::SetVoxels(const std::vector<std::uint32_t>&, const std::uint32_t*) {}
+void Renderer::EditVoxels(int, int, int, int, int, int, const std::uint32_t*, const std::uint32_t*) {}
 void Renderer::SetGiDenoise(bool) {}
 void Renderer::SetEmptySpaceSkip(bool) {}
 void Renderer::SetGiDebug(bool) {}
