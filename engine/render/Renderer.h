@@ -9,16 +9,20 @@ namespace vox::render {
 // Per-frame inputs the renderer needs from the engine (filled from cvars in
 // main): the clear/sky color and a free-fly camera.
 struct FrameParams {
-    float clear[3]   = {0.05f, 0.05f, 0.08f};
-    float cam_pos[3] = {32.0f, 40.0f, -24.0f};
-    float cam_yaw    = 0.0f;    // radians, around +Y
-    float cam_pitch  = -0.5f;   // radians
-    float cam_fov    = 1.2f;    // radians (vertical)
-    float time_sec   = 0.0f;
-    float exposure   = 1.0f;
-    int   hdr        = 0;       // 1 = ACES tonemap (stand-in for HDR10 output)
-    float sun[3]     = {0.55f, 0.62f, 0.56f};  // normalized sun direction
-    float ambient    = 0.28f;                  // ambient/fill light fraction
+    float clear[3]        = {0.05f, 0.05f, 0.08f};
+    float cam_pos[3]      = {32.0f, 40.0f, -24.0f};
+    float cam_yaw         = 0.0f;    // radians, around +Y
+    float cam_pitch       = -0.5f;   // radians
+    float cam_fov         = 1.2f;    // radians (vertical)
+    float time_sec        = 0.0f;
+    float exposure        = 1.0f;
+    int   hdr             = 0;       // 1 = ACES tonemap (stand-in for HDR10 output)
+    float sun[3]          = {0.55f, 0.62f, 0.56f};  // normalized sun direction
+    float ambient         = 0.28f;                  // ambient/fill light fraction
+    // Lighting quality controls
+    float shadow_softness = 0.08f;   // half-angle (rad) for penumbra jitter; 0 = hard shadow
+    float ao_strength     = 0.55f;   // 0..1, how dark fully-occluded ambient gets
+    float ao_radius       = 4.0f;    // world-space voxel radius for AO rays
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen
