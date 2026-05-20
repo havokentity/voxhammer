@@ -252,7 +252,7 @@ int ConsoleServer::HttpHandler(mg_connection* conn, void* cbdata) {
 
 int ConsoleServer::HandleLogin(mg_connection* conn) {
     const mg_request_info* ri = mg_get_request_info(conn);
-    std::string addr = ri->remote_addr ? ri->remote_addr : "?";
+    std::string addr = ri->remote_addr;  // civetweb fills a fixed char[]; always valid
     auto now = clock_t_::now();
 
     if (!impl_->OriginAllowed(mg_get_header(conn, "Origin"))) {

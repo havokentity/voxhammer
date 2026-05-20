@@ -2,6 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "voxhammer",
   "version": "0.1.0",
+  "builtin-baseline": "e5a4f54c0d562059e9ccc6f7e7150667da58fe41",
   "description": "Voxhammer -- standalone Windows DX12 voxel-destruction engine + no-narrative sandbox.",
   "homepage": "https://github.com/havokentity/voxhammer",
   "license": "MIT",

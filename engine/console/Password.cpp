@@ -22,7 +22,7 @@ bool HashingIsCryptographic() {
 namespace {
 constexpr const char* kStubPrefix = "argon2id-stub$";
 
-std::string StubHash(std::string_view pw) {
+[[maybe_unused]] std::string StubHash(std::string_view pw) {
     // FNV-1a, hex. NOT secure -- a placeholder until libsodium is linked, just
     // so the skeleton stores a hash-shaped, non-reversible-at-a-glance token
     // instead of the plaintext.

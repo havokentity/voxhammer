@@ -18,20 +18,29 @@ function(vox_target_options target)
     if(MSVC)  # true for both cl and clang-cl
         target_compile_options(${target} PRIVATE
             /utf-8
-            /permissive-
             /EHsc
-            /Zc:preprocessor
             $<$<CONFIG:Debug>:/Od>
             $<$<NOT:$<CONFIG:Debug>>:/O2>
         )
+        # cl-only flags; clang-cl warns they are unused.
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+            target_compile_options(${target} PRIVATE /permissive- /Zc:preprocessor)
+        endif()
     endif()
 endfunction()
 
 # Warning policy. Kept separate so test / third-party-glue targets can opt out.
-# Not warnings-as-errors yet (skeleton pass); tighten in a later pass.
+# Not warnings-as-errors yet; tighten in a later pass.
 function(vox_target_warnings target)
-    if(MSVC)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
         target_compile_options(${target} PRIVATE /W4 /wd4100 /wd4201)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")  # clang-cl
+        target_compile_options(${target} PRIVATE
+            /W4
+            -Wno-unused-parameter
+            -Wno-missing-field-initializers
+            -Wno-missing-designated-field-initializers
+        )
     endif()
 endfunction()
 
