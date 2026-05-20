@@ -13,11 +13,13 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -444,6 +446,11 @@ struct Renderer::Impl {
     std::uint8_t*                     camPtr = nullptr;
     ComPtr<ID3D12Resource>            accumBuf;       // GI temporal accumulation (RWStructuredBuffer<float4>)
     ComPtr<ID3D12Resource>            blueNoiseBuf;   // 64x64 blue-noise tile (StructuredBuffer<float> t1)
+    float*                            bnPtr      = nullptr;      // persistent map into blueNoiseBuf
+    std::vector<float>                bnTile;                   // async-baked real tile (worker writes here)
+    std::thread                       bnThread;                 // background void-and-cluster bake
+    std::atomic<bool>                 bnReady{false};           // worker sets true when bnTile is complete
+    bool                              bnUploaded = false;       // set true once we've swapped real tile in
     float                             accKey[23] = {};
     bool                              accHave = false;
     UINT                              accumFrame = 0;
@@ -641,10 +648,21 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     //   2. Repeatedly find the tightest cluster and the largest void; swap them.
     //      Repeat until stable.
     //   3. Rank the 4096 entries by insertion order -> uniform float in [0,1).
+    //
+    // Cache HIT:  load from disk, upload synchronously, no thread.
+    // Cache MISS: fill blueNoiseBuf with a cheap hash-based fallback so rendering works
+    //             from frame 1, then spawn a background thread that runs the full
+    //             void-and-cluster bake, writes the disk cache, and sets bnReady.
+    //             RenderFrame swaps the real tile in once the thread is done.
     {
         constexpr int BN = 64;
         constexpr int BN2 = BN * BN;
-        std::vector<float> bn(BN2);
+
+        // Allocate blueNoiseBuf as a persistently-mapped upload buffer so we can
+        // re-upload the real tile later without re-mapping.
+        d.blueNoiseBuf = d.MakeUpload(static_cast<UINT64>(BN2) * sizeof(float));
+        if (!d.blueNoiseBuf) return false;
+        d.blueNoiseBuf->Map(0, &none, reinterpret_cast<void**>(&d.bnPtr));
 
         // Bake the void-and-cluster tile at most once per machine; cache it in the
         // user data dir so later boots load instantly (generation costs a few seconds).
@@ -652,121 +670,121 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
             std::filesystem::path(vox::platform::UserDataDir()) / "bluenoise64.bin";
         bool loaded = false;
         {
+            std::vector<float> bn(BN2);
             std::ifstream cacheIn(cachePath, std::ios::binary);
             if (cacheIn) {
                 cacheIn.read(reinterpret_cast<char*>(bn.data()), std::streamsize(BN2 * sizeof(float)));
                 if (cacheIn.gcount() == std::streamsize(BN2 * sizeof(float))) {
                     loaded = true;
                     vox::log::Info("DX12: loaded cached blue-noise tile");
+                    std::memcpy(d.bnPtr, bn.data(), static_cast<UINT64>(BN2) * sizeof(float));
                 }
             }
         }
 
         if (!loaded) {
-        vox::log::Info("DX12: baking blue-noise tile (one-time, a few seconds)...");
+            // Cache MISS: write a cheap hash-based white-noise fallback into the
+            // buffer so the GPU has valid data from the very first frame.
+            // Using a simple integer hash (Wang hash variant) to produce floats in [0,1).
+            {
+                float* dst = d.bnPtr;
+                for (int i = 0; i < BN2; ++i) {
+                    std::uint32_t hv = static_cast<std::uint32_t>(i);
+                    hv = (hv ^ 61u) ^ (hv >> 16u);
+                    hv *= 9u;
+                    hv ^= hv >> 4u;
+                    hv *= 0x27D4EB2Du;
+                    hv ^= hv >> 15u;
+                    dst[i] = (hv & 0xFFFFu) / 65536.0f;
+                }
+            }
 
-        // Gaussian kernel sigma for cluster/void energy (wrapping toroidal distance).
-        auto energy = [&](const std::vector<int>& pat, int cx, int cy) -> float {
-            float e = 0.0f;
-            for (int dy = -7; dy <= 7; ++dy) {
-                for (int dx = -7; dx <= 7; ++dx) {
-                    int nx = (cx + dx + BN) & (BN - 1);
-                    int ny = (cy + dy + BN) & (BN - 1);
-                    if (pat[ny * BN + nx]) {
-                        float d2 = float(dx * dx + dy * dy);
-                        e += std::exp(-d2 * 0.4f);  // sigma≈1.58
+            vox::log::Info("DX12: baking blue-noise tile in background (one-time)...");
+
+            // Spawn background thread: runs the full void-and-cluster bake, writes
+            // disk cache, then signals bnReady so RenderFrame can swap the real tile in.
+            d.bnTile.resize(BN2);
+            d.bnThread = std::thread([&impl = *impl_, cachePath]() {
+                constexpr int BN  = 64;
+                constexpr int BN2 = BN * BN;
+
+                // Gaussian kernel energy (wrapping toroidal distance, sigma≈1.58).
+                auto energy = [&](const std::vector<int>& pat, int cx, int cy) -> float {
+                    float e = 0.0f;
+                    for (int dy = -7; dy <= 7; ++dy) {
+                        for (int dx = -7; dx <= 7; ++dx) {
+                            int nx = (cx + dx + BN) & (BN - 1);
+                            int ny = (cy + dy + BN) & (BN - 1);
+                            if (pat[ny * BN + nx]) {
+                                float d2 = float(dx * dx + dy * dy);
+                                e += std::exp(-d2 * 0.4f);
+                            }
+                        }
                     }
-                }
-            }
-            return e;
-        };
+                    return e;
+                };
 
-        // Seed: deterministic LCG to avoid rand() platform drift.
-        std::vector<int> pat(BN2, 0);
-        std::uint32_t lcg = 0xA5F1C3B7u;
-        for (int i = 0; i < BN2; ++i) {
-            lcg = lcg * 1664525u + 1013904223u;
-            if ((lcg >> 24) < 26u) pat[i] = 1;   // ~10 % density
+                // Seed: deterministic LCG to avoid rand() platform drift.
+                std::vector<int> pat(BN2, 0);
+                std::uint32_t lcg = 0xA5F1C3B7u;
+                for (int i = 0; i < BN2; ++i) {
+                    lcg = lcg * 1664525u + 1013904223u;
+                    if ((lcg >> 24) < 26u) pat[i] = 1;   // ~10 % density
+                }
+
+                // Iterate void-and-cluster swaps until convergence (max 200 rounds).
+                for (int iter = 0; iter < 200; ++iter) {
+                    int clusterIdx = -1; float maxE = -1.0f;
+                    for (int i = 0; i < BN2; ++i) {
+                        if (pat[i]) { float e = energy(pat, i % BN, i / BN); if (e > maxE) { maxE = e; clusterIdx = i; } }
+                    }
+                    int voidIdx = -1; float minE = 1e30f;
+                    for (int i = 0; i < BN2; ++i) {
+                        if (!pat[i]) { float e = energy(pat, i % BN, i / BN); if (e < minE) { minE = e; voidIdx = i; } }
+                    }
+                    if (voidIdx < 0 || clusterIdx < 0 || clusterIdx == voidIdx) break;
+                    pat[clusterIdx] = 0;
+                    pat[voidIdx]    = 1;
+                }
+
+                // Rank to produce a uniform float tile.
+                // Phase 1: remove ones in cluster order.
+                std::vector<int> rank(BN2, -1);
+                std::vector<int> cur = pat;
+                int ones = 0; for (auto v : cur) ones += v;
+                for (int r = ones - 1; r >= 0; --r) {
+                    int ci = -1; float maxE = -1.0f;
+                    for (int i = 0; i < BN2; ++i) {
+                        if (cur[i]) { float e = energy(cur, i % BN, i / BN); if (e > maxE) { maxE = e; ci = i; } }
+                    }
+                    if (ci < 0) break;
+                    rank[ci] = r; cur[ci] = 0;
+                }
+                // Phase 2: fill zeros in void order.
+                cur = pat;
+                for (int r = ones; r < BN2; ++r) {
+                    int vi = -1; float minE = 1e30f;
+                    for (int i = 0; i < BN2; ++i) {
+                        if (!cur[i]) { float e = energy(cur, i % BN, i / BN); if (e < minE) { minE = e; vi = i; } }
+                    }
+                    if (vi < 0) break;
+                    rank[vi] = r; cur[vi] = 1;
+                }
+
+                for (int i = 0; i < BN2; ++i)
+                    impl.bnTile[i] = (rank[i] >= 0) ? (float(rank[i]) + 0.5f) / float(BN2) : 0.0f;
+
+                // Write disk cache.
+                std::error_code mkec;
+                std::filesystem::create_directories(cachePath.parent_path(), mkec);
+                std::ofstream of(cachePath, std::ios::binary);
+                if (of) of.write(reinterpret_cast<const char*>(impl.bnTile.data()),
+                                 std::streamsize(BN2 * sizeof(float)));
+
+                // Signal main thread that the tile is ready.
+                impl.bnReady.store(true, std::memory_order_release);
+            });
         }
-
-        // Iterate void-and-cluster swaps until convergence (max 200 rounds).
-        for (int iter = 0; iter < 200; ++iter) {
-            // Find tightest cluster (highest energy among set pixels).
-            int clusterIdx = -1;
-            float maxE = -1.0f;
-            for (int i = 0; i < BN2; ++i) {
-                if (pat[i]) {
-                    float e = energy(pat, i % BN, i / BN);
-                    if (e > maxE) { maxE = e; clusterIdx = i; }
-                }
-            }
-            // Find largest void (lowest energy among unset pixels).
-            int voidIdx = -1;
-            float minE = 1e30f;
-            for (int i = 0; i < BN2; ++i) {
-                if (!pat[i]) {
-                    float e = energy(pat, i % BN, i / BN);
-                    if (e < minE) { minE = e; voidIdx = i; }
-                }
-            }
-            if (clusterIdx == voidIdx || voidIdx < 0 || clusterIdx < 0) break;
-            if (clusterIdx == voidIdx) break;
-            pat[clusterIdx] = 0;
-            pat[voidIdx]    = 1;
-        }
-
-        // Rank to produce a rank-based float tile.
-        // Phase 1: remove ones in cluster order, record removal rank.
-        std::vector<int> rank(BN2, -1);
-        std::vector<int> cur = pat;
-        int ones = 0;
-        for (auto v : cur) ones += v;
-
-        for (int r = ones - 1; r >= 0; --r) {
-            int clusterIdx = -1;
-            float maxE = -1.0f;
-            for (int i = 0; i < BN2; ++i) {
-                if (cur[i]) {
-                    float e = energy(cur, i % BN, i / BN);
-                    if (e > maxE) { maxE = e; clusterIdx = i; }
-                }
-            }
-            if (clusterIdx < 0) break;
-            rank[clusterIdx] = r;
-            cur[clusterIdx]  = 0;
-        }
-
-        // Phase 2: fill zeros in void order.
-        cur = pat;
-        for (int r = ones; r < BN2; ++r) {
-            int voidIdx = -1;
-            float minE = 1e30f;
-            for (int i = 0; i < BN2; ++i) {
-                if (!cur[i]) {
-                    float e = energy(cur, i % BN, i / BN);
-                    if (e < minE) { minE = e; voidIdx = i; }
-                }
-            }
-            if (voidIdx < 0) break;
-            rank[voidIdx] = r;
-            cur[voidIdx]  = 1;
-        }
-
-        for (int i = 0; i < BN2; ++i)
-            bn[i] = (rank[i] >= 0) ? (float(rank[i]) + 0.5f) / float(BN2) : 0.0f;
-
-        std::error_code mkec;
-        std::filesystem::create_directories(cachePath.parent_path(), mkec);
-        std::ofstream of(cachePath, std::ios::binary);
-        if (of) of.write(reinterpret_cast<const char*>(bn.data()), std::streamsize(BN2 * sizeof(float)));
-        }  // end if (!loaded)
-
-        d.blueNoiseBuf = d.MakeUpload(static_cast<UINT64>(BN2) * sizeof(float));
-        if (!d.blueNoiseBuf) return false;
-        void* bnPtr = nullptr;
-        d.blueNoiseBuf->Map(0, &none, &bnPtr);
-        std::memcpy(bnPtr, bn.data(), static_cast<UINT64>(BN2) * sizeof(float));
-        d.blueNoiseBuf->Unmap(0, nullptr);
     }
 
     valid_ = true;
@@ -777,6 +795,19 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
 void Renderer::RenderFrame(const FrameParams& fp) {
     if (!valid_) return;
     Impl& d = *impl_;
+
+    // Async blue-noise swap: if the background bake finished and we haven't yet
+    // copied the real tile, do a one-time WaitIdle + memcpy + thread join.
+    if (!d.bnUploaded && d.bnReady.load(std::memory_order_acquire)) {
+        constexpr int BN2 = 64 * 64;
+        d.WaitIdle();   // ensure GPU is not mid-read of blueNoiseBuf
+        std::memcpy(d.bnPtr, d.bnTile.data(), static_cast<UINT64>(BN2) * sizeof(float));
+        d.bnUploaded = true;
+        if (d.bnThread.joinable()) d.bnThread.join();
+        d.bnTile.clear();
+        d.bnTile.shrink_to_fit();
+        vox::log::Info("DX12: blue-noise tile ready (async)");
+    }
 
     // camera basis from yaw/pitch
     float cp = std::cos(fp.cam_pitch), sp = std::sin(fp.cam_pitch);
@@ -881,7 +912,11 @@ void Renderer::RenderFrame(const FrameParams& fp) {
 }
 
 void Renderer::Shutdown() {
-    if (impl_) impl_->WaitIdle();
+    if (impl_) {
+        // Join the background bake thread before tearing down DX12 resources.
+        if (impl_->bnThread.joinable()) impl_->bnThread.join();
+        impl_->WaitIdle();
+    }
     if (impl_ && impl_->fenceEvent) {
         CloseHandle(impl_->fenceEvent);
         impl_->fenceEvent = nullptr;
