@@ -3,6 +3,7 @@
 add_library(vox_ecs STATIC
     EcsWorld.cpp
     EcsWorld.h
+    components.h
 )
 
 target_link_libraries(vox_ecs PUBLIC vox_includes fmt::fmt)
