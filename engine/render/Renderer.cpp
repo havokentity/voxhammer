@@ -35,7 +35,8 @@ cbuffer Camera : register(b0) {
     float3 clearCol;       float exposure;
     float2 viewport;       int   hdr;          float shadowSoftness;
     float3 sunDir;         float ambient;
-    float  aoStrength;     float aoRadius;     int lightingMode; int accumFrame;
+    float  aoStrength;     float aoRadius;     int lightingMode; int accumFrame; // row 7
+    int    dither;         int aoSamples;      int shadowSamples; int giSamples;  // row 8
 };
 StructuredBuffer<uint> Voxels : register(t0);
 RWStructuredBuffer<float4> Accum : register(u0);  // per-pixel GI accumulation: rgb + sample count
@@ -142,8 +143,8 @@ float softShadow(float3 hp, float3 nrm, float3 sunD, float2 screenPos) {
     float rot  = ign(screenPos) * 6.2832;   // per-pixel kernel rotation
     float tanS = tan(shadowSoftness);
     float lit = 0.0;
-    const int N = 6;
-    [unroll] for (int s = 0; s < N; ++s) {
+    int N = clamp(shadowSamples, 1, 16);
+    [loop] for (int s = 0; s < N; ++s) {
         // Vogel-disk tap inside the penumbra cone, rotated per pixel.
         float2 d   = vogelDisk(s, N, rot) * tanS;
         float3 dir = normalize(sunD + st * d.x + sb * d.y);
@@ -152,7 +153,8 @@ float softShadow(float3 hp, float3 nrm, float3 sunD, float2 screenPos) {
     return lit / float(N);
 }
 
-// Ambient occlusion: sample hemisphere oriented around nrm.
+// Ambient occlusion: sample hemisphere oriented around nrm with distance-weighted falloff.
+// Nearer occluders contribute more darkness; far ones are attenuated smoothly.
 float ambientOcclusion(float3 hp, float3 nrm, float2 screenPos) {
     [branch] if (aoStrength < 1e-4) return 1.0;
 
@@ -162,9 +164,10 @@ float ambientOcclusion(float3 hp, float3 nrm, float2 screenPos) {
     float rot   = ign(screenPos + 23.71) * 6.2832;  // decorrelated from the shadow kernel
     int   steps = (int)clamp(aoRadius, 2.0, 24.0);
     const float GOLDEN_ANGLE = 2.39996323;
-    float occ = 0.0;
-    const int M = 5;
-    [unroll] for (int r = 0; r < M; ++r) {
+    float occ   = 0.0;
+    float wSum  = 0.0;
+    int M = clamp(aoSamples, 1, 32);
+    [loop] for (int r = 0; r < M; ++r) {
         // Low-discrepancy cosine-weighted hemisphere sample, rotated per pixel:
         // radial strata -> elevation, golden-angle azimuth -> even spread.
         float u    = (float(r) + 0.5) / float(M);
@@ -172,9 +175,40 @@ float ambientOcclusion(float3 hp, float3 nrm, float2 screenPos) {
         float cosT = sqrt(1.0 - u);           // cosine-weighted toward the normal
         float sinT = sqrt(u);
         float3 dir = normalize(nrm * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
-        if (occludedRay(hp + nrm * 0.02, dir, steps)) occ += 1.0;
+
+        // Distance-weighted DDA: trace and record hit distance for smooth falloff.
+        // Nearer occluders (small hitDist) get higher weight -> removes blocky AO edge.
+        float3 pp  = hp + nrm * 0.02;
+        float3 ddir = dir;
+        if (abs(ddir.x) < 1e-5) ddir.x = 1e-5;
+        if (abs(ddir.y) < 1e-5) ddir.y = 1e-5;
+        if (abs(ddir.z) < 1e-5) ddir.z = 1e-5;
+        float3 cell  = floor(pp);
+        float3 sv    = sign(ddir);
+        float3 tD    = abs(1.0 / ddir);
+        float3 tM2   = ((cell + (sv * 0.5 + 0.5)) - pp) / ddir;
+        float  hitDist = aoRadius;  // default = miss (far distance)
+        bool   gotHit  = false;
+        [loop] for (int i2 = 0; i2 < steps; ++i2) {
+            float curT;
+            if (tM2.x < tM2.y && tM2.x < tM2.z) { curT = tM2.x; cell.x += sv.x; tM2.x += tD.x; }
+            else if (tM2.y < tM2.z)              { curT = tM2.y; cell.y += sv.y; tM2.y += tD.y; }
+            else                                 { curT = tM2.z; cell.z += sv.z; tM2.z += tD.z; }
+            if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
+                cell.x >= gridDim || cell.y >= gridDim || cell.z >= gridDim) break;
+            if (Voxels[(uint)(cell.z * gridDim * gridDim + cell.y * gridDim + cell.x)] != 0) {
+                hitDist = curT;
+                gotHit  = true;
+                break;
+            }
+        }
+        // Distance falloff: weight = 1/(1 + d^2*k) so close occluders darken strongly.
+        float w = 1.0 / (1.0 + hitDist * hitDist * 0.25);
+        occ   += gotHit ? w : 0.0;
+        wSum  += w;
     }
-    float visibility = 1.0 - (occ / float(M)) * aoStrength;
+    float normOcc  = (wSum > 1e-5) ? (occ / wSum) : 0.0;
+    float visibility = 1.0 - normOcc * aoStrength;
     return saturate(visibility);
 }
 
@@ -228,8 +262,8 @@ float3 directSun(float3 hp, float3 nrm, float3 sd) {
     return float3(1.15, 1.06, 0.90) * (ndl * vis);
 }
 
-// One-bounce diffuse path-traced radiance at the primary hit (1 sample/frame;
-// temporal accumulation does the convergence).
+// One-bounce diffuse path-traced radiance at the primary hit.
+// giSamples indirect bounces are averaged per frame; temporal accumulation converges the result.
 float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
     float3 alb = palette(mat);
 
@@ -241,20 +275,28 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
     float3 sd  = normalize(sunDir + (st * cos(ang) + sb * sin(ang)) * rad);
     float3 direct = directSun(hp, nrm, sd);
 
-    // One cosine-weighted indirect bounce, traced through the same voxel grid.
-    float2 xb = sampleXi(screenPos, accumFrame, 37.0);
+    // N cosine-weighted indirect bounces averaged per frame; temporal accumulation does convergence.
+    int    numBounces = clamp(giSamples, 1, 8);
+    float3 indirectSum = float3(0, 0, 0);
     float3 t, b; buildBasis(nrm, t, b);
-    float  cosT = sqrt(1.0 - xb.x), sinT = sqrt(xb.x);
-    float  phi  = xb.y * 6.2832;
-    float3 bd   = normalize(nrm * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
-    float3 bhp, bnrm; uint bmat;
-    float3 indirect;
-    if (traceVoxel(hp + nrm * 0.02, bd, 128, bhp, bnrm, bmat)) {
-        indirect = palette(bmat) * directSun(bhp, bnrm, sunDir);  // light off the bounce surface (color bleed)
-    } else {
-        indirect = sky(bd);                                       // sky/ambient from that direction
+    [loop] for (int gi = 0; gi < numBounces; ++gi) {
+        // Per-bounce salt so each sample draws a different low-discrepancy point.
+        float salt = 37.0 + float(gi) * 17.31;
+        float2 xb   = sampleXi(screenPos, accumFrame, salt);
+        float  cosT = sqrt(1.0 - xb.x), sinT = sqrt(xb.x);
+        float  phi  = xb.y * 6.2832;
+        float3 bd   = normalize(nrm * cosT + (t * cos(phi) + b * sin(phi)) * sinT);
+        float3 bhp, bnrm; uint bmat;
+        float3 indirect;
+        if (traceVoxel(hp + nrm * 0.02, bd, 128, bhp, bnrm, bmat)) {
+            indirect = palette(bmat) * directSun(bhp, bnrm, sunDir);  // light off the bounce surface (color bleed)
+        } else {
+            indirect = sky(bd);                                       // sky/ambient from that direction
+        }
+        indirectSum += indirect;
     }
-    return alb * (direct + indirect);
+    float3 indirectAvg = indirectSum / float(numBounces);
+    return alb * (direct + indirectAvg);
 }
 
 float4 PSMain(VSOut i) : SV_Target {
@@ -293,6 +335,18 @@ float4 PSMain(VSOut i) : SV_Target {
 
     col *= exposure;
     col = (hdr != 0) ? tonemapACES(col) : saturate(col);
+
+    // Triangular dither: converts the uniform IGN noise into a triangular PDF
+    // centered on 0 (range ±1/255).  Applied just before the 8-bit quantization
+    // so smooth gradients never produce visible banding on the R8G8B8A8 swapchain.
+    [branch] if (dither != 0) {
+        // Two decorrelated uniform samples -> triangular by sum (central-limit trick).
+        float u1 = ign(i.pos.xy);
+        float u2 = ign(i.pos.xy + float2(47.0, 31.0));
+        float tri = (u1 + u2 - 1.0) / 255.0;   // triangular PDF, range (-1/255, +1/255)
+        col = saturate(col + tri);
+    }
+
     return float4(col, 1.0);
 }
 )HLSL";
@@ -306,6 +360,7 @@ struct CamCB {
     float viewport[2];     int   hdr;              float shadowSoftness; // row 5 (pad repurposed)
     float sunDir[3];       float ambient;          // row 6
     float aoStrength;      float aoRadius;         int lightingMode; int accumFrame; // row 7
+    int   dither;          int   aoSamples;        int shadowSamples; int giSamples; // row 8
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -358,7 +413,7 @@ struct Renderer::Impl {
     ComPtr<ID3D12Resource>            camBuf;
     std::uint8_t*                     camPtr = nullptr;
     ComPtr<ID3D12Resource>            accumBuf;       // GI temporal accumulation (RWStructuredBuffer<float4>)
-    float                             accKey[19] = {};
+    float                             accKey[23] = {};
     bool                              accHave = false;
     UINT                              accumFrame = 0;
 
@@ -587,15 +642,21 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.aoStrength     = fp.ao_strength;
     cb.aoRadius       = fp.ao_radius;
     cb.lightingMode   = fp.lighting_mode;
+    cb.dither         = fp.dither;
+    cb.aoSamples      = std::max(1, std::min(fp.ao_samples,     32));
+    cb.shadowSamples  = std::max(1, std::min(fp.shadow_samples, 16));
+    cb.giSamples      = std::max(1, std::min(fp.gi_samples,      8));
 
     // Temporal accumulation: keep averaging GI while nothing that affects the
     // image changes; reset the instant the camera/sun/lighting moves. Cheap
     // "progressive refinement while you hold still".
-    const float key[19] = {
+    const float key[23] = {
         fp.cam_pos[0], fp.cam_pos[1], fp.cam_pos[2], fp.cam_yaw, fp.cam_pitch, fp.cam_fov,
         fp.sun[0], fp.sun[1], fp.sun[2], fp.exposure, fp.ambient,
         fp.clear[0], fp.clear[1], fp.clear[2], fp.shadow_softness, fp.ao_strength, fp.ao_radius,
         static_cast<float>(fp.lighting_mode), static_cast<float>(fp.hdr),
+        static_cast<float>(fp.dither), static_cast<float>(fp.ao_samples),
+        static_cast<float>(fp.shadow_samples), static_cast<float>(fp.gi_samples),
     };
     if (fp.lighting_mode == 1 && d.accHave && std::memcmp(key, d.accKey, sizeof(key)) == 0) {
         ++d.accumFrame;

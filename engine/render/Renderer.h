@@ -26,6 +26,11 @@ struct FrameParams {
     float ao_strength     = 0.55f;   // 0..1, how dark fully-occluded ambient gets
     float ao_radius       = 4.0f;    // world-space voxel radius for AO rays
     int   lighting_mode   = 0;       // 0 = PERFORMANCE (raymarch + AO), 1 = QUALITY (path-traced GI)
+    // Runtime-tunable sample counts (mapped to HLSL cbuffer; changing any resets GI accumulation)
+    int   dither          = 1;       // 1 = triangular dither before 8-bit output; 0 = off
+    int   ao_samples      = 8;       // AO hemisphere rays (1..32)
+    int   shadow_samples  = 6;       // soft-shadow cone rays (1..16)
+    int   gi_samples      = 1;       // QUALITY indirect bounce samples averaged per frame (1..8)
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen
