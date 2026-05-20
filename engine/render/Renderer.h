@@ -65,6 +65,15 @@ public:
     // the original hard-reset-on-view-change behaviour for A/B comparison.
     void SetGiDenoise(bool enabled);
 
+    // Empty-space-skipping toggle (default ON). The voxel raymarcher consults a
+    // coarse per-brick occupancy grid and jumps over empty bricks instead of
+    // stepping one fine voxel at a time, so crossing large air gaps is nearly
+    // free (the win grows with world size). The acceleration is CONSERVATIVE — a
+    // brick is occupied if any voxel inside it is solid — so the rendered image
+    // is identical with it on or off. Off forces the original per-voxel DDA for
+    // A/B and correctness comparison.
+    void SetEmptySpaceSkip(bool enabled);
+
     // Hot-update the voxel grid and palette without restarting.
     // grid must contain exactly kGrid^3 (64^3 = 262144) uint32 entries.
     // palette256 must point to 256 RGBA8 uints (VoxPalette::data()).

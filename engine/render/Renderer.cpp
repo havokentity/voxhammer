@@ -34,6 +34,13 @@ namespace {
 
 constexpr UINT kGrid = vox::voxel::kWorldDim;  // 128^3 voxel volume
 
+// Empty-space-skipping acceleration structure: the world is divided into
+// kBrickDim^3 bricks. kBrickGrid = ceil(kGrid/kBrickDim) bricks per axis
+// (16^3 for a 128^3 world). One uint per brick marks "any solid voxel inside".
+constexpr UINT kBrickDim  = 8;
+constexpr UINT kBrickGrid = (kGrid + kBrickDim - 1) / kBrickDim;
+constexpr UINT kBrickCount = kBrickGrid * kBrickGrid * kBrickGrid;
+
 // Full-screen-triangle VS + DDA voxel-raymarch PS. Compiled at runtime with
 // D3DCompile (SM 5.1 DXBC -> accepted by DX12), so no DXC dependency.
 const char* kShader = R"HLSL(
@@ -47,10 +54,49 @@ cbuffer Camera : register(b0) {
     float3 sunDir;         float ambient;
     float  aoStrength;     float aoRadius;     int lightingMode; int accumFrame; // row 7
     int    dither;         int aoSamples;      int shadowSamples; int giSamples;  // row 8
-    int    giDenoise;      float giHistMax;    int giPad0;        int giPad1;     // row 9
+    int    giDenoise;      float giHistMax;    int emptySkip;     int brickDim;   // row 9
 };
 StructuredBuffer<uint> Voxels : register(t0);
 RWStructuredBuffer<float4> Accum : register(u0);  // per-pixel GI accumulation: rgb + sample count
+
+// Coarse occupancy acceleration structure (empty-space skipping). One uint per
+// BRICK_DIM^3 brick: nonzero iff ANY voxel in that brick is solid. The brick
+// grid is ceil(gridDim/brickDim) per axis. Built on the CPU in Init/SetVoxels
+// so it always matches Voxels. A brick is CONSERVATIVELY occupied (set if any
+// solid voxel), so skipping an empty brick can never miss a hit.
+StructuredBuffer<uint> BrickOccupancy : register(t3);
+
+// Number of bricks per axis for the current grid (ceil division).
+int brickGridDim() { return (gridDim + brickDim - 1) / brickDim; }
+
+// True if the brick containing integer voxel cell |c| is entirely empty.
+// |c| is assumed in-bounds (callers guard the grid bounds).
+bool brickIsEmpty(int3 c) {
+    int  bd = brickDim;
+    int3 b  = c / bd;                      // brick coordinate (floor; c>=0 in-bounds)
+    int  B  = brickGridDim();
+    return BrickOccupancy[(uint)((b.z * B + b.y) * B + b.x)] == 0u;
+}
+
+// Coarse-DDA skip: given the current fine-DDA voxel |cell| (whose brick is
+// empty), the ray (ro,rd,stepv,s=sign), advance to the entry of the NEXT brick
+// along the ray. Returns the t at which the next brick is entered and writes the
+// face normal of the crossed brick boundary into |nrm|. The caller rederives the
+// fine cell/tMax from ro+rd*tHit, so there is no coarse/fine state to drift.
+float brickSkipT(float3 ro, float3 rd, int3 cell, float3 s, out float3 nrm) {
+    int   bd = brickDim;
+    // Min corner (in voxel space) of the brick containing cell.
+    float3 bmin = floor(float3(cell) / float(bd)) * float(bd);
+    // Exit plane per axis: far face if stepping +, near face if stepping -.
+    float3 plane = bmin + (s > 0.0 ? float(bd) : 0.0);
+    float3 tNext = (plane - ro) / rd;      // rd already de-zeroed by caller
+    // Nearest brick face along the ray.
+    float tHit;
+    if (tNext.x <= tNext.y && tNext.x <= tNext.z)      { tHit = tNext.x; nrm = float3(-s.x, 0, 0); }
+    else if (tNext.y <= tNext.z)                       { tHit = tNext.y; nrm = float3(0, -s.y, 0); }
+    else                                               { tHit = tNext.z; nrm = float3(0, 0, -s.z); }
+    return tHit;
+}
 
 struct VSOut { float4 pos : SV_Position; };
 VSOut VSMain(uint vid : SV_VertexID) {
@@ -129,6 +175,7 @@ bool occludedRay(float3 p, float3 d, int maxSteps) {
     float3 s = sign(d);
     float3 tD = abs(1.0 / d);
     float3 tM = ((cell + (s * 0.5 + 0.5)) - p) / d;
+    bool skip = (emptySkip != 0);
     [loop] for (int i = 0; i < maxSteps; ++i) {
         if (tM.x < tM.y && tM.x < tM.z) { cell.x += s.x; tM.x += tD.x; }
         else if (tM.y < tM.z)           { cell.y += s.y; tM.y += tD.y; }
@@ -136,6 +183,23 @@ bool occludedRay(float3 p, float3 d, int maxSteps) {
         if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
             cell.x >= gridDim || cell.y >= gridDim || cell.z >= gridDim) return false;
         if (Voxels[(uint)(cell.z * gridDim * gridDim + cell.y * gridDim + cell.x)] != 0) return true;
+        // Empty-space skip: empty brick -> jump to the next brick boundary. This
+        // loop steps before testing, so after relocating we must TEST the first
+        // voxel of the new brick here (the next iteration steps past it).
+        [branch] if (skip && brickIsEmpty(int3(cell))) {
+            float3 sn;
+            float tBrick = brickSkipT(p, d, int3(cell), s, sn);
+            float tNp = tBrick + 0.0005;
+            float3 np = p + d * tNp;
+            float3 nc = floor(np);
+            [branch] if (any(nc != cell)) {
+                cell = nc;
+                tM   = ((cell + (s * 0.5 + 0.5)) - np) / d + tNp;
+                if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
+                    cell.x >= gridDim || cell.y >= gridDim || cell.z >= gridDim) return false;
+                if (Voxels[(uint)(cell.z * gridDim * gridDim + cell.y * gridDim + cell.x)] != 0) return true;
+            }
+        }
     }
     return false;
 }
@@ -268,11 +332,31 @@ bool traceVoxel(float3 ro, float3 rd, int maxSteps, out float3 hp, out float3 nr
     float3 tDelta = abs(1.0 / rd);
     float3 tMax = ((cell + (stepv * 0.5 + 0.5)) - p) / rd;
     float tEnter = 0.0;
+    bool skip = (emptySkip != 0);
     [loop] for (int k = 0; k < maxSteps; ++k) {
         if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
             cell.x >= gridDim || cell.y >= gridDim || cell.z >= gridDim) return false;
         uint v = Voxels[(uint)(cell.z * gridDim * gridDim + cell.y * gridDim + cell.x)];
         if (v != 0) { mat = v; hp = p + rd * tEnter; return true; }
+        // Empty-space skip: if this whole brick is empty, jump to the next brick
+        // boundary (coarse DDA step) instead of a single fine voxel. Conservative:
+        // an empty brick has no solid voxel, so we cannot skip a hit.
+        [branch] if (skip && brickIsEmpty(int3(cell))) {
+            float3 sn;
+            float tBrick = brickSkipT(p, rd, int3(cell), stepv, sn);
+            float tNp = tBrick + 0.0005;                // param (from p) just inside next brick
+            float3 np = p + rd * tNp;                   // nudge just inside next brick
+            float3 nc = floor(np);
+            // Guard: if the nudge failed to advance the cell (ray ~parallel to a
+            // face), fall through to the normal single fine step below.
+            [branch] if (any(nc != cell)) {
+                tEnter = tBrick;
+                cell   = nc;
+                nrm    = sn;
+                tMax   = ((cell + (stepv * 0.5 + 0.5)) - np) / rd + tNp;
+                continue;
+            }
+        }
         if (tMax.x < tMax.y && tMax.x < tMax.z) { tEnter = tMax.x; cell.x += stepv.x; tMax.x += tDelta.x; nrm = float3(-stepv.x, 0, 0); }
         else if (tMax.y < tMax.z)               { tEnter = tMax.y; cell.y += stepv.y; tMax.y += tDelta.y; nrm = float3(0, -stepv.y, 0); }
         else                                    { tEnter = tMax.z; cell.z += stepv.z; tMax.z += tDelta.z; nrm = float3(0, 0, -stepv.z); }
@@ -408,7 +492,7 @@ struct CamCB {
     float sunDir[3];       float ambient;          // row 6
     float aoStrength;      float aoRadius;         int lightingMode; int accumFrame; // row 7
     int   dither;          int   aoSamples;        int shadowSamples; int giSamples; // row 8
-    int   giDenoise;       float giHistMax;        int giPad0; int giPad1;           // row 9
+    int   giDenoise;       float giHistMax;        int emptySkip; int brickDim;      // row 9
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -435,6 +519,31 @@ std::vector<std::uint32_t> GenerateScene(UINT g) {
             }
         }
     return v;
+}
+
+// Build the coarse brick-occupancy grid from a dense flat voxel grid.
+// Each brick cell is 1 iff ANY voxel inside the BRICK_DIM^3 brick is nonzero,
+// so the structure is conservative (an empty brick is provably solid-free).
+// |grid| is a flat g^3 array (z*g*g + y*g + x). Output is kBrickCount uints,
+// flat-indexed (bz*kBrickGrid + by)*kBrickGrid + bx to match the shader.
+std::vector<std::uint32_t> BuildBrickOccupancy(const std::vector<std::uint32_t>& grid, UINT g) {
+    std::vector<std::uint32_t> occ(kBrickCount, 0u);
+    const std::size_t need = static_cast<std::size_t>(g) * g * g;
+    if (grid.size() < need) return occ;  // defensive: leave empty (skips nothing extra)
+    for (UINT z = 0; z < g; ++z) {
+        const UINT bz = z / kBrickDim;
+        for (UINT y = 0; y < g; ++y) {
+            const UINT by = y / kBrickDim;
+            const std::size_t rowBase = (static_cast<std::size_t>(z) * g + y) * g;
+            for (UINT x = 0; x < g; ++x) {
+                if (grid[rowBase + x] != 0u) {
+                    const UINT bx = x / kBrickDim;
+                    occ[(static_cast<std::size_t>(bz) * kBrickGrid + by) * kBrickGrid + bx] = 1u;
+                }
+            }
+        }
+    }
+    return occ;
 }
 
 void Cross(const float a[3], const float b[3], float o[3]) {
@@ -475,6 +584,8 @@ struct Renderer::Impl {
     ComPtr<ID3D12Resource>            blueNoiseBuf;   // 64x64 blue-noise tile (StructuredBuffer<float> t1)
     ComPtr<ID3D12Resource>            paletteBuf;     // 256-entry RGBA8 palette (StructuredBuffer<uint> t2)
     std::uint32_t*                    palettePtr = nullptr;      // persistent map into paletteBuf
+    ComPtr<ID3D12Resource>            brickBuf;       // coarse occupancy (StructuredBuffer<uint> t3) for empty-space skip
+    std::uint32_t*                    brickPtr = nullptr;        // persistent map into brickBuf
     float*                            bnPtr      = nullptr;      // persistent map into blueNoiseBuf
     std::vector<float>                bnTile;                   // async-baked real tile (worker writes here)
     std::thread                       bnThread;                 // background void-and-cluster bake
@@ -490,6 +601,7 @@ struct Renderer::Impl {
     bool                              accHave = false;
     UINT                              accumFrame = 0;
     bool                              giDenoise = true;   // QUALITY temporal denoise (Renderer::SetGiDenoise)
+    bool                              emptySkip = true;   // empty-space skipping (Renderer::SetEmptySpaceSkip)
 
     void WaitIdle() {
         if (!queue || !fence) return;
@@ -595,8 +707,8 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     if (FAILED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&d.fence)))) return false;
     d.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-    // --- root signature: CBV(b0) + SRV(t0 Voxels) + UAV(u0 Accum) + SRV(t1 BlueNoise) + SRV(t2 Palette) ---
-    D3D12_ROOT_PARAMETER rp[5]{};
+    // --- root signature: CBV(b0) + SRV(t0 Voxels) + UAV(u0 Accum) + SRV(t1 BlueNoise) + SRV(t2 Palette) + SRV(t3 BrickOccupancy) ---
+    D3D12_ROOT_PARAMETER rp[6]{};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister = 0;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -612,8 +724,11 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     rp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     rp[4].Descriptor.ShaderRegister = 2;   // t2
     rp[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rp[5].Descriptor.ShaderRegister = 3;   // t3 BrickOccupancy
+    rp[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 5;
+    rs.NumParameters = 6;
     rs.pParameters = rp;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> rsBlob, rsErr;
@@ -672,6 +787,19 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
         d.voxelBuf->Map(0, &none, &p);
         d.voxelPtr = static_cast<std::uint32_t*>(p);  // keep persistently mapped
         std::memcpy(d.voxelPtr, scene.data(), scene.size() * sizeof(std::uint32_t));
+        // Do NOT Unmap — kept open for hot SetVoxels updates.
+    }
+
+    // --- brick occupancy buffer (empty-space-skip acceleration, StructuredBuffer<uint> t3) ---
+    // Built from the same dense grid; persistently mapped and rebuilt in SetVoxels.
+    {
+        std::vector<std::uint32_t> occ = BuildBrickOccupancy(scene, kGrid);
+        d.brickBuf = d.MakeUpload(static_cast<UINT64>(kBrickCount) * sizeof(std::uint32_t));
+        if (!d.brickBuf) return false;
+        void* bp = nullptr;
+        d.brickBuf->Map(0, &none, &bp);
+        d.brickPtr = static_cast<std::uint32_t*>(bp);  // keep persistently mapped
+        std::memcpy(d.brickPtr, occ.data(), static_cast<std::size_t>(kBrickCount) * sizeof(std::uint32_t));
         // Do NOT Unmap — kept open for hot SetVoxels updates.
     }
 
@@ -991,8 +1119,8 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.accumFrame = static_cast<int>(d.accumFrame);
     cb.giDenoise  = d.giDenoise ? 1 : 0;
     cb.giHistMax  = histMax;
-    cb.giPad0     = 0;
-    cb.giPad1     = 0;
+    cb.emptySkip  = d.emptySkip ? 1 : 0;
+    cb.brickDim   = static_cast<int>(kBrickDim);
     std::memcpy(d.camPtr, &cb, sizeof(cb));
 
     d.alloc->Reset();
@@ -1025,6 +1153,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf->GetGPUVirtualAddress());
     d.list->SetGraphicsRootShaderResourceView(3, d.blueNoiseBuf->GetGPUVirtualAddress());
     d.list->SetGraphicsRootShaderResourceView(4, d.paletteBuf->GetGPUVirtualAddress());
+    d.list->SetGraphicsRootShaderResourceView(5, d.brickBuf->GetGPUVirtualAddress());
     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     d.list->DrawInstanced(3, 1, 0, 0);
 
@@ -1061,6 +1190,26 @@ void Renderer::SetVoxels(const std::vector<std::uint32_t>& grid, const std::uint
         std::memcpy(d.palettePtr, palette256, kPalEntries * sizeof(std::uint32_t));
     }
 
+    // Rebuild the brick-occupancy acceleration structure from the voxels that
+    // actually landed in the GPU buffer (exactly kGrid^3 after clamp/zero-fill),
+    // so empty-space skipping stays conservative and correct after live edits.
+    if (d.brickPtr && d.voxelPtr) {
+        std::memset(d.brickPtr, 0, static_cast<std::size_t>(kBrickCount) * sizeof(std::uint32_t));
+        for (UINT z = 0; z < kGrid; ++z) {
+            const UINT bz = z / kBrickDim;
+            for (UINT y = 0; y < kGrid; ++y) {
+                const UINT by = y / kBrickDim;
+                const std::size_t rowBase = (static_cast<std::size_t>(z) * kGrid + y) * kGrid;
+                for (UINT x = 0; x < kGrid; ++x) {
+                    if (d.voxelPtr[rowBase + x] != 0u) {
+                        const UINT bx = x / kBrickDim;
+                        d.brickPtr[(static_cast<std::size_t>(bz) * kBrickGrid + by) * kBrickGrid + bx] = 1u;
+                    }
+                }
+            }
+        }
+    }
+
     // Reset GI accumulation so the new geometry doesn't ghost.
     d.accumFrame = 0;
     d.accHave    = false;
@@ -1073,6 +1222,18 @@ void Renderer::SetGiDenoise(bool enabled) {
     d.giDenoise = enabled;
     // Restart accumulation on toggle so the A/B switch is clean (no stale history
     // bleeding across the mode change).
+    d.accumFrame = 0;
+    d.accHave    = false;
+}
+
+void Renderer::SetEmptySpaceSkip(bool enabled) {
+    if (!impl_) return;
+    Impl& d = *impl_;
+    if (d.emptySkip == enabled) return;
+    d.emptySkip = enabled;
+    // Empty-space skipping is conservative, so the image is identical with it on
+    // or off; restart GI accumulation anyway so an A/B toggle starts from a clean
+    // history rather than blending two (visually identical) traversals.
     d.accumFrame = 0;
     d.accHave    = false;
 }
@@ -1203,6 +1364,7 @@ bool Renderer::Init(void*, int, int, const std::vector<std::uint32_t>*, const st
 void Renderer::RenderFrame(const FrameParams&) {}
 void Renderer::SetVoxels(const std::vector<std::uint32_t>&, const std::uint32_t*) {}
 void Renderer::SetGiDenoise(bool) {}
+void Renderer::SetEmptySpaceSkip(bool) {}
 bool Renderer::CaptureScreenshot(const std::string&, bool) { return false; }
 void Renderer::Shutdown() {}
 }  // namespace vox::render
