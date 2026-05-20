@@ -196,6 +196,8 @@ class MockBus {
 
 // ---------- transport (login -> WSS, or offline mock) ----------
 let bus = { send() {} };
+let sessionToken = null;   // current session token (for reconnect)
+let reconnectTimer = null;
 function setLink(mode) {
     const link = $("#link");
     link.className = "link " + (mode === "live" ? "link-live" : mode === "demo" ? "link-demo" : mode === "down" ? "link-down" : "link-init");
@@ -208,14 +210,43 @@ function startMock() {
     setLink("demo");
     boot();
 }
-function openLiveWs(token) {
+function openLiveWs(tok) {
+    clearTimeout(reconnectTimer);
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(proto + "//" + location.host + "/ws?token=" + encodeURIComponent(token));
-    bus = { mode: "live", ws, send: (o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); } };
-    ws.onopen = () => { setLink("live"); boot(); };
+    const ws = new WebSocket(proto + "//" + location.host + "/ws?token=" + encodeURIComponent(tok));
+    let opened = false;
+    const failT = setTimeout(() => { if (!opened) { try { ws.close(); } catch (e) {} } }, 1600);
+    ws.onopen = () => {
+        opened = true; clearTimeout(failT); sessionToken = tok; booted = false;
+        bus = { mode: "live", ws, send: (o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); } };
+        setLink("live"); boot();
+    };
     ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)); } catch (x) {} };
-    ws.onclose = () => { setLink("down"); };
+    ws.onclose = () => {
+        clearTimeout(failT);
+        bus = { send() {} };
+        setLink("down");
+        if (opened) scheduleReconnect();  // lost an established link -> keep retrying
+        else showLogin();                 // engine reachable but token rejected (restart) -> re-auth
+    };
     ws.onerror = () => {};
+}
+// Auto-reconnect: while the tab is open, poll for the engine; reuse the session
+// if it's still valid (transient blip), else prompt re-login (engine restarted
+// -> sessions are in-memory, so re-auth is by design).
+function scheduleReconnect() {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(tryReconnect, 2000);
+}
+async function tryReconnect() {
+    try {
+        const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        if (r.status === 401 || r.status === 200 || r.status === 429) {
+            if (sessionToken) openLiveWs(sessionToken); else showLogin();
+            return;
+        }
+    } catch (e) { /* engine still down */ }
+    scheduleReconnect();  // keep polling until it returns
 }
 async function doLogin(pw) {
     const msg = $("#login-msg");
@@ -257,6 +288,8 @@ const persistPins = () => localStorage.setItem("vox.pinned", JSON.stringify([...
 const cssEsc = (s) => s.replace(/["\\]/g, "\\$&");
 
 function setCvar(name, value) {
+    state.editName = name;          // remember what the user is actively editing
+    state.editAt = Date.now();
     const cv = state.cvars.get(name);
     if (cv) { cv.value = String(value); afterValueChange(name); }
     bus.send({ type: "set_cvar", name, value: String(value) });
@@ -615,9 +648,12 @@ function onMessage(msg) {
             // Live update from another source (keybinding/TCP/other client).
             const cur = state.cvars.get(msg.data.name);
             state.cvars.set(msg.data.name, msg.data);
-            // Only rebuild the widget if the value actually changed -- avoids
-            // interrupting an in-progress drag echoing our own set.
-            if (!cur || cur.value !== msg.data.value) { syncControl(msg.data.name); updateViewport(); }
+            // Don't rebuild a control the user is actively editing (a lagging
+            // echo of their own drag would destroy the DOM and close the
+            // native picker). External changes (F11 etc.) still rebuild.
+            const editing = state.editName === msg.data.name && Date.now() - (state.editAt || 0) < 1500;
+            if (!editing && (!cur || cur.value !== msg.data.value)) syncControl(msg.data.name);
+            updateViewport();
         }
     }
 }

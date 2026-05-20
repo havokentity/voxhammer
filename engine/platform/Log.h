@@ -60,7 +60,7 @@ inline void Emit(Level level, const std::string& body) {
     {
         std::lock_guard<std::mutex> lk(LogMutex());
         std::FILE* out = (level == Level::Error || level == Level::Warn) ? stderr : stdout;
-        fmt::print(out, "[{}] [{:>5}] {}\n", ts, LevelName(level), body);
+        fmt::print(out, "[{}] [{}] {}\n", ts, LevelName(level), body);
         std::fflush(out);
     }
     if (auto& s = GlobalSink()) {

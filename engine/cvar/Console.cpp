@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <chrono>
 #include <fstream>
 
 #include <toml++/toml.h>
@@ -235,7 +236,18 @@ ExecuteResult Console::Execute(std::string_view line) {
         if (!err.empty()) {
             return {false, {}, err};
         }
-        vox::log::Info("cvar {} = {}", cv->name, cv->value);
+        // Audit log (spec), throttled per-cvar so rapid drags (color/sliders)
+        // don't flood the log -- you still see progress ~3x/sec, and discrete
+        // changes (toggles, F11) log immediately.
+        {
+            static std::map<std::string, std::chrono::steady_clock::time_point, std::less<>> last_log;
+            auto now = std::chrono::steady_clock::now();
+            auto it = last_log.find(cv->name);
+            if (it == last_log.end() || now - it->second > std::chrono::milliseconds(300)) {
+                vox::log::Info("cvar {} = {}", cv->name, cv->value);
+                last_log[cv->name] = now;
+            }
+        }
         return {true, fmt::format("{} = \"{}\"", cv->name, cv->value), {}};
     }
 
