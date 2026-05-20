@@ -122,7 +122,7 @@ body {
 .ctrl-tools { margin-left: auto; display: flex; gap: 4px; flex: none; }
 .icon-btn { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; background: transparent; border: 1px solid transparent; color: var(--faint); cursor: pointer; font-size: 13px; }
 .icon-btn:hover { color: var(--accent); border-color: var(--edge-hi); } .icon-btn.pinned { color: var(--accent); }
-.ctrl-desc { font-size: 11px; color: var(--dim); line-height: 1.4; min-height: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctrl-desc { font-size: 11px; color: var(--dim); line-height: 1.4; white-space: normal; overflow-wrap: anywhere; }
 .ctrl-body { min-height: var(--ctrl-h); display: flex; align-items: center; min-width: 0; overflow: hidden; }
 
 /* toggle */
