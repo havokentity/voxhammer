@@ -69,6 +69,7 @@ void RegisterCoreCvars() {
     reg("renderer.exposure", "1.0", "Render exposure (pre-tonemap multiplier).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.1f, .range_max = 4.0f, .range_step = 0.05f});
     reg("renderer.sun.azimuth", "0.7", "Sun azimuth (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 6.2832f, .range_step = 0.02f});
     reg("renderer.sun.elevation", "0.6", "Sun elevation (radians; lower = longer shadows).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.1f, .range_max = 1.5f, .range_step = 0.02f});
+    reg("renderer.ambient", "0.28", "Ambient fill light (lower = punchier shadows).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
     reg("physics.gpu_rigids.enabled", "1", "GPU rigid bodies (NVIDIA).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("physics.gpu_rigids.max_islands", "10000", "Max active dynamic islands.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 256, .range_max = 16384, .range_step = 256});
     reg("physics.solver.position_iters", "8", "Solver position iterations.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
@@ -83,6 +84,9 @@ void RegisterCoreCvars() {
     reg("camera.fov", "1.2", "Camera vertical FOV (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.4f, .range_max = 2.4f, .range_step = 0.02f});
     reg("camera.invert_x", "1", "Invert horizontal mouse-look.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("camera.invert_y", "0", "Invert vertical mouse-look.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("camera.move_speed", "15", "Fly-cam move speed (units/sec).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 1.0f, .range_max = 120.0f, .range_step = 1.0f});
+    reg("camera.boost", "3.0", "Fly-cam Shift speed multiplier.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 1.0f, .range_max = 10.0f, .range_step = 0.5f});
+    reg("camera.sensitivity", "0.0025", "Mouse-look sensitivity (rad/px).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0005f, .range_max = 0.01f, .range_step = 0.0005f});
     reg("editor.active", "0", "Editor mode (vs play).", {.type = CVarType::Bool});
     reg("debug.show_brick_grid", "0", "Overlay the brick grid.", {.type = CVarType::Bool, .flags = CVAR_DEVELOPER});
     reg("debug.show_physx_wireframe", "0", "Overlay PhysX collision wireframe.", {.type = CVarType::Bool, .flags = CVAR_DEVELOPER});
@@ -301,7 +305,8 @@ int main(int argc, char** argv) {
                 float pitch = console.FindCVar("camera.pitch")->GetFloat();
                 float pos[3] = {0, 0, 0};
                 ParseRGB(console.FindCVar("camera.pos")->value, pos[0], pos[1], pos[2]);
-                const float sens = 0.0025f, PI = 3.14159265f;
+                const float PI = 3.14159265f;
+                float sens = console.FindCVar("camera.sensitivity")->GetFloat();
                 float invx = console.FindCVar("camera.invert_x")->GetBool() ? -1.0f : 1.0f;
                 float invy = console.FindCVar("camera.invert_y")->GetBool() ? -1.0f : 1.0f;
                 yaw += ci.look_dx * sens * invx;
@@ -313,7 +318,8 @@ int main(int argc, char** argv) {
                 float fwd[3] = {cp * sy, sp, cp * cy};
                 float rl = std::sqrt(fwd[0] * fwd[0] + fwd[2] * fwd[2]);
                 float right[3] = {rl > 1e-5f ? -fwd[2] / rl : 1.0f, 0.0f, rl > 1e-5f ? fwd[0] / rl : 0.0f};
-                float speed = (ci.fast ? 46.0f : 15.0f) * dt;
+                float base = console.FindCVar("camera.move_speed")->GetFloat();
+                float speed = (ci.fast ? base * console.FindCVar("camera.boost")->GetFloat() : base) * dt;
                 for (int i = 0; i < 3; ++i)
                     pos[i] += (right[i] * ci.move_strafe + (i == 1 ? ci.move_up : 0.0f) + fwd[i] * ci.move_fwd) * speed;
                 console.SetCVarOverride("camera.yaw", fmt::format("{:.4f}", yaw));
@@ -337,6 +343,7 @@ int main(int argc, char** argv) {
             fp.sun[0] = ce * std::sin(saz);
             fp.sun[1] = std::sin(sel);
             fp.sun[2] = ce * std::cos(saz);
+            fp.ambient = console.FindCVar("renderer.ambient")->GetFloat();
             renderer.RenderFrame(fp);  // vsync caps the loop
         }
 

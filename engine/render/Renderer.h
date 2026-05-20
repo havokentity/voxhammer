@@ -18,6 +18,7 @@ struct FrameParams {
     float exposure   = 1.0f;
     int   hdr        = 0;       // 1 = ACES tonemap (stand-in for HDR10 output)
     float sun[3]     = {0.55f, 0.62f, 0.56f};  // normalized sun direction
+    float ambient    = 0.28f;                  // ambient/fill light fraction
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen

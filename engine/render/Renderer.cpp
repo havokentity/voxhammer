@@ -34,7 +34,7 @@ cbuffer Camera : register(b0) {
     float3 camUp;    int   gridDim;
     float3 clearCol; float exposure;
     float2 viewport; int   hdr; float pad;
-    float3 sunDir;   float pad2;
+    float3 sunDir;   float ambient;
 };
 StructuredBuffer<uint> Voxels : register(t0);
 
@@ -127,7 +127,7 @@ float4 PSMain(VSOut i) : SV_Target {
             float ndl = saturate(dot(nrm, sunDir));
             float shadow = occluded(hp + nrm * 0.02, sunDir) ? 0.0 : 1.0;
             float3 alb = palette(mat);
-            col = alb * (0.28 + 0.72 * ndl * shadow);   // ambient + shadowed sun
+            col = alb * (ambient + (1.0 - ambient) * ndl * shadow);   // fill + shadowed sun
         } else {
             col = sky(rd);
         }
@@ -146,7 +146,7 @@ struct CamCB {
     float camUp[3]; int gridDim;
     float clearCol[3]; float exposure;
     float viewport[2]; int hdr; float pad;
-    float sunDir[3]; float pad2;
+    float sunDir[3]; float ambient;
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -389,6 +389,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.gridDim = static_cast<int>(kGrid);
     cb.exposure = fp.exposure;
     cb.hdr = fp.hdr;
+    cb.ambient = fp.ambient;
     cb.viewport[0] = float(d.width);
     cb.viewport[1] = float(d.height);
     std::memcpy(d.camPtr, &cb, sizeof(cb));
