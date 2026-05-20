@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace vox::render {
@@ -61,6 +62,11 @@ public:
     // palette256 must point to 256 RGBA8 uints (VoxPalette::data()).
     // Call from the main thread (WaitIdle is used internally to sync the GPU).
     void SetVoxels(const std::vector<std::uint32_t>& grid, const std::uint32_t* palette256);
+
+    // Capture the current backbuffer and save it to |path|.
+    // png=true -> PNG (stb_image_write); png=false -> BMP.
+    // Returns false if DX12 is not initialised or the write fails.
+    bool CaptureScreenshot(const std::string& path, bool png);
 
 private:
     struct Impl;

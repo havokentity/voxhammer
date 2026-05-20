@@ -14,3 +14,6 @@ if(VOX_ENABLE_WINDOW)
     target_compile_definitions(vox_render PRIVATE VOX_HAVE_DX12=1)
     target_link_libraries(vox_render PRIVATE d3d12 dxgi dxguid d3dcompiler)
 endif()
+
+find_package(Stb REQUIRED)
+target_include_directories(vox_render PRIVATE ${Stb_INCLUDE_DIR})
