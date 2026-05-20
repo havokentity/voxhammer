@@ -328,3 +328,52 @@ TEST_CASE("VoxImport: reject bad magic") {
     vox::voxel::VoxScene scene;
     CHECK_FALSE(vox::voxel::LoadVoxFromMemory(buf.data(), buf.size(), scene));
 }
+
+TEST_CASE("VoxImport: RGBA palette maps color[i] to index i+1 (no off-by-one)") {
+    // SIZE 2x2x2
+    std::vector<std::uint8_t> sizeChunk;
+    append_tag(sizeChunk, "SIZE");
+    append_u32(sizeChunk, 12); append_u32(sizeChunk, 0);
+    append_u32(sizeChunk, 2); append_u32(sizeChunk, 2); append_u32(sizeChunk, 2);
+
+    // XYZI: one voxel (0,0,0) material 1
+    std::vector<std::uint8_t> xyziChunk;
+    append_tag(xyziChunk, "XYZI");
+    append_u32(xyziChunk, 4 + 1 * 4); append_u32(xyziChunk, 0);
+    append_u32(xyziChunk, 1);
+    xyziChunk.push_back(0); xyziChunk.push_back(0); xyziChunk.push_back(0); xyziChunk.push_back(1);
+
+    // RGBA: 256 colors; on-disk color[i] = (R=i, G=i, B=i, A=255).
+    std::vector<std::uint8_t> rgbaChunk;
+    append_tag(rgbaChunk, "RGBA");
+    append_u32(rgbaChunk, 256 * 4); append_u32(rgbaChunk, 0);
+    for (int i = 0; i < 256; ++i) {
+        rgbaChunk.push_back(static_cast<std::uint8_t>(i));  // R
+        rgbaChunk.push_back(static_cast<std::uint8_t>(i));  // G
+        rgbaChunk.push_back(static_cast<std::uint8_t>(i));  // B
+        rgbaChunk.push_back(0xFF);                          // A
+    }
+
+    std::uint32_t childBytes = static_cast<std::uint32_t>(sizeChunk.size() + xyziChunk.size() + rgbaChunk.size());
+    std::vector<std::uint8_t> buf;
+    append_tag(buf, "VOX "); append_u32(buf, 150);
+    append_tag(buf, "MAIN"); append_u32(buf, 0); append_u32(buf, childBytes);
+    buf.insert(buf.end(), sizeChunk.begin(), sizeChunk.end());
+    buf.insert(buf.end(), xyziChunk.begin(), xyziChunk.end());
+    buf.insert(buf.end(), rgbaChunk.begin(), rgbaChunk.end());
+
+    vox::voxel::VoxScene scene;
+    REQUIRE(vox::voxel::LoadVoxFromMemory(buf.data(), buf.size(), scene));
+
+    // r.u32() reads R,G,B,A little-endian -> 0xAABBGGRR in memory.
+    auto expected = [](int i) -> std::uint32_t {
+        return 0xFF000000u | (static_cast<std::uint32_t>(i) << 16)
+             | (static_cast<std::uint32_t>(i) << 8) | static_cast<std::uint32_t>(i);
+    };
+    // Spec: palette index m holds on-disk color[m-1]. (The old off-by-one bug
+    // stored color[m] at index m -> these would all be shifted by one.)
+    CHECK(scene.palette[1]   == expected(0));    // material 1 -> color 0
+    CHECK(scene.palette[5]   == expected(4));    // material 5 -> color 4
+    CHECK(scene.palette[255] == expected(254));  // top index -> color 254, NOT the unused 256th
+    CHECK(scene.palette[0]   == 0x00000000u);    // index 0 reserved/unused
+}
