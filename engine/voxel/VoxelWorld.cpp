@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 
 namespace vox::voxel {
 
@@ -61,6 +62,72 @@ void VoxelWorld::Shutdown() {
 
 void VoxelWorld::Clear() {
     chunks_.clear();
+    palette_ = {};
+    paletteUsed_ = 1;  // index 0 is reserved empty/air
+}
+
+void VoxelWorld::StampVox(const VoxelWorld& srcWorld, const VoxPalette& srcPalette,
+                           int ox, int oy, int oz) {
+    constexpr int kMaxCoord = 64;  // renderer grid is 64^3; clip outside [0,64)
+
+    int xmin, ymin, zmin, xmax, ymax, zmax;
+    srcWorld.Bounds(xmin, ymin, zmin, xmax, ymax, zmax);
+
+    for (int wz = zmin; wz < zmax; ++wz) {
+        for (int wy = ymin; wy < ymax; ++wy) {
+            for (int wx = xmin; wx < xmax; ++wx) {
+                const std::uint8_t srcMat = srcWorld.GetVoxel(wx, wy, wz);
+                if (srcMat == 0) continue;
+
+                // Destination world coordinate.
+                const int dx = ox + wx;
+                const int dy = oy + wy;
+                const int dz = oz + wz;
+                if (dx < 0 || dy < 0 || dz < 0 ||
+                    dx >= kMaxCoord || dy >= kMaxCoord || dz >= kMaxCoord) continue;
+
+                // Look up RGBA in the source palette.
+                const std::uint32_t rgba = srcPalette[srcMat];
+
+                // Find or insert this colour in the global merged palette.
+                std::uint8_t globalIdx = 0;
+
+                // Search existing entries [1 .. paletteUsed_-1] for an exact match.
+                for (unsigned i = 1; i < paletteUsed_; ++i) {
+                    if (palette_[i] == rgba) {
+                        globalIdx = static_cast<std::uint8_t>(i);
+                        break;
+                    }
+                }
+
+                if (globalIdx == 0) {
+                    if (paletteUsed_ < 256) {
+                        // Add new colour.
+                        globalIdx = static_cast<std::uint8_t>(paletteUsed_);
+                        palette_[paletteUsed_++] = rgba;
+                    } else {
+                        // Palette full: pick the nearest existing colour (Euclidean in RGB).
+                        auto r8 = [](std::uint32_t c) { return static_cast<int>( c        & 0xFF); };
+                        auto g8 = [](std::uint32_t c) { return static_cast<int>((c >>  8) & 0xFF); };
+                        auto b8 = [](std::uint32_t c) { return static_cast<int>((c >> 16) & 0xFF); };
+                        int rr = r8(rgba), rg = g8(rgba), rb = b8(rgba);
+                        unsigned bestDist = UINT_MAX;
+                        unsigned bestIdx  = 1;
+                        for (unsigned i = 1; i < 256; ++i) {
+                            int dr = r8(palette_[i]) - rr;
+                            int dg = g8(palette_[i]) - rg;
+                            int db = b8(palette_[i]) - rb;
+                            unsigned d = static_cast<unsigned>(dr*dr + dg*dg + db*db);
+                            if (d < bestDist) { bestDist = d; bestIdx = i; }
+                        }
+                        globalIdx = static_cast<std::uint8_t>(bestIdx);
+                    }
+                }
+
+                SetVoxel(dx, dy, dz, globalIdx);
+            }
+        }
+    }
 }
 
 void VoxelWorld::SetVoxel(int x, int y, int z, std::uint8_t mat) {

@@ -10,6 +10,13 @@
 namespace vox::voxel {
 
 // ---------------------------------------------------------------------------
+// Palette type (shared between VoxelWorld and VoxImport)
+// ---------------------------------------------------------------------------
+// 256-entry RGBA8 palette (R=byte0, G=byte1, B=byte2, A=byte3).
+// Index 0 is reserved (empty/air); valid material indices are 1..255.
+using VoxPalette = std::array<std::uint32_t, 256>;
+
+// ---------------------------------------------------------------------------
 // Chunk constants
 // ---------------------------------------------------------------------------
 inline constexpr unsigned kChunkSize = 32;  // voxels per side
@@ -68,8 +75,18 @@ public:
     // Number of live (non-evicted) chunks in the resident map.
     unsigned ResidentChunks() const { return static_cast<unsigned>(chunks_.size()); }
 
-    // Clear all voxel data.
+    // Clear all voxel data and reset the merged palette.
     void Clear();
+
+    // Stamp a source VoxScene's voxels into this world at offset (ox,oy,oz).
+    // Additive: existing voxels are NOT erased.  Source palette entries are merged
+    // into the world's global palette (palette_); indices are remapped accordingly.
+    // Coordinates outside [0,64) are clipped (matches the renderer's 64^3 grid).
+    void StampVox(const VoxelWorld& srcWorld, const VoxPalette& srcPalette,
+                  int ox, int oy, int oz);
+
+    // Access the merged global palette (256 RGBA8 entries; index 0 = empty).
+    const VoxPalette& Palette() const { return palette_; }
 
     // Produce the flat uint32 grid that the DX12 renderer reads via StructuredBuffer<uint>.
     // Encoding (matches Renderer.cpp GenerateScene / HLSL PSMain):
@@ -86,6 +103,11 @@ public:
 private:
     using ChunkMap = std::unordered_map<ChunkCoord, Chunk, ChunkCoordHash>;
     ChunkMap chunks_;
+
+    // Merged global palette: index 0 = empty/air (reserved).
+    // Palette entries are accumulated as models are stamped.
+    VoxPalette palette_{};
+    unsigned   paletteUsed_ = 1;  // next free index (starts at 1; 0 is reserved)
 
     static ChunkCoord WorldToChunk(int x, int y, int z) noexcept;
     static void       ChunkLocal(int x, int y, int z,

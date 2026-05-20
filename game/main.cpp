@@ -108,6 +108,9 @@ void RegisterCoreCvars() {
     reg("voxel.streaming.horizon_meters", "256", "Voxel streaming horizon.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 64.0f, .range_max = 512.0f, .range_step = 8.0f});
     reg("voxel.lod.aggressive_eviction", "0", "Aggressively evict distant chunks.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("voxel.import_path", "", "MagicaVoxel .vox file to load at startup (empty = procedural demo scene).", {.type = CVarType::String, .flags = CVAR_ARCHIVE});
+    reg("voxel.cursor.x", "0", "3D cursor X for voxel.place (0..63).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 63, .range_step = 1});
+    reg("voxel.cursor.y", "0", "3D cursor Y for voxel.place (0..63).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 63, .range_step = 1});
+    reg("voxel.cursor.z", "0", "3D cursor Z for voxel.place (0..63).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 63, .range_step = 1});
     reg("audio.master_volume", "0.8", "Master output volume.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
     reg("camera.pos", "32 40 -24", "Free-fly camera position (world units).", {.type = CVarType::Vec3, .flags = CVAR_ARCHIVE});
     reg("camera.yaw", "0.0", "Camera yaw (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = -3.1416f, .range_max = 3.1416f, .range_step = 0.02f});
@@ -349,6 +352,49 @@ int main(int argc, char** argv) {
             });
             vox::log::Info("camera: hold LEFT-MOUSE + WASD/QE to fly (Shift=fast); mouse looks");
         }
+    }
+
+    // --- Hot voxel placement commands ---
+    // voxel.place: stamp the .vox at voxel.import_path into the live world at cursor.
+    // voxel.clear: empty the world immediately.
+    // Both call renderer.SetVoxels (WaitIdle + memcpy) on the main thread (via console.Drain).
+    {
+        Console& c = Console::Get();
+        c.RegisterCommand("voxel.place",
+            "Stamp voxel.import_path into the world at (voxel.cursor.x/y/z). Additive.",
+            [&world, &renderer](std::span<const std::string_view>, Output& o) {
+                Console& cc = Console::Get();
+                CVar* ipCv = cc.FindCVar("voxel.import_path");
+                CVar* cxCv = cc.FindCVar("voxel.cursor.x");
+                CVar* cyCv = cc.FindCVar("voxel.cursor.y");
+                CVar* czCv = cc.FindCVar("voxel.cursor.z");
+                if (!ipCv || ipCv->value.empty()) {
+                    o.Print("voxel.place: load failed (set voxel.import_path)");
+                    return;
+                }
+                const std::string path = ipCv->value;
+                const int cx = cxCv ? cxCv->GetInt() : 0;
+                const int cy = cyCv ? cyCv->GetInt() : 0;
+                const int cz = czCv ? czCv->GetInt() : 0;
+                vox::voxel::VoxScene vs;
+                if (vox::voxel::LoadVox(path, vs)) {
+                    world.StampVox(vs.world, vs.palette, cx, cy, cz);
+                    auto grid = world.BakeFlatGrid(64);
+                    renderer.SetVoxels(grid, world.Palette().data());
+                    o.Format("placed {} at ({},{},{}) - {} voxels", path, cx, cy, cz, vs.voxelCount);
+                } else {
+                    o.Print("voxel.place: load failed (set voxel.import_path)");
+                }
+            });
+
+        c.RegisterCommand("voxel.clear",
+            "Clear all voxels from the world.",
+            [&world, &renderer](std::span<const std::string_view>, Output& o) {
+                world.Clear();
+                auto grid = world.BakeFlatGrid(64);
+                renderer.SetVoxels(grid, world.Palette().data());
+                o.Print("voxel world cleared");
+            });
     }
 
     // Engine loop.
