@@ -220,10 +220,14 @@ body {
 /* ---------- tools (abilities + console) ---------- */
 .tools { display: flex; align-items: center; gap: 12px; padding: 10px 12px; flex-wrap: wrap; }
 .abilities { display: flex; gap: 8px; flex-wrap: wrap; }
-.ability { display: flex; flex-direction: column; align-items: center; gap: 3px; width: 66px; min-height: 60px; padding: 8px 4px; border-radius: var(--r-sm); background: var(--panel-2); border: 1px solid var(--edge); color: var(--dim); font: inherit; cursor: pointer; transition: transform .08s, color .12s, border-color .12s; }
+.ability { position: relative; overflow: hidden; display: flex; flex-direction: column; align-items: center; gap: 3px; width: 66px; min-height: 60px; padding: 8px 4px; border-radius: var(--r-sm); background: var(--panel-2); border: 1px solid var(--edge); color: var(--dim); font: inherit; cursor: pointer; transition: transform .08s, color .12s, border-color .12s; }
 .ability .ab-ico { font-size: 18px; } .ability .ab-lbl { font-size: 9px; text-transform: uppercase; letter-spacing: .5px; }
+.ability .ab-ico, .ability .ab-lbl { position: relative; z-index: 1; }
 .ability:hover { color: var(--accent); border-color: var(--accent); transform: translateY(-1px); } .ability:active { transform: none; }
 .ability.danger:hover { color: var(--err); border-color: var(--err); }
+.ability.hold { touch-action: none; user-select: none; }
+.ability.hold.arming { color: var(--err); border-color: var(--err); }
+.ab-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; z-index: 0; opacity: 0; pointer-events: none; background: color-mix(in srgb, var(--err) 42%, transparent); }
 .console-line { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: 1; min-width: 240px; max-width: 620px; height: 40px; padding: 0 8px 0 14px; background: var(--panel-2); border: 1px solid var(--edge); border-radius: 999px; }
 .cl-prompt { color: var(--accent); font-family: var(--mono); }
 .console-line input { flex: 1; background: none; border: 0; color: var(--fg); font: inherit; outline: none; }

@@ -43,6 +43,7 @@ public:
     const std::vector<KeyBinding>& All() const { return bindings_; }
     void Set(const KeyBinding& b);
     bool Remove(const std::string& key, std::uint32_t modifiers);
+    void ResetToDefaults();  // replace all bindings with DefaultBindings() and save
 
 private:
     std::string             path_;

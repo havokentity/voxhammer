@@ -204,6 +204,12 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
             ShellExecuteW(nullptr, L"open", widePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             o.Format("opened {}", pf::UserDataDir());
         });
+    c.RegisterCommand("open_data_folder", "Open the Voxhammer user-data folder (cvars, keybindings, shots, cert) in Explorer.",
+        [](std::span<const std::string_view>, Output& o) {
+            std::wstring widePath = std::filesystem::path(pf::UserDataDir()).wstring();
+            ShellExecuteW(nullptr, L"open", widePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            o.Format("opened {}", pf::UserDataDir());
+        });
 
     // --- keybindings management (the web editor drives these via `exec`) ---
     c.RegisterCommand("binds", "List keybindings as JSON.", [&kb](std::span<const std::string_view>, Output& o) {
@@ -241,6 +247,11 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
         o.Print(ok ? "unbound" : "no such binding");
     });
     c.RegisterCommand("bind_reload", "Reload keybindings.toml.", [&kb](std::span<const std::string_view>, Output& o) { kb.Reload(); o.Print("reloaded"); });
+    c.RegisterCommand("keybindings.reset", "Reset ALL keybindings to factory defaults (overwrites keybindings.toml).",
+        [&kb](std::span<const std::string_view>, Output& o) {
+            kb.ResetToDefaults();
+            o.Format("keybindings reset to defaults ({} bindings)", kb.All().size());
+        });
     (void)outln;
 }
 

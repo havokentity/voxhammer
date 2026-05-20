@@ -79,6 +79,12 @@ bool Keybindings::Remove(const std::string& key, std::uint32_t modifiers) {
     return true;
 }
 
+void Keybindings::ResetToDefaults() {
+    bindings_ = DefaultBindings();
+    Save();
+    vox::log::Info("keybindings reset to defaults ({} bindings)", bindings_.size());
+}
+
 bool Keybindings::Dispatch(const std::string& key, std::uint32_t modifiers,
                            const std::function<void(const std::string&)>& exec_line) const {
     for (const KeyBinding& b : bindings_) {

@@ -105,6 +105,8 @@ const ABILITY_DEFS = [
     { name: "lua", ico: "✦", lbl: "Lua" },
     { name: "bluenoise.clear_cache", ico: "⟲", lbl: "Clear BN" },
     { name: "bluenoise.open_folder", ico: "📁", lbl: "BN Folder" },
+    { name: "open_data_folder", ico: "📂", lbl: "Data Dir" },
+    { name: "keybindings.reset", ico: "⌫", lbl: "Reset Keys", danger: true, hold: 1100 },
     { name: "quit", ico: "⏻", lbl: "Quit", danger: true },
 ];
 
@@ -961,10 +963,36 @@ function renderAbilities() {
     const have = new Set(state.commands.map((c) => c.name));
     for (const a of ABILITY_DEFS) {
         if (!have.has(a.name)) continue;
-        const b = el("button", "ability" + (a.danger ? " danger" : "")); b.innerHTML = `<span class="ab-ico">${a.ico}</span><span class="ab-lbl">${a.lbl}</span>`;
-        b.title = (state.commands.find((c) => c.name === a.name) || {}).description || a.name; b.onclick = () => runAbility(a.name);
+        const b = el("button", "ability" + (a.danger ? " danger" : "") + (a.hold ? " hold" : ""));
+        b.innerHTML = `<span class="ab-ico">${a.ico}</span><span class="ab-lbl">${a.lbl}</span>`;
+        b.title = (state.commands.find((c) => c.name === a.name) || {}).description || a.name;
+        if (a.hold) { b.title += " — press & hold to confirm"; wireHoldAbility(b, a); }
+        else b.onclick = () => runAbility(a.name);
         host.appendChild(b);
     }
+}
+// Press-and-hold-to-confirm: a fill bar wipes across over a.hold ms; releasing
+// early cancels. Used for destructive abilities (e.g. keybindings.reset).
+function wireHoldAbility(btn, a) {
+    const fill = el("span", "ab-fill"); btn.appendChild(fill);
+    let timer = 0, firing = false;
+    const reset = () => { fill.style.transition = "width .14s ease, opacity .2s"; fill.style.width = "0%"; fill.style.opacity = "0"; btn.classList.remove("arming"); };
+    const cancel = () => { if (timer) { clearTimeout(timer); timer = 0; if (!firing) reset(); } };
+    const start = (ev) => {
+        ev.preventDefault();
+        if (timer || firing) return;
+        btn.classList.add("arming");
+        fill.style.opacity = "1"; fill.style.transition = "width " + a.hold + "ms linear"; fill.style.width = "100%";
+        timer = setTimeout(() => {
+            timer = 0; firing = true; btn.classList.remove("arming"); fill.style.width = "100%";
+            runAbility(a.name);
+            setTimeout(() => { firing = false; reset(); }, 220);
+        }, a.hold);
+    };
+    btn.addEventListener("pointerdown", start);
+    btn.addEventListener("pointerup", cancel);
+    btn.addEventListener("pointerleave", cancel);
+    btn.addEventListener("pointercancel", cancel);
 }
 function runAbility(name) {
     if (name === "lua") { if (document.body.dataset.layout === "narrow") setView("tools"); $("#console-input").value = 'lua "print(\'hi\')"'; $("#console-input").focus(); return; }

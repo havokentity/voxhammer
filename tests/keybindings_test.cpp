@@ -287,6 +287,45 @@ TEST_CASE("Keybindings: loading a missing file returns false") {
     CHECK_FALSE(kb.Load("definitely_no_such_keybindings.toml"));
 }
 
+TEST_CASE("Keybindings::ResetToDefaults restores factory bindings and persists") {
+    const std::string path = "test_kb_reset.toml";
+
+    // Seed a file so path_ is set (ResetToDefaults calls Save()).
+    {
+        std::ofstream f(path);
+        f << "[[bind]]\nkey=\"Z\"\nmods=[]\ntarget=\"command custom_only\"\n";
+    }
+
+    Keybindings kb;
+    REQUIRE(kb.Load(path));
+
+    // Add a custom binding that is NOT part of the defaults.
+    {
+        KeyBinding b;
+        b.key = "Z"; b.modifiers = 0u; b.target = "command custom_only";
+        kb.Set(b);
+    }
+    REQUIRE_FALSE(kb.All().empty());
+
+    kb.ResetToDefaults();
+
+    // After reset, bindings must equal DefaultBindings() exactly.
+    auto def = DefaultBindings();
+    REQUIRE(kb.All().size() == def.size());
+    bool custom_gone = true;
+    for (const auto& b : kb.All()) {
+        if (b.key == "Z" && b.target == "command custom_only") custom_gone = false;
+    }
+    CHECK(custom_gone);
+
+    // And the reset must have been written to disk: a fresh load matches defaults.
+    Keybindings kb2;
+    REQUIRE(kb2.Load(path));
+    CHECK(kb2.All().size() == def.size());
+
+    std::remove(path.c_str());
+}
+
 TEST_CASE("Keybindings: duplicate key in file keeps first, ignores second") {
     const std::string path = "test_kb_dup.toml";
     {
