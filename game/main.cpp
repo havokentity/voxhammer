@@ -81,6 +81,8 @@ void RegisterCoreCvars() {
     reg("camera.yaw", "0.0", "Camera yaw (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = -3.1416f, .range_max = 3.1416f, .range_step = 0.02f});
     reg("camera.pitch", "-0.5", "Camera pitch (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = -1.5f, .range_max = 1.5f, .range_step = 0.02f});
     reg("camera.fov", "1.2", "Camera vertical FOV (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.4f, .range_max = 2.4f, .range_step = 0.02f});
+    reg("camera.invert_x", "1", "Invert horizontal mouse-look.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("camera.invert_y", "0", "Invert vertical mouse-look.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("editor.active", "0", "Editor mode (vs play).", {.type = CVarType::Bool});
     reg("debug.show_brick_grid", "0", "Overlay the brick grid.", {.type = CVarType::Bool, .flags = CVAR_DEVELOPER});
     reg("debug.show_physx_wireframe", "0", "Overlay PhysX collision wireframe.", {.type = CVarType::Bool, .flags = CVAR_DEVELOPER});
@@ -300,8 +302,10 @@ int main(int argc, char** argv) {
                 float pos[3] = {0, 0, 0};
                 ParseRGB(console.FindCVar("camera.pos")->value, pos[0], pos[1], pos[2]);
                 const float sens = 0.0025f, PI = 3.14159265f;
-                yaw -= ci.look_dx * sens;   // inverted X (horizontal)
-                pitch -= ci.look_dy * sens;
+                float invx = console.FindCVar("camera.invert_x")->GetBool() ? -1.0f : 1.0f;
+                float invy = console.FindCVar("camera.invert_y")->GetBool() ? -1.0f : 1.0f;
+                yaw += ci.look_dx * sens * invx;
+                pitch -= ci.look_dy * sens * invy;
                 while (yaw > PI) yaw -= 2 * PI;
                 while (yaw < -PI) yaw += 2 * PI;
                 pitch = std::clamp(pitch, -1.5f, 1.5f);

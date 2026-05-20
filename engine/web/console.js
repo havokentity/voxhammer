@@ -106,6 +106,8 @@ function mockCvars() {
         C("camera.yaw", "0.0", "float", F.ARCHIVE, "Camera yaw (radians).", R(-3.1416, 3.1416, 0.02)),
         C("camera.pitch", "-0.5", "float", F.ARCHIVE, "Camera pitch (radians).", R(-1.5, 1.5, 0.02)),
         C("camera.fov", "1.2", "float", F.ARCHIVE, "Camera vertical FOV (radians).", R(0.4, 2.4, 0.02)),
+        C("camera.invert_x", "1", "bool", F.ARCHIVE, "Invert horizontal mouse-look."),
+        C("camera.invert_y", "0", "bool", F.ARCHIVE, "Invert vertical mouse-look."),
         C("debug.show_brick_grid", "0", "bool", F.DEVELOPER, "Overlay the brick grid."),
         C("debug.pause_simulation", "0", "bool", F.CHEAT, "Pause the simulation."),
         C("profiling.tracy_enabled", "0", "bool", 0, "Stream to the Tracy profiler."),
