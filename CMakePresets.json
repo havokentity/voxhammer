@@ -11,7 +11,10 @@
       "cacheVariables": {
         "VCPKG_TARGET_TRIPLET": "x64-windows",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "VCPKG_MANIFEST_FEATURES": "console;tls;window"
+        "VCPKG_MANIFEST_FEATURES": "console;tls;window;jobs;ecs;script",
+        "VOX_ENABLE_JOBS": "ON",
+        "VOX_ENABLE_ECS": "ON",
+        "VOX_ENABLE_SCRIPT": "ON"
       },
       "vendor": {
         "microsoft.com/VisualStudioSettings/CMake/1.0": { "hostOS": [ "Windows" ] }

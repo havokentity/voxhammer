@@ -2,7 +2,9 @@
 // Copyright (c) 2026 Rajesh D'Monte
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace vox::render {
 
@@ -37,7 +39,9 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
 
-    bool Init(void* hwnd, int width, int height);
+    // voxels: optional flat kGrid^3 uint32 material grid (from VoxelWorld::BakeFlatGrid)
+    // that overrides the built-in procedural scene. nullptr => procedural demo scene.
+    bool Init(void* hwnd, int width, int height, const std::vector<std::uint32_t>* voxels = nullptr);
     void Shutdown();
     bool Valid() const { return valid_; }
 

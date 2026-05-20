@@ -323,7 +323,7 @@ struct Renderer::Impl {
 Renderer::Renderer() : impl_(std::make_unique<Impl>()) {}
 Renderer::~Renderer() { Shutdown(); }
 
-bool Renderer::Init(void* hwndPtr, int width, int height) {
+bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std::uint32_t>* voxels) {
     HWND hwnd = static_cast<HWND>(hwndPtr);
     if (!hwnd) return false;
     Impl& d = *impl_;
@@ -433,7 +433,10 @@ bool Renderer::Init(void* hwndPtr, int width, int height) {
     }
 
     // --- voxel buffer (upload heap StructuredBuffer) ---
-    std::vector<std::uint32_t> scene = GenerateScene(kGrid);
+    // Use an externally supplied grid (imported .vox) when it matches kGrid^3;
+    // otherwise fall back to the built-in procedural demo scene.
+    const std::size_t voxNeed = static_cast<std::size_t>(kGrid) * kGrid * kGrid;
+    std::vector<std::uint32_t> scene = (voxels && voxels->size() == voxNeed) ? *voxels : GenerateScene(kGrid);
     d.voxelBuf = d.MakeUpload(scene.size() * sizeof(std::uint32_t));
     if (!d.voxelBuf) return false;
     void* p = nullptr;
@@ -550,7 +553,7 @@ namespace vox::render {
 struct Renderer::Impl {};
 Renderer::Renderer() : impl_(std::make_unique<Impl>()) {}
 Renderer::~Renderer() {}
-bool Renderer::Init(void*, int, int) { return false; }
+bool Renderer::Init(void*, int, int, const std::vector<std::uint32_t>*) { return false; }
 void Renderer::RenderFrame(const FrameParams&) {}
 void Renderer::Shutdown() {}
 }  // namespace vox::render

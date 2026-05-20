@@ -14,9 +14,15 @@
 #include "platform/Log.h"
 #include "platform/Platform.h"
 #include "platform/Window.h"
+#include "ecs/EcsWorld.h"
+#include "jobs/JobScheduler.h"
 #include "render/Renderer.h"
+#include "script/ScriptHost.h"
+#include "voxel/VoxImport.h"
+#include "voxel/VoxelWorld.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -70,6 +76,9 @@ void RegisterCoreCvars() {
     reg("renderer.sun.azimuth", "0.7", "Sun azimuth (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 6.2832f, .range_step = 0.02f});
     reg("renderer.sun.elevation", "0.6", "Sun elevation (radians; lower = longer shadows).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.1f, .range_max = 1.5f, .range_step = 0.02f});
     reg("renderer.ambient", "0.28", "Ambient fill light (lower = punchier shadows).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
+    reg("renderer.shadow.softness", "0.08", "Soft-shadow penumbra half-angle (radians; 0 = hard).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 0.5f, .range_step = 0.01f});
+    reg("renderer.ao.strength", "0.55", "Ambient-occlusion darkening (0 = off).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
+    reg("renderer.ao.radius", "4.0", "Ambient-occlusion ray reach (voxels).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 1.0f, .range_max = 24.0f, .range_step = 1.0f});
     reg("physics.gpu_rigids.enabled", "1", "GPU rigid bodies (NVIDIA).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("physics.gpu_rigids.max_islands", "10000", "Max active dynamic islands.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 256, .range_max = 16384, .range_step = 256});
     reg("physics.solver.position_iters", "8", "Solver position iterations.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
@@ -77,6 +86,7 @@ void RegisterCoreCvars() {
     reg("sim.fire.combustion_rate", "1.0", "Combustion rate multiplier.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.1f, .range_max = 5.0f, .range_step = 0.1f});
     reg("voxel.streaming.horizon_meters", "256", "Voxel streaming horizon.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 64.0f, .range_max = 512.0f, .range_step = 8.0f});
     reg("voxel.lod.aggressive_eviction", "0", "Aggressively evict distant chunks.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("voxel.import_path", "", "MagicaVoxel .vox file to load at startup (empty = procedural demo scene).", {.type = CVarType::String, .flags = CVAR_ARCHIVE});
     reg("audio.master_volume", "0.8", "Master output volume.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
     reg("camera.pos", "32 40 -24", "Free-fly camera position (world units).", {.type = CVarType::Vec3, .flags = CVAR_ARCHIVE});
     reg("camera.yaw", "0.0", "Camera yaw (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = -3.1416f, .range_max = 3.1416f, .range_step = 0.02f});
@@ -139,7 +149,7 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
     c.RegisterCommand("reload_scene", "Reload the current scene (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("reload_scene: stub"); });
     c.RegisterCommand("physics.dump_islands", "Dump active PhysX islands (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("0 active islands"); });
     c.RegisterCommand("voxel.dump_chunks", "Dump resident voxel chunks (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("0 chunks resident"); });
-    c.RegisterCommand("lua", "Execute a Lua script (stub until M6).", [](std::span<const std::string_view>, Output& o) { o.Print("lua host stubbed (M6)"); });
+    // `lua` command is registered by ScriptHost::Init() (engine/script) when scripting is enabled.
 
     c.RegisterCommand("console.rotate_cert", "Regenerate the TLS cert.", [&server](std::span<const std::string_view>, Output& o) { server.RotateCert(); o.Print("ok"); });
     c.RegisterCommand("console.rotate_sessions", "Invalidate all sessions.", [&server](std::span<const std::string_view>, Output& o) { server.RotateSessions(); o.Print("ok"); });
@@ -260,6 +270,31 @@ int main(int argc, char** argv) {
         server.Start(cfg, &console);
     }
 
+    // Engine subsystems (M1 bring-up): jobs scheduler, ECS, scripting, voxel world.
+    vox::jobs::JobScheduler jobs;
+    jobs.Init();  // 0 => auto-size from CPU topology
+    vox::ecs::EcsWorld ecs;
+    ecs.Init();
+    vox::script::ScriptHost scripts;
+    scripts.Init();  // registers the `lua` console command
+    vox::voxel::VoxelWorld world;
+    world.Init();
+
+    // Optional .vox import overrides the renderer's procedural demo scene.
+    std::vector<std::uint32_t> voxelGrid;
+    bool haveVoxels = false;
+    if (CVar* ip = console.FindCVar("voxel.import_path"); ip && !ip->value.empty()) {
+        vox::voxel::VoxScene vs;
+        if (vox::voxel::LoadVox(ip->value, vs)) {
+            world = std::move(vs.world);
+            voxelGrid = world.BakeFlatGrid(64);  // 64 = renderer kGrid
+            haveVoxels = true;
+            vox::log::Info("voxel: imported {} ({} voxels, {} chunks)", ip->value, vs.voxelCount, world.ResidentChunks());
+        } else {
+            vox::log::Warn("voxel: failed to import {}", ip->value);
+        }
+    }
+
     // Window + DX12 + key dispatch.
     pf::Window window;
     vox::render::Renderer renderer;
@@ -267,7 +302,7 @@ int main(int argc, char** argv) {
     if (!args.no_window) {
         hasWindow = window.Create(1280, 720, "Voxhammer");
         if (hasWindow) {
-            renderer.Init(window.NativeHandle(), window.Width(), window.Height());
+            renderer.Init(window.NativeHandle(), window.Width(), window.Height(), haveVoxels ? &voxelGrid : nullptr);
             window.SetKeyHandler([&keybindings](const std::string& key, std::uint32_t mods) {
                 keybindings.Dispatch(key, mods, [](const std::string& line) {
                     vox::log::Info("keybind: {}", line);
@@ -328,6 +363,8 @@ int main(int argc, char** argv) {
             }
         }
 
+        ecs.Step(dt);  // advance ECS systems (kinematics + lifetimes)
+
         if (renderer.Valid()) {
             vox::render::FrameParams fp;
             ParseRGB(console.FindCVar("renderer.debug.clear_color")->value, fp.clear[0], fp.clear[1], fp.clear[2]);
@@ -344,6 +381,9 @@ int main(int argc, char** argv) {
             fp.sun[1] = std::sin(sel);
             fp.sun[2] = ce * std::cos(saz);
             fp.ambient = console.FindCVar("renderer.ambient")->GetFloat();
+            fp.shadow_softness = console.FindCVar("renderer.shadow.softness")->GetFloat();
+            fp.ao_strength = console.FindCVar("renderer.ao.strength")->GetFloat();
+            fp.ao_radius = console.FindCVar("renderer.ao.radius")->GetFloat();
             renderer.RenderFrame(fp);  // vsync caps the loop
         }
 
@@ -352,8 +392,8 @@ int main(int argc, char** argv) {
             float fps = dt > 0.0f ? 1.0f / dt : 0.0f;
             bool paused = console.FindCVar("debug.pause_simulation")->GetBool();
             std::string data = fmt::format(
-                R"({{"fps":{:.1f},"frame_ms":{:.2f},"gpu_mem_mb":0,"gpu_budget_mb":16384,"chunks":0,"islands":0,"archetypes":0,"denoiser_ms":0,"upscaler_ms":0,"paused":{}}})",
-                fps, dt * 1000.0f, paused ? "true" : "false");
+                R"({{"fps":{:.1f},"frame_ms":{:.2f},"gpu_mem_mb":0,"gpu_budget_mb":16384,"chunks":{},"islands":0,"archetypes":{},"denoiser_ms":0,"upscaler_ms":0,"paused":{}}})",
+                fps, dt * 1000.0f, world.ResidentChunks(), ecs.EntityCount(), paused ? "true" : "false");
             server.BroadcastEvent("frame_stats", data);
         }
 
@@ -365,6 +405,10 @@ int main(int argc, char** argv) {
     vox::log::Info("shutting down");
     renderer.Shutdown();
     if (hasWindow) window.Destroy();
+    scripts.Shutdown();
+    ecs.Shutdown();
+    world.Shutdown();
+    jobs.Shutdown();
     server.Stop();
     console.SaveCvarsToml(args.cvars_path);
     return 0;
