@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Rajesh D'Monte
+// Generated from VoxVersion.h.in by CMake configure_file. Do not edit the
+// generated copy. The version comes from project(voxhammer VERSION ...).
+#pragma once
+
+#define VOX_VERSION_STRING "@PROJECT_VERSION@"
+#define VOX_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define VOX_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define VOX_VERSION_PATCH @PROJECT_VERSION_PATCH@

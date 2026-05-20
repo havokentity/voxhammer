@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Example Voxhammer mod manifest. Mods live under /mods/<name>/ with a
+# mod.toml, Lua scripts, .vox models, and optional FMOD banks. The LuaJIT host
+# + file-watcher hot-reload land in M6.
+[mod]
+name        = "example"
+version     = "0.1.0"
+author      = "Rajesh D'Monte"
+description = "Skeleton example mod -- registers a console command via Lua."
+entry       = "main.lua"
+api_version = 1

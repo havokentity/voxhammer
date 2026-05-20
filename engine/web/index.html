@@ -1,0 +1,109 @@
+<!--
+     SPDX-License-Identifier: MIT
+     Copyright (c) 2026 Rajesh D'Monte
+     Voxhammer command console -- a modern, touch-first control surface. Works
+     on desktop and tablet (over the network); mouse- and touch-centric. Vanilla
+     JS/CSS, no build step, embedded into the binary via vox_embed_resource.
+     Speaks the ConsoleServer JSON protocol; falls back to an offline mock so it
+     is fully interactive before the network server is wired.
+-->
+<!DOCTYPE html>
+<html lang="en" data-theme="aurora" data-skin="modern" data-density="comfortable">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0e14">
+<title>Voxhammer · console</title>
+<link rel="stylesheet" href="console.css">
+</head>
+<body data-layout="wide" data-view="controls">
+<div class="fx" aria-hidden="true"></div>
+
+<div class="login" id="login" hidden>
+  <form class="login-card" id="login-form">
+    <div class="login-brand"><span class="brand-mark">◆</span> <b>VOX</b>HAMMER</div>
+    <div class="login-sub">console authentication</div>
+    <input id="login-pw" type="password" placeholder="password" autocomplete="current-password" spellcheck="false">
+    <button type="submit" class="login-go">connect</button>
+    <div class="login-msg" id="login-msg"></div>
+  </form>
+</div>
+
+<header class="topbar">
+  <button class="rail-toggle" id="rail-toggle" title="categories" aria-label="categories">≣</button>
+  <div class="brand"><span class="brand-mark">◆</span><span class="brand-name"><b>VOX</b>HAMMER</span><span class="brand-sub">console</span></div>
+  <div class="resbar" id="resbar"><!-- live telemetry counters --></div>
+  <div class="topbar-right">
+    <button class="link link-init" id="link" title="connection status"><span class="link-dot"></span><span id="link-text">init…</span></button>
+    <button class="gear" id="gear" title="settings" aria-label="settings">⚙</button>
+  </div>
+</header>
+
+<div class="settings-pop" id="settings" hidden>
+  <div class="set-row"><span class="set-k">preset</span><div class="seg" id="set-preset"></div></div>
+  <div class="set-sep"></div>
+  <div class="set-row"><span class="set-k">skin</span><div class="seg" id="set-skin"></div></div>
+  <div class="set-row"><span class="set-k">theme</span><div class="swatches" id="set-theme"></div></div>
+  <div class="set-row"><span class="set-k">density</span><div class="seg" id="set-density"></div></div>
+</div>
+
+<main class="stage" id="stage">
+  <nav class="rail" id="rail"><!-- category buttons --></nav>
+
+  <section class="panel deck" id="deck">
+    <div class="deck-head">
+      <div class="deck-title"><span class="deck-icon" id="deck-icon">▣</span><h1 id="deck-name">Render</h1><span class="deck-count" id="deck-count"></span></div>
+      <div class="deck-tools">
+        <label class="search"><span>⌕</span><input id="search" type="text" placeholder="filter" spellcheck="false" autocomplete="off"></label>
+        <button class="btn-ghost" id="reset-group" title="Reset this group to defaults">⟲ reset</button>
+      </div>
+    </div>
+    <div class="controls" id="controls"><!-- schema-driven controls --></div>
+  </section>
+
+  <aside class="intel" id="intel">
+    <div class="panel viewport-card">
+      <div class="cap">viewport <span class="cap-dim" id="vp-res">clear_color</span></div>
+      <div class="viewport" id="viewport">
+        <div class="vp-grid" id="vp-grid"></div>
+        <div class="vp-badges" id="vp-badges"></div>
+        <div class="vp-readout" id="vp-readout"></div>
+      </div>
+    </div>
+    <div class="panel tele-card">
+      <div class="cap">telemetry <span class="cap-dim" id="tele-state">live</span></div>
+      <div class="fps-big"><span id="fps-num">—</span><small>fps</small><canvas id="spark" class="spark" width="240" height="42"></canvas></div>
+      <div class="gauges" id="gauges"></div>
+    </div>
+    <div class="panel log-card">
+      <div class="cap">log
+        <span class="cap-tools">
+          <button class="chip on" data-lvl="info">info</button>
+          <button class="chip on" data-lvl="warn">warn</button>
+          <button class="chip on" data-lvl="error">error</button>
+          <button class="cap-btn" id="log-clear" title="clear log">⌫</button>
+        </span>
+      </div>
+      <div class="log" id="log"></div>
+    </div>
+  </aside>
+
+  <section class="panel tools" id="tools">
+    <div class="abilities" id="abilities"><!-- command buttons --></div>
+    <form class="console-line" id="console-form" autocomplete="off">
+      <span class="cl-prompt">❯</span>
+      <input id="console-input" type="text" spellcheck="false" placeholder="raw command — optional; the console is mouse/touch-first">
+      <button class="cl-send" type="submit">run</button>
+    </form>
+  </section>
+</main>
+
+<nav class="viewtabs" id="viewtabs">
+  <button data-view="controls" class="active"><span>▣</span>Controls</button>
+  <button data-view="intel"><span>◹</span>Intel</button>
+  <button data-view="tools"><span>⌘</span>Tools</button>
+</nav>
+
+<script src="console.js"></script>
+</body>
+</html>

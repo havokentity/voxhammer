@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
+# LLVM base, 4-space indent, 120 column limit (Voxhammer coding standard).
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+PointerAlignment: Left
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+NamespaceIndentation: None
+FixNamespaceComments: true

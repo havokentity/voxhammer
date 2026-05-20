@@ -1,0 +1,86 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "voxhammer",
+  "version": "0.1.0",
+  "description": "Voxhammer -- standalone Windows DX12 voxel-destruction engine + no-narrative sandbox.",
+  "homepage": "https://github.com/havokentity/voxhammer",
+  "license": "MIT",
+  "dependencies": [
+    "fmt",
+    "tomlplusplus",
+    "glm",
+    "doctest"
+  ],
+  "features": {
+    "console": {
+      "description": "Network ConsoleServer: civetweb (WS+HTTP) + libsodium (argon2id, secure random) + nlohmann-json (protocol).",
+      "dependencies": [
+        "civetweb",
+        "libsodium",
+        "nlohmann-json"
+      ]
+    },
+    "tls": {
+      "description": "HTTPS/WSS transport for the ConsoleServer (self-signed cert).",
+      "dependencies": [
+        {
+          "name": "civetweb",
+          "features": [
+            "ssl"
+          ]
+        },
+        "openssl"
+      ]
+    },
+    "jobs": {
+      "description": "enkiTS lock-free task scheduler.",
+      "dependencies": [
+        "enkits"
+      ]
+    },
+    "window": {
+      "description": "GLFW window + input (hosts the DX12 swapchain).",
+      "dependencies": [
+        "glfw3"
+      ]
+    },
+    "ecs": {
+      "description": "EnTT entity-component-system.",
+      "dependencies": [
+        "entt"
+      ]
+    },
+    "mem": {
+      "description": "mimalloc base allocator.",
+      "dependencies": [
+        "mimalloc"
+      ]
+    },
+    "ui": {
+      "description": "Dear ImGui debug overlay + GLFW window/input.",
+      "dependencies": [
+        "imgui",
+        "glfw3"
+      ]
+    },
+    "script": {
+      "description": "LuaJIT scripting host + FFI.",
+      "dependencies": [
+        "luajit"
+      ]
+    },
+    "profiling": {
+      "description": "Tracy CPU profiler client.",
+      "dependencies": [
+        "tracy"
+      ]
+    },
+    "assets": {
+      "description": "meshoptimizer (.vox simplification) + nlohmann-json.",
+      "dependencies": [
+        "meshoptimizer",
+        "nlohmann-json"
+      ]
+    }
+  }
+}

@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Rajesh D'Monte
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Hosted Windows runners ship vcpkg at VCPKG_INSTALLATION_ROOT.
+      - name: Point VCPKG_ROOT at the runner's vcpkg
+        shell: pwsh
+        run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+
+      - name: Set up MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+
+      # MSVC/Debug is the guaranteed-green CI config on hosted runners. The
+      # clang-cl release presets are validated locally (clang-cl is not always
+      # present on the runner image).
+      - name: Configure
+        run: cmake --preset windows-debug
+
+      - name: Build
+        run: cmake --build build/windows-debug --parallel
+
+      - name: Test
+        run: ctest --test-dir build/windows-debug --output-on-failure
+
+      - name: Smoke (version)
+        run: build/windows-debug/game/voxhammer.exe --version
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: voxhammer-windows-debug
+          path: build/windows-debug/game/voxhammer.exe
+          if-no-files-found: error

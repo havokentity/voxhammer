@@ -1,0 +1,47 @@
+# Build output
+build/
+dist/
+out/
+
+# vcpkg (manifest mode installs here per-build-tree; toolchain also drops a
+# copy at the source root on some flows)
+vcpkg_installed/
+.vcpkg-root
+
+# CMake local
+CMakeUserPresets.json
+compile_commands.json
+
+# IDEs / editors
+.idea/
+.vs/
+.vscode/
+.fleet/
+.cache/
+*.user
+
+# Compiled / linked artifacts
+*.obj
+*.o
+*.lib
+*.a
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Build/run logs + scratch
+*.log
+
+# Runtime-generated config + state (the engine regenerates these)
+cvars.toml
+keybindings.toml
+console_history.txt
+
+# Claude Code session state
+.claude/
+
+# OS cruft
+.DS_Store
+Thumbs.db
