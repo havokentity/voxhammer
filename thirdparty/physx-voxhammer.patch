@@ -1,0 +1,28 @@
+diff --git a/physx/source/compiler/cmake/windows/CMakeLists.txt b/physx/source/compiler/cmake/windows/CMakeLists.txt
+index fa30123..0873a74 100644
+--- a/physx/source/compiler/cmake/windows/CMakeLists.txt
++++ b/physx/source/compiler/cmake/windows/CMakeLists.txt
+@@ -127,7 +127,11 @@ SET(PHYSX_WINDOWS_PROFILE_COMPILE_DEFS "PX_PROFILE=1;${NVTX_FLAG};PX_SUPPORT_PVD
+ SET(PHYSX_WINDOWS_RELEASE_COMPILE_DEFS "PX_SUPPORT_PVD=0;PX_SUPPORT_OMNI_PVD=0" CACHE INTERNAL "Release PhysX preprocessor definitions")
+ 
+ # copy the external dlls
+-IF(PX_COPY_EXTERNAL_DLL OR PUBLIC_RELEASE)
++# Voxhammer: gated on PX_COPY_EXTERNAL_DLL only (was "OR PUBLIC_RELEASE"). Our
++# CPU-only source build has no packman-provided PhysXDevice/freeglut/PhysXGpu
++# DLLs, and PUBLIC_RELEASE=1 would otherwise force a FILE COPY of files that do
++# not exist. See thirdparty/README.md + thirdparty/physx-voxhammer.patch.
++IF(PX_COPY_EXTERNAL_DLL)
+ 	IF(NOT PHYSX_SLN_PHYSXDEVICE_PATH)
+ 		SET(PHYSX_SLN_PHYSXDEVICE_PATH "$ENV{PM_PhysXDevice_PATH}/bin/x86/" CACHE INTERNAL "PhysX device copy path")
+ 	ENDIF()
+@@ -154,7 +158,9 @@ IF(PX_COPY_EXTERNAL_DLL OR PUBLIC_RELEASE)
+ 	ENDIF()
+ ENDIF()
+ # for public release we copy the dlls for GPU other platforms so we dont keep duplicates around the repository
+-IF(PUBLIC_RELEASE)
++# Voxhammer: disabled (was "IF(PUBLIC_RELEASE)"). No prebuilt PhysXGpu DLLs in a
++# CPU-only source build. See thirdparty/README.md + thirdparty/physx-voxhammer.patch.
++IF(FALSE)
+ 	IF(NOT PHYSX_SLN_PHYSXGPU_PATH)
+ 		SET(PHYSX_SLN_PHYSXGPU_PATH "$ENV{PM_PhysXGpu_PATH}/bin/" CACHE INTERNAL "PhysXGpu copy path")
+ 	ENDIF()

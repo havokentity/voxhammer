@@ -21,3 +21,9 @@ vox_add_test(voxel   SOURCES voxel_test.cpp   LINK vox_voxel)
 vox_add_test(command     SOURCES command_test.cpp     LINK vox_cvar)
 vox_add_test(keybindings SOURCES keybindings_test.cpp LINK vox_platform)
 vox_add_test(password    SOURCES password_test.cpp    LINK vox_console)
+
+# PhysX smoke test: only built when the SDK is wired in (VOX_ENABLE_PHYSX=ON),
+# since vox_physics is just a stub otherwise. Mirrors the root CMake gate.
+if(VOX_ENABLE_PHYSX)
+    vox_add_test(physics SOURCES physics_test.cpp LINK vox_physics)
+endif()
