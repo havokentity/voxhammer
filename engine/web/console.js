@@ -103,9 +103,8 @@ const ABILITY_DEFS = [
     { name: "console.rotate_cert", ico: "⚿", lbl: "Cert" },
     { name: "console.list_sessions", ico: "⧉", lbl: "Sessions" },
     { name: "lua", ico: "✦", lbl: "Lua" },
-    { name: "bluenoise.clear_cache", ico: "⟲", lbl: "Clear BN" },
-    { name: "bluenoise.open_folder", ico: "📁", lbl: "BN Folder" },
-    { name: "open_data_folder", ico: "📂", lbl: "Data Dir" },
+    { name: "bluenoise.clear_cache", ico: "⟲", lbl: "Clear BN", danger: true, hold: 1100 },
+    { name: "open_data_folder", ico: "📂", lbl: "AppData" },
     { name: "keybindings.reset", ico: "⌫", lbl: "Reset Keys", danger: true, hold: 1100 },
     { name: "quit", ico: "⏻", lbl: "Quit", danger: true },
 ];

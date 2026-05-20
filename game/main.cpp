@@ -198,12 +198,6 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
             std::filesystem::remove(std::filesystem::path(pf::UserDataDir()) / "bluenoise64.bin", ec);
             o.Print("blue-noise cache cleared - restart the engine to re-bake");
         });
-    c.RegisterCommand("bluenoise.open_folder", "Open the engine user-data directory in Explorer.",
-        [](std::span<const std::string_view>, Output& o) {
-            std::wstring widePath = std::filesystem::path(pf::UserDataDir()).wstring();
-            ShellExecuteW(nullptr, L"open", widePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            o.Format("opened {}", pf::UserDataDir());
-        });
     c.RegisterCommand("open_data_folder", "Open the Voxhammer user-data folder (cvars, keybindings, shots, cert) in Explorer.",
         [](std::span<const std::string_view>, Output& o) {
             std::wstring widePath = std::filesystem::path(pf::UserDataDir()).wstring();
