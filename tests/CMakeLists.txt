@@ -14,3 +14,6 @@ endfunction()
 
 vox_add_test(cvar_roundtrip SOURCES cvar_roundtrip_test.cpp LINK vox_cvar)
 vox_add_test(ispc_kernel    SOURCES ispc_kernel_test.cpp    LINK vox_ispc)
+vox_add_test(command        SOURCES command_test.cpp        LINK vox_cvar)
+vox_add_test(keybindings    SOURCES keybindings_test.cpp    LINK vox_platform)
+vox_add_test(password       SOURCES password_test.cpp       LINK vox_console)
