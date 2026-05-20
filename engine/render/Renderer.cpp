@@ -55,6 +55,7 @@ cbuffer Camera : register(b0) {
     float  aoStrength;     float aoRadius;     int lightingMode; int accumFrame; // row 7
     int    dither;         int aoSamples;      int shadowSamples; int giSamples;  // row 8
     int    giDenoise;      float giHistMax;    int emptySkip;     int brickDim;   // row 9
+    int    giDebug;        int   giPad10a;     int giPad10b;      int giPad10c;   // row 10
 };
 StructuredBuffer<uint> Voxels : register(t0);
 RWStructuredBuffer<float4> Accum : register(u0);  // per-pixel GI accumulation: rgb + sample count
@@ -422,6 +423,7 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
         indirectSum += indirect;
     }
     float3 indirectAvg = indirectSum / float(numBounces);
+    if (giDebug != 0) return indirectAvg;   // GI debug view: show ONLY the indirect bounce radiance
     return alb * (direct + indirectAvg);
 }
 
@@ -493,6 +495,7 @@ struct CamCB {
     float aoStrength;      float aoRadius;         int lightingMode; int accumFrame; // row 7
     int   dither;          int   aoSamples;        int shadowSamples; int giSamples; // row 8
     int   giDenoise;       float giHistMax;        int emptySkip; int brickDim;      // row 9
+    int   giDebug;         int   giPad10a;         int giPad10b; int giPad10c;        // row 10
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -602,6 +605,7 @@ struct Renderer::Impl {
     UINT                              accumFrame = 0;
     bool                              giDenoise = true;   // QUALITY temporal denoise (Renderer::SetGiDenoise)
     bool                              emptySkip = true;   // empty-space skipping (Renderer::SetEmptySpaceSkip)
+    bool                              giDebug   = false;  // GI-only debug view (Renderer::SetGiDebug)
 
     void WaitIdle() {
         if (!queue || !fence) return;
@@ -1119,6 +1123,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.accumFrame = static_cast<int>(d.accumFrame);
     cb.giDenoise  = d.giDenoise ? 1 : 0;
     cb.giHistMax  = histMax;
+    cb.giDebug    = d.giDebug ? 1 : 0;
     cb.emptySkip  = d.emptySkip ? 1 : 0;
     cb.brickDim   = static_cast<int>(kBrickDim);
     std::memcpy(d.camPtr, &cb, sizeof(cb));
@@ -1234,6 +1239,17 @@ void Renderer::SetEmptySpaceSkip(bool enabled) {
     // Empty-space skipping is conservative, so the image is identical with it on
     // or off; restart GI accumulation anyway so an A/B toggle starts from a clean
     // history rather than blending two (visually identical) traversals.
+    d.accumFrame = 0;
+    d.accHave    = false;
+}
+
+void Renderer::SetGiDebug(bool enabled) {
+    if (!impl_) return;
+    Impl& d = *impl_;
+    if (d.giDebug == enabled) return;
+    d.giDebug = enabled;
+    // Toggling the GI-only view changes what is accumulated, so restart so it
+    // converges fresh to the debug (or normal) image instead of blending both.
     d.accumFrame = 0;
     d.accHave    = false;
 }
@@ -1365,6 +1381,7 @@ void Renderer::RenderFrame(const FrameParams&) {}
 void Renderer::SetVoxels(const std::vector<std::uint32_t>&, const std::uint32_t*) {}
 void Renderer::SetGiDenoise(bool) {}
 void Renderer::SetEmptySpaceSkip(bool) {}
+void Renderer::SetGiDebug(bool) {}
 bool Renderer::CaptureScreenshot(const std::string&, bool) { return false; }
 void Renderer::Shutdown() {}
 }  // namespace vox::render

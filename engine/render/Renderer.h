@@ -74,6 +74,12 @@ public:
     // A/B and correctness comparison.
     void SetEmptySpaceSkip(bool enabled);
 
+    // GI-only debug view (default OFF). When ON in QUALITY mode, the renderer
+    // outputs ONLY the accumulated indirect-bounce radiance (no direct light, no
+    // albedo) so it is unmistakable that path-traced GI is contributing. Has no
+    // effect in PERFORMANCE mode (no GI is computed there).
+    void SetGiDebug(bool enabled);
+
     // Hot-update the voxel grid and palette without restarting.
     // grid must contain exactly kGrid^3 (64^3 = 262144) uint32 entries.
     // palette256 must point to 256 RGBA8 uints (VoxPalette::data()).
