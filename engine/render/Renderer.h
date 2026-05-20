@@ -32,7 +32,7 @@ struct FrameParams {
     int   ao_samples      = 8;       // AO hemisphere rays (1..32)
     int   shadow_samples  = 12;      // soft-shadow cone rays (1..16)
     int   gi_samples      = 1;       // QUALITY indirect samples (paths) averaged per frame (1..8)
-    int   gi_bounces      = 3;       // QUALITY path depth: bounces light walks per path (0..5; 1 = single bounce)
+    int   gi_bounces      = 1;       // QUALITY path depth: bounces light walks per path (1..5; 1 = single bounce, the clean default)
     float gi_emissive     = 1.0f;    // emissive-voxel light multiplier (0 = emitters dark)
 };
 

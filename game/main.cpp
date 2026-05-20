@@ -125,7 +125,7 @@ void Usage() {
 void RegisterCoreCvars() {
     Console& c = Console::Get();
     auto reg = [&](const char* n, const char* d, const char* desc, CVarParams p) { c.RegisterCVar(n, d, desc, std::move(p)); };
-    reg("renderer.gi.bounces", "3", "QUALITY GI path depth: how many times light bounces per path (1 = single bounce, 2-3 fills enclosed rooms; higher = slower).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 5, .range_step = 1});
+    reg("renderer.gi.bounces", "1", "QUALITY GI path depth: 1 = clean single bounce (default, converges fast); 2-5 fills enclosed rooms but is noisier (needs longer to settle).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 5, .range_step = 1});
     reg("renderer.gi.emissive", "1.0", "Emissive-voxel brightness multiplier (.vox _emit materials glow + light the scene via GI).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 8.0f, .range_step = 0.25f});
     reg("renderer.gi.restir.spatial_passes", "2", "ReSTIR GI spatial resampling passes.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 4, .range_step = 1});
     reg("renderer.upscaling.mode", "DLSS_Q", "Super-resolution / upscaler preset.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"DLSS_DLAA", "DLSS_Q", "DLSS_B", "DLSS_P", "DLSS_UP", "FSR_Q", "FSR_B", "FSR_P", "NATIVE"}});
