@@ -10,7 +10,8 @@
     "fmt",
     "tomlplusplus",
     "glm",
-    "doctest"
+    "doctest",
+    "stb"
   ],
   "features": {
     "console": {

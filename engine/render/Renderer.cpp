@@ -19,8 +19,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <thread>
 #include <vector>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -988,6 +992,107 @@ void Renderer::SetVoxels(const std::vector<std::uint32_t>& grid, const std::uint
     d.accHave    = false;
 }
 
+bool Renderer::CaptureScreenshot(const std::string& path, bool png) {
+    if (!valid_) return false;
+    Impl& d = *impl_;
+
+    // Pick the current back-buffer index.
+    const UINT i = d.swap->GetCurrentBackBufferIndex();
+
+    // Query the texture description and compute the readback footprint.
+    D3D12_RESOURCE_DESC texDesc = d.targets[i]->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT    numRows      = 0;
+    UINT64  rowSizeBytes = 0;
+    UINT64  totalBytes   = 0;
+    d.device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, &numRows, &rowSizeBytes, &totalBytes);
+
+    // Create a READBACK buffer.
+    D3D12_HEAP_PROPERTIES rbHeap{};
+    rbHeap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rbDesc{};
+    rbDesc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rbDesc.Width              = totalBytes;
+    rbDesc.Height             = 1;
+    rbDesc.DepthOrArraySize   = 1;
+    rbDesc.MipLevels          = 1;
+    rbDesc.Format             = DXGI_FORMAT_UNKNOWN;
+    rbDesc.SampleDesc.Count   = 1;
+    rbDesc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> readback;
+    if (FAILED(d.device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&readback)))) {
+        vox::log::Error("screenshot: failed to create readback buffer");
+        return false;
+    }
+
+    // Record: barrier PRESENT->COPY_SOURCE, copy, barrier back, execute, wait.
+    d.alloc->Reset();
+    d.list->Reset(d.alloc.Get(), nullptr);
+
+    D3D12_RESOURCE_BARRIER bar{};
+    bar.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource   = d.targets[i].Get();
+    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    d.list->ResourceBarrier(1, &bar);
+
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource        = readback.Get();
+    dst.Type             = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint  = footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource        = d.targets[i].Get();
+    src.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+
+    d.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    d.list->ResourceBarrier(1, &bar);
+    d.list->Close();
+
+    ID3D12CommandList* lists[] = {d.list.Get()};
+    d.queue->ExecuteCommandLists(1, lists);
+    d.WaitIdle();
+
+    // Map the readback buffer and copy rows (respecting RowPitch alignment).
+    void* mapped = nullptr;
+    D3D12_RANGE readRange{0, static_cast<SIZE_T>(totalBytes)};
+    if (FAILED(readback->Map(0, &readRange, &mapped))) {
+        vox::log::Error("screenshot: Map failed");
+        return false;
+    }
+
+    const UINT width  = d.width;
+    const UINT height = d.height;
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4);
+    const UINT rowPitch = footprint.Footprint.RowPitch;
+    const std::uint8_t* src_ptr = static_cast<const std::uint8_t*>(mapped);
+    for (UINT row = 0; row < height; ++row) {
+        std::memcpy(rgba.data() + row * width * 4u, src_ptr + row * rowPitch, width * 4u);
+    }
+
+    D3D12_RANGE writeRange{0, 0};
+    readback->Unmap(0, &writeRange);
+
+    bool ok;
+    if (png) {
+        ok = stbi_write_png(path.c_str(), static_cast<int>(width), static_cast<int>(height),
+                            4, rgba.data(), static_cast<int>(width) * 4) != 0;
+    } else {
+        ok = stbi_write_bmp(path.c_str(), static_cast<int>(width), static_cast<int>(height),
+                            4, rgba.data()) != 0;
+    }
+    if (ok)  vox::log::Info("screenshot: saved {}", path);
+    else     vox::log::Error("screenshot: write failed to {}", path);
+    return ok;
+}
+
 void Renderer::Shutdown() {
     if (impl_) {
         // Join the background bake thread before tearing down DX12 resources.
@@ -1012,6 +1117,7 @@ Renderer::~Renderer() {}
 bool Renderer::Init(void*, int, int, const std::vector<std::uint32_t>*, const std::uint32_t*) { return false; }
 void Renderer::RenderFrame(const FrameParams&) {}
 void Renderer::SetVoxels(const std::vector<std::uint32_t>&, const std::uint32_t*) {}
+bool Renderer::CaptureScreenshot(const std::string&, bool) { return false; }
 void Renderer::Shutdown() {}
 }  // namespace vox::render
 

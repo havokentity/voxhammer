@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -130,6 +131,7 @@ void RegisterCoreCvars() {
     reg("remote.port_tcp", "27961", "Scripted TCP port.", {.type = CVarType::Int, .flags = CVAR_READONLY});
     reg("remote.session_ttl_seconds", "3600", "Console session idle TTL.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 300, .range_max = 86400, .range_step = 60});
     reg("remote.password_hash", "", "argon2id hash of the remote console password.", {.type = CVarType::String, .flags = CVAR_ARCHIVE | CVAR_READONLY});
+    reg("renderer.screenshot.format", "PNG", "Screenshot file format.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"PNG", "BMP"}});
 }
 
 // "Ctrl+Shift+F5" -> (key="F5", mods). Single token (no spaces).
@@ -168,7 +170,6 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
         std::string nv = cv->GetBool() ? "0" : "1";
         Console::Get().Execute(std::string(a[0]) + " " + nv);
     });
-    c.RegisterCommand("screenshot", "Capture a screenshot (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("screenshot: stub (renderer capture lands in M1)"); });
     c.RegisterCommand("pix_capture_next_frame", "Trigger a PIX GPU capture (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("pix: stub"); });
     c.RegisterCommand("reload_scene", "Reload the current scene (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("reload_scene: stub"); });
     c.RegisterCommand("physics.dump_islands", "Dump active PhysX islands (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("0 active islands"); });
@@ -405,6 +406,42 @@ int main(int argc, char** argv) {
                 auto grid = world.BakeFlatGrid(64);
                 renderer.SetVoxels(grid, world.Palette().data());
                 o.Print("voxel world cleared");
+            });
+    }
+
+    // Real screenshot command: capture DX12 backbuffer -> PNG or BMP in UserDataDir/shots/.
+    {
+        Console& c = Console::Get();
+        c.RegisterCommand("screenshot", "Capture the current frame to UserDataDir/shots/.",
+            [&renderer](std::span<const std::string_view>, Output& o) {
+                namespace pf2 = vox::platform;
+                std::filesystem::path dir = std::filesystem::path(pf2::UserDataDir()) / "shots";
+                std::error_code mkec;
+                std::filesystem::create_directories(dir, mkec);
+
+                // Format: "PNG" or "BMP" from cvar; anything else falls back to PNG.
+                CVar* fmtCv = Console::Get().FindCVar("renderer.screenshot.format");
+                const bool usePng = !(fmtCv && fmtCv->value == "BMP");
+                const char* ext = usePng ? "png" : "bmp";
+
+                // Timestamp for unique filename.
+                std::time_t t = std::time(nullptr);
+                char tsBuf[32] = {};
+                std::tm tmLocal{};
+#if defined(_WIN32)
+                localtime_s(&tmLocal, &t);
+#else
+                localtime_r(&t, &tmLocal);
+#endif
+                std::strftime(tsBuf, sizeof(tsBuf), "%Y%m%d_%H%M%S", &tmLocal);
+                std::string filename = fmt::format("voxhammer_{}.{}", tsBuf, ext);
+                std::string path = (dir / filename).string();
+
+                if (renderer.CaptureScreenshot(path, usePng)) {
+                    o.Format("saved {}", path);
+                } else {
+                    o.Print("screenshot failed (no DX12?)");
+                }
             });
     }
 
