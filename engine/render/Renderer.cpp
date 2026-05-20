@@ -47,6 +47,7 @@ cbuffer Camera : register(b0) {
     float3 sunDir;         float ambient;
     float  aoStrength;     float aoRadius;     int lightingMode; int accumFrame; // row 7
     int    dither;         int aoSamples;      int shadowSamples; int giSamples;  // row 8
+    int    giDenoise;      float giHistMax;    int giPad0;        int giPad1;     // row 9
 };
 StructuredBuffer<uint> Voxels : register(t0);
 RWStructuredBuffer<float4> Accum : register(u0);  // per-pixel GI accumulation: rgb + sample count
@@ -278,7 +279,11 @@ bool traceVoxel(float3 ro, float3 rd, int maxSteps, out float3 hp, out float3 nr
     }
     return false;
 }
-
+)HLSL"
+// Split into two adjacent raw-string literals (C++ concatenates them at compile
+// time). MSVC caps a single string literal token at 16380 bytes; the combined
+// shader is near that, so the break keeps each chunk comfortably under the limit.
+R"HLSL(
 // Per-frame-varying low-discrepancy 2D sample: an R2 sequence advanced by the
 // accumulation frame, Cranley-Patterson rotated by a per-pixel blue-noise offset,
 // so each accumulated frame draws a fresh well-spread sample that converges.
@@ -359,12 +364,17 @@ float4 PSMain(VSOut i) : SV_Target {
         col = alb * (ambientLight + (1.0 - ambient) * ndl * shadow);
     }
 
-    // QUALITY: progressive temporal accumulation (running average, linear space).
+    // QUALITY: progressive temporal accumulation. New-sample blend weight is
+    // 1/(n+1), so the per-pixel sample cap (giHistMax) is the only denoise knob:
+    // still -> cap 2048 (converges clean); moving -> small cap => EMA that keeps
+    // history (kills the 1-spp noise storm). accumFrame==0 still forces a fresh
+    // start on a genuine reset; giDenoise off keeps the cap at 2048 (original).
     if (lightingMode == 1) {
         uint w = (uint)viewport.x;
         uint pix = (uint)i.pos.y * w + (uint)i.pos.x;
         float4 hist = Accum[pix];
-        float n = (accumFrame == 0) ? 0.0 : min(hist.a, 2048.0);
+        float cap = (giDenoise != 0) ? max(giHistMax, 0.0) : 2048.0;
+        float n = (accumFrame == 0) ? 0.0 : min(hist.a, cap);
         float3 avg = (hist.rgb * n + col) / (n + 1.0);
         Accum[pix] = float4(avg, n + 1.0);
         col = avg;
@@ -398,6 +408,7 @@ struct CamCB {
     float sunDir[3];       float ambient;          // row 6
     float aoStrength;      float aoRadius;         int lightingMode; int accumFrame; // row 7
     int   dither;          int   aoSamples;        int shadowSamples; int giSamples; // row 8
+    int   giDenoise;       float giHistMax;        int giPad0; int giPad1;           // row 9
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -469,9 +480,16 @@ struct Renderer::Impl {
     std::thread                       bnThread;                 // background void-and-cluster bake
     std::atomic<bool>                 bnReady{false};           // worker sets true when bnTile is complete
     bool                              bnUploaded = false;       // set true once we've swapped real tile in
-    float                             accKey[23] = {};
+    // GI temporal accumulation state. Split into a CAMERA key (pos/yaw/pitch/fov)
+    // and a SCENE key (sun/exposure/lighting/sample counts/...). A scene change
+    // invalidates history -> hard reset (accumFrame=0). A pure camera change keeps
+    // history and only shortens the accumulation cap (motion-adaptive EMA) when
+    // denoise is enabled; with denoise off it still hard-resets like the original.
+    float                             accCamKey[6]    = {};
+    float                             accSceneKey[17] = {};
     bool                              accHave = false;
     UINT                              accumFrame = 0;
+    bool                              giDenoise = true;   // QUALITY temporal denoise (Renderer::SetGiDenoise)
 
     void WaitIdle() {
         if (!queue || !fence) return;
@@ -911,25 +929,70 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.shadowSamples  = std::max(1, std::min(fp.shadow_samples, 16));
     cb.giSamples      = std::max(1, std::min(fp.gi_samples,      8));
 
-    // Temporal accumulation: keep averaging GI while nothing that affects the
-    // image changes; reset the instant the camera/sun/lighting moves. Cheap
-    // "progressive refinement while you hold still".
-    const float key[23] = {
+    // Temporal accumulation with motion-adaptive denoise.
+    //
+    // CAMERA key (pos/orientation/fov) vs SCENE key (sun/exposure/lighting/sample
+    // counts/...). A SCENE change makes existing GI history wrong, so it forces a
+    // hard reset (accumFrame=0 -> shader restarts the running average). A pure
+    // CAMERA change keeps history: with denoise on we only SHORTEN the per-pixel
+    // accumulation cap (giHistMax) so the shader's running average degrades into a
+    // motion-adaptive exponential moving average (alpha ~= 1/(cap+1)) -- this is
+    // what removes the 1-spp noise storm in motion. With denoise off, a camera
+    // change hard-resets like the original (full noise storm, for A/B testing).
+    const float camKey[6] = {
         fp.cam_pos[0], fp.cam_pos[1], fp.cam_pos[2], fp.cam_yaw, fp.cam_pitch, fp.cam_fov,
+    };
+    const float sceneKey[17] = {
         fp.sun[0], fp.sun[1], fp.sun[2], fp.exposure, fp.ambient,
         fp.clear[0], fp.clear[1], fp.clear[2], fp.shadow_softness, fp.ao_strength, fp.ao_radius,
         static_cast<float>(fp.lighting_mode), static_cast<float>(fp.hdr),
         static_cast<float>(fp.dither), static_cast<float>(fp.ao_samples),
         static_cast<float>(fp.shadow_samples), static_cast<float>(fp.gi_samples),
     };
-    if (fp.lighting_mode == 1 && d.accHave && std::memcmp(key, d.accKey, sizeof(key)) == 0) {
+    const bool sceneSame = d.accHave && std::memcmp(sceneKey, d.accSceneKey, sizeof(sceneKey)) == 0;
+    const bool camSame   = d.accHave && std::memcmp(camKey,   d.accCamKey,   sizeof(camKey))   == 0;
+
+    // Per-pixel sample-count cap fed to the shader. Still frames converge to a
+    // clean image (large cap); moving frames clamp to a short window so history
+    // is trusted just enough to kill noise without excessive lag/ghosting.
+    constexpr float kHistMaxStill = 2048.0f;
+    float histMax = kHistMaxStill;
+
+    if (fp.lighting_mode != 1) {
+        d.accumFrame = 0;                 // not QUALITY: nothing accumulates
+    } else if (!sceneSame) {
+        d.accumFrame = 0;                 // scene/lighting changed: history invalid -> hard reset
+    } else if (camSame) {
+        ++d.accumFrame;                   // fully still: keep converging (cap stays 2048)
+    } else if (d.giDenoise) {
+        // Pure camera motion with denoise ON: KEEP history, advance the sample
+        // sequence, and shorten the cap based on motion magnitude. Larger motion
+        // -> smaller cap -> higher EMA alpha -> less ghosting (but a touch noisier).
         ++d.accumFrame;
+        float dp = 0.0f;
+        for (int i = 0; i < 3; ++i) { float e = fp.cam_pos[i] - d.accCamKey[i]; dp += e * e; }
+        const float posDelta = std::sqrt(dp);                              // world voxels moved this frame
+        const float angDelta = std::fabs(fp.cam_yaw   - d.accCamKey[3]) +
+                               std::fabs(fp.cam_pitch - d.accCamKey[4]) +
+                               std::fabs(fp.cam_fov   - d.accCamKey[5]);   // radians
+        // Map motion -> blend alpha in [0.15, 0.45]; convert to a sample cap.
+        // Scales chosen so a gentle nudge sits near 0.15 (heavy history, very
+        // clean) and a fast swing approaches 0.45 (light history, low ghosting).
+        const float motion = posDelta * 0.20f + angDelta * 2.0f;
+        const float alpha  = std::min(0.45f, 0.15f + motion);
+        histMax = (1.0f / alpha) - 1.0f;  // cap s.t. shader's 1/(n+1) == alpha
     } else {
-        d.accumFrame = 0;
+        d.accumFrame = 0;                 // camera moved, denoise OFF: original hard reset
     }
-    std::memcpy(d.accKey, key, sizeof(key));
+
+    std::memcpy(d.accCamKey,   camKey,   sizeof(camKey));
+    std::memcpy(d.accSceneKey, sceneKey, sizeof(sceneKey));
     d.accHave = true;
     cb.accumFrame = static_cast<int>(d.accumFrame);
+    cb.giDenoise  = d.giDenoise ? 1 : 0;
+    cb.giHistMax  = histMax;
+    cb.giPad0     = 0;
+    cb.giPad1     = 0;
     std::memcpy(d.camPtr, &cb, sizeof(cb));
 
     d.alloc->Reset();
@@ -999,6 +1062,17 @@ void Renderer::SetVoxels(const std::vector<std::uint32_t>& grid, const std::uint
     }
 
     // Reset GI accumulation so the new geometry doesn't ghost.
+    d.accumFrame = 0;
+    d.accHave    = false;
+}
+
+void Renderer::SetGiDenoise(bool enabled) {
+    if (!impl_) return;
+    Impl& d = *impl_;
+    if (d.giDenoise == enabled) return;
+    d.giDenoise = enabled;
+    // Restart accumulation on toggle so the A/B switch is clean (no stale history
+    // bleeding across the mode change).
     d.accumFrame = 0;
     d.accHave    = false;
 }
@@ -1128,6 +1202,7 @@ Renderer::~Renderer() {}
 bool Renderer::Init(void*, int, int, const std::vector<std::uint32_t>*, const std::uint32_t*) { return false; }
 void Renderer::RenderFrame(const FrameParams&) {}
 void Renderer::SetVoxels(const std::vector<std::uint32_t>&, const std::uint32_t*) {}
+void Renderer::SetGiDenoise(bool) {}
 bool Renderer::CaptureScreenshot(const std::string&, bool) { return false; }
 void Renderer::Shutdown() {}
 }  // namespace vox::render

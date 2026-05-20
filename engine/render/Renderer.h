@@ -57,6 +57,14 @@ public:
 
     void RenderFrame(const FrameParams& fp);
 
+    // QUALITY-mode GI temporal denoise toggle (default ON). When on, GI history is
+    // preserved across camera motion via a motion-adaptive temporal exponential
+    // moving average instead of being discarded every frame, so path-traced GI
+    // stays usable while the camera moves (at the cost of mild ghosting/lag).
+    // Still-frame convergence and PERFORMANCE mode are unaffected. Off reproduces
+    // the original hard-reset-on-view-change behaviour for A/B comparison.
+    void SetGiDenoise(bool enabled);
+
     // Hot-update the voxel grid and palette without restarting.
     // grid must contain exactly kGrid^3 (64^3 = 262144) uint32 entries.
     // palette256 must point to 256 RGBA8 uints (VoxPalette::data()).
