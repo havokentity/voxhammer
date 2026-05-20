@@ -55,6 +55,10 @@ const GFX_ADVANCED_CVARS = [
     "renderer.shadow.samples",
     "renderer.shadow.softness",
     "renderer.gi.samples",
+    "renderer.gi.bounces",
+    "renderer.gi.denoise",
+    "renderer.gi.emissive",
+    "renderer.empty_space_skip",
     "renderer.dither",
     "renderer.exposure",
     "renderer.ambient",
@@ -703,7 +707,9 @@ function renderGraphicsDeck() {
     const host = $("#controls");
     host.innerHTML = "";
 
-    // --- Quality Presets section ---
+    const q = (state.search || "").toLowerCase().trim();
+
+    // --- Quality Presets section (hidden while searching) ---
     const presetsSection = el("div", "gfx-section");
     presetsSection.appendChild(el("div", "gfx-section-hd", "Quality Presets"));
 
@@ -727,7 +733,7 @@ function renderGraphicsDeck() {
     const customBadge = el("span", "gfx-custom" + (currentPreset === "Custom" ? " visible" : ""), "Custom");
     presetsSection.appendChild(presetsRow);
     presetsSection.appendChild(customBadge);
-    host.appendChild(presetsSection);
+    if (!q) host.appendChild(presetsSection);
 
     // --- Advanced section ---
     const advSection = el("div", "gfx-section gfx-advanced-section");
@@ -742,6 +748,8 @@ function renderGraphicsDeck() {
     for (const name of GFX_ADVANCED_CVARS) {
         const cv = state.cvars.get(name);
         if (!cv) continue; // gracefully skip missing cvars
+        // Honor the search box: filter by cvar name or description.
+        if (q && !(name.toLowerCase().includes(q) || (cv.description || "").toLowerCase().includes(q))) continue;
         // Cards are always rendered in their stable order; inactive ones are
         // dimmed and non-interactive rather than removed from the DOM.
         const inactive = isInactiveForLightingMode(name);
@@ -749,8 +757,9 @@ function renderGraphicsDeck() {
         shown++;
     }
     if (!shown) {
-        grid.appendChild(el("div", "ctrl-desc", "No advanced renderer cvars available in this build."));
+        grid.appendChild(el("div", "ctrl-desc", q ? `No graphics cvars match "${q}".` : "No advanced renderer cvars available in this build."));
     }
+    if (q) $("#deck-count").textContent = String(shown);
     advSection.appendChild(grid);
     host.appendChild(advSection);
 }

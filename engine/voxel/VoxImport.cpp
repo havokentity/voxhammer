@@ -183,6 +183,21 @@ bool ParseVox(Reader& r, VoxScene& out) {
             (out.palette[static_cast<std::size_t>(i)] & 0x00FFFFFFu) | (a << 24);
     }
 
+    // Report emissive materials so you can verify a model's MATL _emit setup
+    // (0 here means the bright colors are plain diffuse, not emitters).
+    {
+        int nEmit = 0, first = -1;
+        for (int i = 0; i < 256; ++i) {
+            if (emit[i] > 0.0f) { ++nEmit; if (first < 0) first = i; }
+        }
+        if (nEmit > 0) {
+            vox::log::Info("voximp: {} emissive material(s) (MATL _emit); e.g. index {} emit={:.3f}",
+                           nEmit, first, emit[first]);
+        } else {
+            vox::log::Info("voximp: no emissive materials (no MATL _emit) -- bright voxels are diffuse, not light sources");
+        }
+    }
+
     vox::log::Info("voximp: loaded {}x{}x{} | {} voxels | {} chunks",
                    out.sizeX, out.sizeY, out.sizeZ,
                    out.voxelCount, out.world.ResidentChunks());
