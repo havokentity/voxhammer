@@ -365,15 +365,74 @@ TEST_CASE("VoxImport: RGBA palette maps color[i] to index i+1 (no off-by-one)") 
     vox::voxel::VoxScene scene;
     REQUIRE(vox::voxel::LoadVoxFromMemory(buf.data(), buf.size(), scene));
 
-    // r.u32() reads R,G,B,A little-endian -> 0xAABBGGRR in memory.
-    auto expected = [](int i) -> std::uint32_t {
-        return 0xFF000000u | (static_cast<std::uint32_t>(i) << 16)
-             | (static_cast<std::uint32_t>(i) << 8) | static_cast<std::uint32_t>(i);
+    // Compare RGB only: the alpha byte is now repurposed for emission (0 here,
+    // since there is no MATL chunk). r.u32() reads R,G,B little-endian.
+    auto rgbOf = [](std::uint32_t p) -> std::uint32_t { return p & 0x00FFFFFFu; };
+    auto expectedRGB = [](int i) -> std::uint32_t {
+        return (static_cast<std::uint32_t>(i) << 16) | (static_cast<std::uint32_t>(i) << 8) | static_cast<std::uint32_t>(i);
     };
     // Spec: palette index m holds on-disk color[m-1]. (The old off-by-one bug
     // stored color[m] at index m -> these would all be shifted by one.)
-    CHECK(scene.palette[1]   == expected(0));    // material 1 -> color 0
-    CHECK(scene.palette[5]   == expected(4));    // material 5 -> color 4
-    CHECK(scene.palette[255] == expected(254));  // top index -> color 254, NOT the unused 256th
-    CHECK(scene.palette[0]   == 0x00000000u);    // index 0 reserved/unused
+    CHECK(rgbOf(scene.palette[1])   == expectedRGB(0));    // material 1 -> color 0
+    CHECK(rgbOf(scene.palette[5])   == expectedRGB(4));    // material 5 -> color 4
+    CHECK(rgbOf(scene.palette[255]) == expectedRGB(254));  // top index -> color 254, NOT the unused 256th
+    CHECK(scene.palette[0] == 0x00000000u);                // index 0 reserved/unused
+    // No MATL chunk -> nothing is emissive (alpha/emission byte is 0 everywhere).
+    CHECK(((scene.palette[1]   >> 24) & 0xFFu) == 0u);
+    CHECK(((scene.palette[255] >> 24) & 0xFFu) == 0u);
+}
+
+TEST_CASE("VoxImport: MATL _emit material packs emission into palette alpha") {
+    // SIZE 2x2x2 + one voxel (material 1) + RGBA + a MATL marking material 1 emissive.
+    std::vector<std::uint8_t> sizeChunk;
+    append_tag(sizeChunk, "SIZE");
+    append_u32(sizeChunk, 12); append_u32(sizeChunk, 0);
+    append_u32(sizeChunk, 2); append_u32(sizeChunk, 2); append_u32(sizeChunk, 2);
+
+    std::vector<std::uint8_t> xyziChunk;
+    append_tag(xyziChunk, "XYZI");
+    append_u32(xyziChunk, 4 + 1 * 4); append_u32(xyziChunk, 0);
+    append_u32(xyziChunk, 1);
+    xyziChunk.push_back(0); xyziChunk.push_back(0); xyziChunk.push_back(0); xyziChunk.push_back(1);
+
+    std::vector<std::uint8_t> rgbaChunk;
+    append_tag(rgbaChunk, "RGBA");
+    append_u32(rgbaChunk, 256 * 4); append_u32(rgbaChunk, 0);
+    for (int i = 0; i < 256; ++i) { rgbaChunk.push_back(200); rgbaChunk.push_back(100); rgbaChunk.push_back(50); rgbaChunk.push_back(0xFF); }
+
+    // MATL for material 1: _type=_emit, _emit=1.0, _flux=1  (-> emission 1.0 -> alpha ~32)
+    auto appendStr = [](std::vector<std::uint8_t>& b, const char* s) {
+        std::uint32_t n = static_cast<std::uint32_t>(std::strlen(s));
+        append_u32(b, n);
+        for (std::uint32_t i = 0; i < n; ++i) b.push_back(static_cast<std::uint8_t>(s[i]));
+    };
+    std::vector<std::uint8_t> matlBody;
+    append_u32(matlBody, 1);       // material id
+    append_u32(matlBody, 3);       // 3 key/value pairs
+    appendStr(matlBody, "_type"); appendStr(matlBody, "_emit");
+    appendStr(matlBody, "_emit"); appendStr(matlBody, "1.0");
+    appendStr(matlBody, "_flux"); appendStr(matlBody, "1");
+    std::vector<std::uint8_t> matlChunk;
+    append_tag(matlChunk, "MATL");
+    append_u32(matlChunk, static_cast<std::uint32_t>(matlBody.size())); append_u32(matlChunk, 0);
+    matlChunk.insert(matlChunk.end(), matlBody.begin(), matlBody.end());
+
+    std::uint32_t childBytes = static_cast<std::uint32_t>(sizeChunk.size() + xyziChunk.size() + rgbaChunk.size() + matlChunk.size());
+    std::vector<std::uint8_t> buf;
+    append_tag(buf, "VOX "); append_u32(buf, 200);
+    append_tag(buf, "MAIN"); append_u32(buf, 0); append_u32(buf, childBytes);
+    buf.insert(buf.end(), sizeChunk.begin(), sizeChunk.end());
+    buf.insert(buf.end(), xyziChunk.begin(), xyziChunk.end());
+    buf.insert(buf.end(), rgbaChunk.begin(), rgbaChunk.end());
+    buf.insert(buf.end(), matlChunk.begin(), matlChunk.end());
+
+    vox::voxel::VoxScene scene;
+    REQUIRE(vox::voxel::LoadVoxFromMemory(buf.data(), buf.size(), scene));
+
+    // Material 1 is emissive -> alpha (emission) byte > 0; a non-emissive index stays 0.
+    const std::uint32_t emitByte = (scene.palette[1] >> 24) & 0xFFu;
+    CHECK(emitByte > 0u);
+    CHECK(((scene.palette[2] >> 24) & 0xFFu) == 0u);
+    // RGB still loads correctly (color 0 -> index 1).
+    CHECK((scene.palette[1] & 0x00FFFFFFu) == ((50u << 16) | (100u << 8) | 200u));
 }

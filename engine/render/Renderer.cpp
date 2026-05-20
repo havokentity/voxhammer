@@ -55,7 +55,7 @@ cbuffer Camera : register(b0) {
     float  aoStrength;     float aoRadius;     int lightingMode; int accumFrame; // row 7
     int    dither;         int aoSamples;      int shadowSamples; int giSamples;  // row 8
     int    giDenoise;      float giHistMax;    int emptySkip;     int brickDim;   // row 9
-    int    giDebug;        int   giBounces;    int giPad10b;      int giPad10c;   // row 10
+    int    giDebug;        int   giBounces;    float giEmissive;  int giPad10c;   // row 10
 };
 StructuredBuffer<uint> Voxels : register(t0);
 RWStructuredBuffer<float4> Accum : register(u0);  // per-pixel GI accumulation: rgb + sample count
@@ -137,6 +137,15 @@ float3 palette(uint m) {
     uint p = Palette[m & 255u];
     float3 c = float3(p & 255u, (p >> 8) & 255u, (p >> 16) & 255u) / 255.0;
     return pow(c, 2.2);
+}
+
+// Emissive strength, packed in the palette ALPHA byte (0 = not emissive). The
+// .vox importer writes saturate(emit * 2^(flux-1)) there; here we expand back to
+// an HDR range (x8) and scale by the giEmissive cvar. Emissive surfaces act as
+// light sources in the GI path, so (with multi-bounce) bright voxels fill rooms.
+float emission(uint m) {
+    uint p = Palette[m & 255u];
+    return (float((p >> 24) & 255u) / 255.0) * 8.0 * giEmissive;
 }
 
 // Blue-noise lookup: spatially uniform, spectrally high-frequency.
@@ -437,6 +446,7 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
             float3 qhp, qn; uint qm;
             if (traceVoxel(ro, bd, 256, qhp, qn, qm)) {
                 L    += beta * palette(qm) * directSun(qhp, qn, sunDir);  // sun light at this surface
+                L    += beta * palette(qm) * emission(qm);               // emissive surface = light source
                 beta *= palette(qm);                                     // carry albedo for the next bounce
                 ro    = qhp + qn * 0.02;
                 n     = qn;
@@ -449,7 +459,7 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
     }
     float3 indirectAvg = indirectSum / float(numSamples);
     if (giDebug != 0) return indirectAvg;   // GI debug view: show ONLY the indirect bounce radiance
-    return alb * (direct + indirectAvg);
+    return alb * (direct + indirectAvg) + alb * emission(mat);   // + self-emission (emissive voxels glow)
 }
 
 float4 PSMain(VSOut i) : SV_Target {
@@ -473,6 +483,7 @@ float4 PSMain(VSOut i) : SV_Target {
         float3 alb = palette(mat);
         float3 ambientLight = float3(ambient, ambient, ambient) * ao;
         col = alb * (ambientLight + (1.0 - ambient) * ndl * shadow);
+        col += alb * emission(mat);   // emissive voxels glow (no GI fill in PERFORMANCE, but they still emit)
     }
 
     // QUALITY: progressive temporal accumulation. New-sample blend weight is
@@ -520,7 +531,7 @@ struct CamCB {
     float aoStrength;      float aoRadius;         int lightingMode; int accumFrame; // row 7
     int   dither;          int   aoSamples;        int shadowSamples; int giSamples; // row 8
     int   giDenoise;       float giHistMax;        int emptySkip; int brickDim;      // row 9
-    int   giDebug;         int   giBounces;        int giPad10b; int giPad10c;        // row 10
+    int   giDebug;         int   giBounces;        float giEmissive; int giPad10c;       // row 10
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -1000,7 +1011,7 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
                 float s = std::pow(std::max(v, 0.0f), 1.0f / 2.2f);
                 return static_cast<std::uint32_t>(std::round(s * 255.0f));
             };
-            return to8(r) | (to8(g) << 8) | (to8(b) << 16) | (255u << 24);
+            return to8(r) | (to8(g) << 8) | (to8(b) << 16) | (0u << 24);  // alpha byte = emission (0 = none)
         };
 
         if (palette256) {
@@ -1086,6 +1097,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.shadowSamples  = std::max(1, std::min(fp.shadow_samples, 16));
     cb.giSamples      = std::max(1, std::min(fp.gi_samples,      8));
     cb.giBounces      = std::max(0, std::min(fp.gi_bounces,      5));
+    cb.giEmissive     = std::max(0.0f, std::min(fp.gi_emissive, 8.0f));
 
     // Temporal accumulation with motion-adaptive denoise.
     //
@@ -1100,13 +1112,13 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     const float camKey[6] = {
         fp.cam_pos[0], fp.cam_pos[1], fp.cam_pos[2], fp.cam_yaw, fp.cam_pitch, fp.cam_fov,
     };
-    const float sceneKey[18] = {
+    const float sceneKey[19] = {
         fp.sun[0], fp.sun[1], fp.sun[2], fp.exposure, fp.ambient,
         fp.clear[0], fp.clear[1], fp.clear[2], fp.shadow_softness, fp.ao_strength, fp.ao_radius,
         static_cast<float>(fp.lighting_mode), static_cast<float>(fp.hdr),
         static_cast<float>(fp.dither), static_cast<float>(fp.ao_samples),
         static_cast<float>(fp.shadow_samples), static_cast<float>(fp.gi_samples),
-        static_cast<float>(fp.gi_bounces),
+        static_cast<float>(fp.gi_bounces), fp.gi_emissive,
     };
     const bool sceneSame = d.accHave && std::memcmp(sceneKey, d.accSceneKey, sizeof(sceneKey)) == 0;
     const bool camSame   = d.accHave && std::memcmp(camKey,   d.accCamKey,   sizeof(camKey))   == 0;

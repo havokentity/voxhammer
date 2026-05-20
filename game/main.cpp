@@ -74,15 +74,19 @@ void ParseRGB(const std::string& s, float& r, float& g, float& b) {
 void GenerateDemoScene(vox::voxel::VoxScene& vs) {
     vs.world.Init();
     vs.palette.fill(0u);
+    // alpha byte = emission (0 = not emissive); RGB are sRGB bytes (shader decodes pow(c,2.2)).
     auto rgb = [](int r, int g, int b) -> std::uint32_t {
-        return 0xFF000000u | (static_cast<std::uint32_t>(b) << 16)
+        return (static_cast<std::uint32_t>(b) << 16)
              | (static_cast<std::uint32_t>(g) << 8) | static_cast<std::uint32_t>(r);
     };
-    // sRGB bytes (the shader decodes pow(c,2.2)); tuned to the old demo look.
     vs.palette[1] = rgb(173, 211, 148);  // grass
     vs.palette[2] = rgb(183, 160, 139);  // dirt
     vs.palette[3] = rgb(194, 196, 202);  // stone
-    vs.palette[4] = rgb(233, 148, 134);  // sphere
+    // Floating orb is EMISSIVE (alpha=56 -> emission ~1.75x at the default
+    // gi.emissive=1): a glowing light that bleeds warm color onto the terrain
+    // below via GI -- showcases emissive voxels. Crank renderer.gi.emissive up
+    // for a blown-out sun, down to 0 to make it matte.
+    vs.palette[4] = rgb(255, 150, 95) | (56u << 24);  // warm glowing orb
 
     const int   dim   = static_cast<int>(vox::voxel::kWorldDim);
     const float g     = static_cast<float>(dim);
@@ -122,6 +126,7 @@ void RegisterCoreCvars() {
     Console& c = Console::Get();
     auto reg = [&](const char* n, const char* d, const char* desc, CVarParams p) { c.RegisterCVar(n, d, desc, std::move(p)); };
     reg("renderer.gi.bounces", "3", "QUALITY GI path depth: how many times light bounces per path (1 = single bounce, 2-3 fills enclosed rooms; higher = slower).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 5, .range_step = 1});
+    reg("renderer.gi.emissive", "1.0", "Emissive-voxel brightness multiplier (.vox _emit materials glow + light the scene via GI).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 8.0f, .range_step = 0.25f});
     reg("renderer.gi.restir.spatial_passes", "2", "ReSTIR GI spatial resampling passes.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 4, .range_step = 1});
     reg("renderer.upscaling.mode", "DLSS_Q", "Super-resolution / upscaler preset.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"DLSS_DLAA", "DLSS_Q", "DLSS_B", "DLSS_P", "DLSS_UP", "FSR_Q", "FSR_B", "FSR_P", "NATIVE"}});
     reg("renderer.frame_gen.factor", "OFF", "Frame-generation multiplier.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"OFF", "2X", "3X", "4X"}});
@@ -631,6 +636,7 @@ int main(int argc, char** argv) {
             fp.shadow_samples = console.FindCVar("renderer.shadow.samples")->GetInt();
             fp.gi_samples = console.FindCVar("renderer.gi.samples")->GetInt();
             fp.gi_bounces = console.FindCVar("renderer.gi.bounces")->GetInt();
+            fp.gi_emissive = console.FindCVar("renderer.gi.emissive")->GetFloat();
             renderer.SetGiDenoise(console.FindCVar("renderer.gi.denoise")->GetBool());  // self-guards; resets accum only on toggle
             renderer.SetEmptySpaceSkip(console.FindCVar("renderer.empty_space_skip")->GetBool());  // self-guards
             renderer.SetGiDebug(console.FindCVar("renderer.gi.debug")->GetBool());  // self-guards

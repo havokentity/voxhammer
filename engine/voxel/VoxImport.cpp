@@ -4,8 +4,11 @@
 
 #include "platform/Log.h"
 
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <string>
 #include <vector>
 
 namespace vox::voxel {
@@ -96,6 +99,16 @@ bool ParseVox(Reader& r, VoxScene& out) {
     out.sizeX = out.sizeY = out.sizeZ = 0;
     out.voxelCount = 0;
 
+    // Per-material emission (0 = not emissive), packed into the palette alpha byte
+    // after parsing. Filled from MATL chunks (_type=_emit + _emit/_flux).
+    float emit[256] = {0.0f};
+    auto readStr = [&r]() -> std::string {
+        const std::uint32_t len = r.u32();
+        std::string s;
+        for (std::uint32_t i = 0; i < len && r.canRead(1); ++i) s.push_back(static_cast<char>(r.u8()));
+        return s;
+    };
+
     // Walk child chunks until EOF.
     while (r.canRead(12)) {
         if (!r.readTag(tag)) break;
@@ -134,10 +147,40 @@ bool ParseVox(Reader& r, VoxScene& out) {
                 const std::uint32_t rgba = r.u32();
                 if (i < 255) out.palette[static_cast<std::size_t>(i) + 1] = rgba;
             }
+        } else if (matchTag(tag, "MATL")) {
+            // Material dictionary (MagicaVoxel 200). For _emit materials, record
+            // emission = _emit * 2^(_flux-1) (its power scaling). MATT (old 150
+            // format) is not parsed -- it falls through to the skip below.
+            const std::uint32_t matId  = r.u32();
+            const std::uint32_t nPairs = r.u32();  // DICT key/value count
+            bool  isEmit  = false;
+            float emitVal = 0.0f, fluxVal = 1.0f;
+            for (std::uint32_t i = 0; i < nPairs && r.pos < selfEnd; ++i) {
+                const std::string key = readStr();
+                const std::string val = readStr();
+                if (key == "_type")      { if (val == "_emit") isEmit = true; }
+                else if (key == "_emit") { emitVal = static_cast<float>(std::atof(val.c_str())); }
+                else if (key == "_flux") { fluxVal = static_cast<float>(std::atof(val.c_str())); }
+            }
+            if ((isEmit || emitVal > 0.0f) && matId < 256) {
+                float flux = fluxVal < 1.0f ? 1.0f : (fluxVal > 4.0f ? 4.0f : fluxVal);
+                emit[matId] = emitVal * std::pow(2.0f, flux - 1.0f);
+            }
         }
 
         // Skip any unread self-data (handles unknown/future chunks).
         if (r.pos < selfEnd) r.skip(selfEnd - r.pos);
+    }
+
+    // Pack per-material emission into the palette ALPHA byte (0 = none). The
+    // renderer reads this; the on-disk RGBA alpha (always opaque) is unused, so
+    // we overwrite every entry's alpha here -- emissive -> saturate(e/8)*255.
+    for (int i = 0; i < 256; ++i) {
+        float e01 = emit[i] / 8.0f;
+        if (e01 > 1.0f) e01 = 1.0f;
+        const std::uint32_t a = static_cast<std::uint32_t>(e01 * 255.0f + 0.5f);
+        out.palette[static_cast<std::size_t>(i)] =
+            (out.palette[static_cast<std::size_t>(i)] & 0x00FFFFFFu) | (a << 24);
     }
 
     vox::log::Info("voximp: loaded {}x{}x{} | {} voxels | {} chunks",
