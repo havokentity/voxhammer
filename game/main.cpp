@@ -66,6 +66,46 @@ void ParseRGB(const std::string& s, float& r, float& g, float& b) {
     std::sscanf(s.c_str(), "%f %f %f", &r, &g, &b);
 }
 
+// Build the default DESTRUCTIBLE demo scene into a VoxScene: a terrain
+// heightfield + a floating sphere (mirrors the renderer's procedural
+// GenerateScene), but as real VoxelWorld content so voxel.break / the X key
+// can carve it. Materials: 1=grass 2=dirt 3=stone 4=sphere. The caller stamps
+// this into the live world (which merges the palette so carving keeps colors).
+void GenerateDemoScene(vox::voxel::VoxScene& vs) {
+    vs.world.Init();
+    vs.palette.fill(0u);
+    auto rgb = [](int r, int g, int b) -> std::uint32_t {
+        return 0xFF000000u | (static_cast<std::uint32_t>(b) << 16)
+             | (static_cast<std::uint32_t>(g) << 8) | static_cast<std::uint32_t>(r);
+    };
+    // sRGB bytes (the shader decodes pow(c,2.2)); tuned to the old demo look.
+    vs.palette[1] = rgb(173, 211, 148);  // grass
+    vs.palette[2] = rgb(183, 160, 139);  // dirt
+    vs.palette[3] = rgb(194, 196, 202);  // stone
+    vs.palette[4] = rgb(233, 148, 134);  // sphere
+
+    const int   dim   = static_cast<int>(vox::voxel::kWorldDim);
+    const float g     = static_cast<float>(dim);
+    const float baseH = g * 0.34f, ampH = g * 0.125f;
+    const float scx = g * 0.69f, scy = g * 0.66f, scz = g * 0.625f;
+    const float sr2 = (g * 0.125f) * (g * 0.125f);
+    std::uint32_t count = 0;
+    for (int z = 0; z < dim; ++z)
+        for (int x = 0; x < dim; ++x) {
+            float h = baseH + ampH * std::sin(x * 0.20f) * std::cos(z * 0.18f);
+            for (int y = 0; y < dim; ++y) {
+                std::uint8_t m = 0;
+                if (static_cast<float>(y) < h)
+                    m = (static_cast<float>(y) > h - 1.5f) ? 1 : (static_cast<float>(y) > h - 5.0f ? 2 : 3);
+                const float dx = static_cast<float>(x) - scx, dy = static_cast<float>(y) - scy, dz = static_cast<float>(z) - scz;
+                if (dx * dx + dy * dy + dz * dz < sr2) m = 4;
+                if (m) { vs.world.SetVoxel(x, y, z, m); ++count; }
+            }
+        }
+    vs.sizeX = vs.sizeY = vs.sizeZ = static_cast<decltype(vs.sizeX)>(dim);
+    vs.voxelCount = count;
+}
+
 void Usage() {
     vox::log::Info("Voxhammer {} -- standalone DX12 voxel-destruction engine", VOX_VERSION_STRING);
     vox::log::Info("Usage: voxhammer [flags]");
@@ -353,6 +393,17 @@ int main(int argc, char** argv) {
         } else {
             vox::log::Warn("voxel: failed to import {}", ip->value);
         }
+    }
+    if (!haveVoxels) {
+        // No .vox loaded: stamp a destructible procedural demo into the world so
+        // voxel.break (and the X key) carves the default scene out of the box.
+        // StampVox merges the palette into the world, so carving keeps colors.
+        GenerateDemoScene(vs);
+        world.StampVox(vs.world, vs.palette, 0, 0, 0);
+        voxelGrid = world.BakeFlatGrid(vox::voxel::kWorldDim);
+        haveVoxels = true;
+        palettePtr = world.Palette().data();
+        vox::log::Info("voxel: generated destructible demo scene ({} voxels, {} chunks)", vs.voxelCount, world.ResidentChunks());
     }
 
     // Window + DX12 + key dispatch.
