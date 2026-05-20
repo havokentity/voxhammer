@@ -162,6 +162,14 @@ body {
 .str-in { width: 100%; height: var(--ctrl-h); background: var(--panel-2); border: 1px solid var(--edge); border-radius: 9px; color: var(--fg); font: inherit; padding: 0 11px; outline: none; }
 .str-in:focus { border-color: var(--accent); }
 
+/* vec3 (x/y/z number inputs) */
+.vec3 { display: flex; gap: 6px; width: 100%; }
+.vec3-field { display: flex; align-items: center; gap: 5px; flex: 1; min-width: 0; height: var(--ctrl-h); padding: 0 8px; background: var(--panel-2); border: 1px solid var(--edge); border-radius: 9px; }
+[data-skin="tactical"] .vec3-field { border-radius: 0; }
+.vec3-field:focus-within { border-color: var(--accent); }
+.vec3-ax { color: var(--dim); font-size: 10px; text-transform: uppercase; }
+.vec3-field input { width: 100%; min-width: 0; background: none; border: 0; color: var(--fg); font: inherit; font-family: var(--mono); font-size: 12px; outline: none; }
+
 /* ---------- intel ---------- */
 .intel { display: flex; flex-direction: column; gap: var(--gap); min-height: 0; overflow-y: auto; }
 .cap { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 13px; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; color: var(--accent); border-bottom: 1px solid var(--edge); }

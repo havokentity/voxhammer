@@ -25,6 +25,7 @@ const F = { ARCHIVE: 1, READONLY: 2, CHEAT: 4, DEVELOPER: 8 };
 
 const CATS = {
     renderer:  { label: "Render",   icon: "▣" },
+    camera:    { label: "Camera",   icon: "◉" },
     physics:   { label: "Physics",  icon: "⬡" },
     sim:       { label: "Sim",      icon: "≋" },
     voxel:     { label: "World",    icon: "◫" },
@@ -98,6 +99,11 @@ function mockCvars() {
         C("voxel.streaming.horizon_meters", "256", "float", F.ARCHIVE, "Voxel streaming horizon.", R(64, 512, 8)),
         C("voxel.lod.aggressive_eviction", "0", "bool", F.ARCHIVE, "Aggressively evict distant chunks."),
         C("audio.master_volume", "0.8", "float", F.ARCHIVE, "Master output volume.", R(0, 1, 0.01)),
+        C("renderer.exposure", "1.0", "float", F.ARCHIVE, "Render exposure (pre-tonemap multiplier).", R(0.1, 4.0, 0.05)),
+        C("camera.pos", "32 40 -24", "vec3", F.ARCHIVE, "Free-fly camera position (world units)."),
+        C("camera.yaw", "0.0", "float", F.ARCHIVE, "Camera yaw (radians).", R(-3.1416, 3.1416, 0.02)),
+        C("camera.pitch", "-0.5", "float", F.ARCHIVE, "Camera pitch (radians).", R(-1.5, 1.5, 0.02)),
+        C("camera.fov", "1.2", "float", F.ARCHIVE, "Camera vertical FOV (radians).", R(0.4, 2.4, 0.02)),
         C("debug.show_brick_grid", "0", "bool", F.DEVELOPER, "Overlay the brick grid."),
         C("debug.pause_simulation", "0", "bool", F.CHEAT, "Pause the simulation."),
         C("profiling.tracy_enabled", "0", "bool", 0, "Stream to the Tracy profiler."),
@@ -299,6 +305,12 @@ function afterValueChange(name) {
     if (cv) { const card = $(`.ctrl[data-name="${cssEsc(name)}"]`); if (card) card.classList.toggle("changed", cv.value !== cv.default); }
     if (name.startsWith("renderer.") || name === "debug.show_brick_grid" || name === "debug.pause_simulation") updateViewport();
 }
+// Merge an incoming cvar in place (keep the object identity) so a widget that
+// captured the reference -- e.g. an open color picker -- keeps repainting.
+function upsertCvar(data) {
+    const cur = state.cvars.get(data.name);
+    if (cur) Object.assign(cur, data); else state.cvars.set(data.name, data);
+}
 
 // ---------- rail ----------
 function renderRail() {
@@ -373,6 +385,7 @@ function buildWidget(cv) {
         case "bool": return widgetToggle(cv);
         case "enum": return widgetSeg(cv);
         case "color": return widgetColor(cv);
+        case "vec3": return widgetVec3(cv);
         case "int": case "float": return (cv.range_max > cv.range_min) ? widgetSlider(cv) : widgetString(cv);
         default: return widgetString(cv);
     }
@@ -414,6 +427,20 @@ function widgetColor(cv) {
 function widgetString(cv) {
     const inp = el("input", "str-in"); inp.type = "text"; inp.value = cv.value; inp.spellcheck = false;
     inp.onchange = () => setCvar(cv.name, inp.value); return inp;
+}
+function widgetVec3(cv) {
+    const wrap = el("div", "vec3");
+    const parts = String(cv.value).trim().split(/\s+/);
+    const inputs = [];
+    ["x", "y", "z"].forEach((ax, i) => {
+        const f = el("div", "vec3-field");
+        const inp = el("input"); inp.type = "number"; inp.step = "1"; inp.value = parts[i] || "0";
+        inp.oninput = () => setCvar(cv.name, inputs.map((x) => x.value || "0").join(" "));
+        inputs.push(inp);
+        f.append(el("span", "vec3-ax", ax), inp);
+        wrap.appendChild(f);
+    });
+    return wrap;
 }
 function syncControl(name) {
     const cv = state.cvars.get(name); if (!cv) return;
@@ -638,7 +665,7 @@ function onMessage(msg) {
         }
         if (Array.isArray(msg.cvars)) { state.cvars = new Map(msg.cvars.map((c) => [c.name, c])); renderRail(); renderDeck(); updateViewport(); }
         if (Array.isArray(msg.commands)) { state.commands = msg.commands; renderAbilities(); }
-        if (msg.cvar) { state.cvars.set(msg.cvar.name, msg.cvar); afterValueChange(msg.cvar.name); }
+        if (msg.cvar) { upsertCvar(msg.cvar); afterValueChange(msg.cvar.name); }
         if (msg.output) pushLog("info", msg.output);
         if (msg.error) pushLog("error", msg.error);
     } else if (msg.type === "event") {
@@ -647,12 +674,13 @@ function onMessage(msg) {
         else if (msg.topic === "cvar" && msg.data && msg.data.name) {
             // Live update from another source (keybinding/TCP/other client).
             const cur = state.cvars.get(msg.data.name);
-            state.cvars.set(msg.data.name, msg.data);
+            const changed = !cur || cur.value !== msg.data.value;
+            upsertCvar(msg.data);  // merge in place -- don't orphan open widgets
             // Don't rebuild a control the user is actively editing (a lagging
             // echo of their own drag would destroy the DOM and close the
             // native picker). External changes (F11 etc.) still rebuild.
             const editing = state.editName === msg.data.name && Date.now() - (state.editAt || 0) < 1500;
-            if (!editing && (!cur || cur.value !== msg.data.value)) syncControl(msg.data.name);
+            if (!editing && changed) syncControl(msg.data.name);
             updateViewport();
         }
     }
