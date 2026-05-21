@@ -684,28 +684,23 @@ struct ShadeOut {
     float4 variance : SV_Target4;  // .x = temporal luminance variance, .y = history sample count (SVGF)
 };
 
-// G-BUFFER PASS (Milestone A0). Offscreen variant of PSMain for the deferred path
-// (gi_denoiser != 0, QUALITY mode). STILL full-screen raymarches the one global voxel
-// grid exactly as PSMain does; instead of lighting+tonemapping to the backbuffer it
-// computes the demodulated indirect / direct / albedo via giShadeSplit, temporally
-// accumulates the indirect EXACTLY like the single pass (same reproject + Accum/PrevAccum
-// ping-pong), accumulates luminance moments for SVGF, and writes the five G-buffer
-// targets for the deferred-lighting passes to consume. NO tonemap/dither here -- that is
-// the composite (deferred-lighting) pass's job.
-ShadeOut PSShade(VSOut i) {
+// Shared G-buffer shading core (Milestone A0/A1). Given a primary ray (ro,rd) IN THE
+// SAME SPACE the voxel grid is marched (world==voxel for the single global object) and
+// the integer screen pixel |screenPos|, run the voxel DDA, compute the demodulated
+// indirect / direct / albedo via giShadeSplit, temporally accumulate the indirect EXACTLY
+// like the single pass (same reproject + Accum/PrevAccum ping-pong), accumulate luminance
+// moments for SVGF, write the Accum/HitPos/Moments/DirectAccum ping-pong buffers, and
+// return the five G-buffer MRT values. NO tonemap/dither here -- that is the composite
+// (deferred-lighting) pass's job. Identical math whether invoked by the full-screen
+// PSShade (A0) or the OBB-raster PSObb (A1), so the deferred output stays pixel-identical.
+ShadeOut shadeGBuffer(float3 ro, float3 rd, float2 screenPos) {
     ShadeOut o;
-    float2 ndc = (i.pos.xy / viewport) * 2.0 - 1.0;
-    ndc.y = -ndc.y;
-    float tf = tan(fov * 0.5);
-    float3 rd = normalize(camFwd + camRight * (ndc.x * tf * aspect) + camUp * (ndc.y * tf));
-    float3 ro = camPos;
-
     float3 hp, nrm; uint mat;
     bool primHit = traceVoxel(ro, rd, 768, hp, nrm, mat);
 
     float3 alb, direct, indirect;
     if (primHit) {
-        indirect = giShadeSplit(hp, nrm, mat, i.pos.xy, alb, direct);
+        indirect = giShadeSplit(hp, nrm, mat, screenPos, alb, direct);
     } else {
         // Sky/miss: the demodulated-indirect channel carries the background sky so the
         // composite (DIRECT + ALBEDO*indirect) reproduces the sky where albedo=1,direct=0.
@@ -720,7 +715,7 @@ ShadeOut PSShade(VSOut i) {
     // the same world point, else start fresh). Ping-pong: read PrevAccum, write Accum.
     uint w   = (uint)viewport.x;
     uint h   = (uint)viewport.y;
-    uint pix = (uint)i.pos.y * w + (uint)i.pos.x;
+    uint pix = (uint)screenPos.y * w + (uint)screenPos.x;
 
     uint  srcPix    = pix;
     bool  histValid = true;
@@ -794,6 +789,94 @@ ShadeOut PSShade(VSOut i) {
     o.variance = float4(tvar, n + 1.0, 0.0, 0.0);
     return o;
 }
+
+// G-BUFFER PASS (Milestone A0). Full-screen-triangle variant: reconstruct the primary
+// world ray from the pixel exactly as PSMain does, then run the shared shading core. The
+// ray space IS the world/voxel space for the single global grid, so this is byte-identical
+// to the pre-A1 PSShade. (A1's OBB-raster PSObb produces the same G-buffer for the single
+// world object; this entry point is retained for A/B and as the no-OBB fallback.)
+ShadeOut PSShade(VSOut i) {
+    float2 ndc = (i.pos.xy / viewport) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float tf = tan(fov * 0.5);
+    float3 rd = normalize(camFwd + camRight * (ndc.x * tf * aspect) + camUp * (ndc.y * tf));
+    float3 ro = camPos;
+    return shadeGBuffer(ro, rd, i.pos.xy);
+}
+)HLSL"
+// Adjacent raw-string literal #5 (C++ concatenates all chunks at compile time). Holds the
+// Milestone A1 OBB-raster pipeline (cube VS + voxel-DDA PS) for the deferred G-buffer pass.
+// Kept a separate literal so each chunk stays comfortably under MSVC's 16380-byte cap.
+R"HLSL(
+// ---- Milestone A1: OBB raster of a single VoxelObject ---------------------
+// The deferred G-buffer pass rasterizes the object's oriented bounding box (a unit cube
+// scaled to the voxel dims by the object's model matrix), BACKFACES ONLY (front-face
+// cull, so a camera inside the volume still covers the screen), depth-test + write. The
+// fragment shader reconstructs the world ray (identically to PSShade), transforms it into
+// object-LOCAL voxel space via invModel, and runs the SAME voxel DDA, writing the SAME 5
+// G-buffer MRT targets. For the single world object model/invModel are identity and the
+// cube fills the view, so the output is pixel-identical to the full-screen A0 path.
+cbuffer ObbObject : register(b1) {
+    row_major float4x4 obbMVP;     // world->clip with a REAL perspective-z (model premultiplied): clip = mul(obbMVP, float4(unitCube*dims,1))
+    row_major float4x4 obbInvModel;// world->object-local (voxel) space for the ray: identity for object #0
+    float3             obbDims;    // object voxel dimensions (the unit cube is scaled by this)
+    int                obbSkyOnMiss;// 1 = write the background sky on a DDA miss (the enclosing world object); 0 = discard (objects composited over it, A2+)
+};
+
+// 36-vertex unit cube ([0,1]^3) generated from SV_VertexID -- no vertex buffer. Wound
+// OUTWARD CCW (each face's vertices are CCW seen from outside, built via U x V = N). The
+// PSO uses FrontCounterClockwise=TRUE + CULL_FRONT, so the camera-facing (near) faces are
+// culled and only the far faces are rasterized -- coverage survives the camera being
+// inside the box. The far-face depth is what the hardware depth buffer records.
+struct ObbVSOut { float4 pos : SV_Position; };
+ObbVSOut VSObb(uint vid : SV_VertexID) {
+    const float3 C[8] = {
+        float3(0,0,0), float3(1,0,0), float3(1,1,0), float3(0,1,0),
+        float3(0,0,1), float3(1,0,1), float3(1,1,1), float3(0,1,1),
+    };
+    const uint IDX[36] = {
+        1,2,6, 1,6,5,   // +X
+        0,4,7, 0,7,3,   // -X
+        3,7,6, 3,6,2,   // +Y
+        0,1,5, 0,5,4,   // -Y
+        4,5,6, 4,6,7,   // +Z
+        0,3,2, 0,2,1,   // -Z
+    };
+    float3 unit = C[IDX[vid]];
+    float3 local = unit * obbDims;          // unit cube -> [0,dims] in object space
+    ObbVSOut o;
+    o.pos = mul(obbMVP, float4(local, 1.0));// obbMVP already folds the object model matrix
+    return o;
+}
+
+// OBB fragment shader. Reconstruct the SAME world ray PSShade uses (from the rasterized
+// pixel, not the interpolated vertex -- so coverage is the ONLY thing the cube changes),
+// transform ray origin + direction into object-local voxel space via invModel, then run
+// the shared G-buffer shading core. On a DDA miss: the enclosing world object writes the
+// background sky (obbSkyOnMiss=1, pixel-identical to A0); a non-enclosing object discards
+// (obbSkyOnMiss=0) so the depth buffer reveals whatever is behind it (A2+).
+ShadeOut PSObb(ObbVSOut i) {
+    float2 ndc = (i.pos.xy / viewport) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float tf = tan(fov * 0.5);
+    float3 rdW = normalize(camFwd + camRight * (ndc.x * tf * aspect) + camUp * (ndc.y * tf));
+    float3 roW = camPos;
+    // World -> object-local voxel space. invModel is identity for the single world object,
+    // so roL/rdL == roW/rdW and the DDA marches the global grid exactly as before. (rd is a
+    // direction => the translation row is dropped; it is NOT renormalized so the marched t
+    // stays in world units, matching PSShade's linear-depth and reprojection math.)
+    float3 roL = mul(obbInvModel, float4(roW, 1.0)).xyz;
+    float3 rdL = mul(obbInvModel, float4(rdW, 0.0)).xyz;
+
+    // Single shared trace (local-space AABB clip is built into traceVoxel). For the
+    // enclosing world object (obbSkyOnMiss=1) a miss writes the sky -> pixel-identical to
+    // the full-screen A0 path. A non-enclosing object (obbSkyOnMiss=0, A2+) discards on a
+    // miss so the depth buffer reveals what is behind it; shadeGBuffer flags a miss by
+    // leaving gbuffer.w at the 1e6 far-sentinel and nrm at zero.
+    ShadeOut o = shadeGBuffer(roL, rdL, i.pos.xy);
+    [branch] if (obbSkyOnMiss == 0 && o.gbuffer.w >= 1e6) discard;
+    return o;
+}
 )HLSL";
 
 struct CamCB {
@@ -814,6 +897,19 @@ struct CamCB {
 // The CBV is uploaded into a 256-byte buffer (MakeUpload(256)); keep the mirror at
 // exactly 16 float4 rows so prevVP lands on rows 12-15 and nothing overruns.
 static_assert(sizeof(CamCB) == 256, "CamCB must stay 256 bytes (16 x 16-byte rows) to match cbuffer + camBuf size");
+
+// Milestone A1: per-OBB-object constants (HLSL cbuffer ObbObject : register(b1)). One
+// per drawn VoxelObject; for the single world object model/invModel are identity and dims
+// = the global grid. obbMVP folds the object model INTO the world->clip matrix (with a
+// real perspective-z for hardware depth). Uploaded into a 256-byte CBV. Rows: 0-3 obbMVP,
+// 4-7 obbInvModel, 8 = dims + skyOnMiss flag. Mirror must stay <= 256 bytes.
+struct ObbCB {
+    float mvp[16];        // rows 0-3: world->clip (model premultiplied), row-major
+    float invModel[16];   // rows 4-7: world->object-local (voxel) space, row-major
+    float dims[3];        // row 8.xyz: object voxel dimensions
+    int   skyOnMiss;      // row 8.w: 1 = enclosing world object (write sky on miss); 0 = discard (A2+)
+};
+static_assert(sizeof(ObbCB) == 144, "ObbCB mirror must match the HLSL ObbObject cbuffer layout (fits in a 256-byte CBV)");
 
 // ===========================================================================
 // DEFERRED-LIGHTING shaders (Milestone A0; GI-denoiser modes 1 & 2). These read the
@@ -1112,6 +1208,15 @@ struct Renderer::Impl {
     std::uint32_t*                    voxelPtr   = nullptr;      // persistent map into voxelBuf
     ComPtr<ID3D12Resource>            camBuf;
     std::uint8_t*                     camPtr = nullptr;
+    // Milestone A1 OBB-raster G-buffer pass (deferred path only): per-object constants
+    // (b1), a unit-cube PSO drawn backfaces-only with depth test+write, and a full-res
+    // depth buffer + DSV. obbBuf is a persistently-mapped 256-byte CBV updated each frame.
+    ComPtr<ID3D12Resource>            obbBuf;
+    std::uint8_t*                     obbPtr = nullptr;          // persistent map into obbBuf
+    ComPtr<ID3D12Resource>            depthTex;                  // full-res D32 depth for the OBB pass
+    ComPtr<ID3D12DescriptorHeap>      dsvHeap;                   // single DSV
+    ComPtr<ID3D12RootSignature>       obbRootSig;                // SHADE root sig + the b1 OBB CBV
+    ComPtr<ID3D12PipelineState>       obbPso;                    // VSObb + PSObb, front-cull, depth+5 MRT
     // GI temporal accumulation -- PING-PONG pair (swapped each frame): one set is
     // CURRENT (written this frame: u0 accum / u1 hitpos), the other is PREVIOUS
     // (read this frame for reprojection: u2 accum / u3 hitpos). accumPair selects
@@ -1517,6 +1622,111 @@ bool Renderer::Impl::InitDenoiser(const char* kVox, const char* kDenoise) {
         }
     }
 
+    // ===================== A1: OBB-raster G-buffer pass =====================
+    // A full-res depth buffer (+ DSV) and a cube PSO (VSObb + PSObb) that draws the world
+    // object's OBB backfaces-only with depth test+write into the SAME 5 MRT G-buffer the
+    // full-screen SHADE pass writes. Replaces the full-screen SHADE draw in the deferred
+    // path; the a-trous + composite passes downstream are unchanged.
+
+    // --- full-res D32 depth buffer + a one-entry DSV heap ---
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = W;
+        rd.Height = H;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_D32_FLOAT;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE cv{};
+        cv.Format = DXGI_FORMAT_D32_FLOAT;
+        cv.DepthStencil.Depth = 1.0f;
+        if (FAILED(d.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                     D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
+                                                     IID_PPV_ARGS(&d.depthTex)))) {
+            vox::log::Error("DX12: OBB depth buffer"); return false;
+        }
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.NumDescriptors = 1;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        if (FAILED(d.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&d.dsvHeap)))) return false;
+        D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
+        dv.Format = DXGI_FORMAT_D32_FLOAT;
+        dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        d.device->CreateDepthStencilView(d.depthTex.Get(), &dv,
+                                         d.dsvHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+
+    // --- OBB root signature = the SHADE layout (b0; t0-t3; u0-u7) + a b1 OBB CBV ---
+    {
+        D3D12_ROOT_PARAMETER rp[14]{};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; rp[0].Descriptor.ShaderRegister = 0;  // b0 Camera
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[1].Descriptor.ShaderRegister = 0;  // t0 Voxels
+        rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[2].Descriptor.ShaderRegister = 0;  // u0 Accum
+        rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[3].Descriptor.ShaderRegister = 1;  // t1 BlueNoise
+        rp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[4].Descriptor.ShaderRegister = 2;  // t2 Palette
+        rp[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[5].Descriptor.ShaderRegister = 3;  // t3 Brick
+        rp[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[6].Descriptor.ShaderRegister = 1;  // u1 HitPos
+        rp[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[7].Descriptor.ShaderRegister = 2;  // u2 PrevAccum
+        rp[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[8].Descriptor.ShaderRegister = 3;  // u3 PrevHitPos
+        rp[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[9].Descriptor.ShaderRegister = 4;  // u4 Moments
+        rp[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[10].Descriptor.ShaderRegister = 5; // u5 PrevMoments
+        rp[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[11].Descriptor.ShaderRegister = 6; // u6 DirectAccum
+        rp[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[12].Descriptor.ShaderRegister = 7; // u7 PrevDirectAccum
+        rp[13].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; rp[13].Descriptor.ShaderRegister = 1; // b1 ObbObject
+        for (auto& p : rp) p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rs{};
+        rs.NumParameters = 14; rs.pParameters = rp;
+        rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        ComPtr<ID3DBlob> blob, err;
+        if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) {
+            vox::log::Error("DX12: OBB root sig: {}", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+            return false;
+        }
+        if (FAILED(d.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                 IID_PPV_ARGS(&d.obbRootSig)))) return false;
+
+        ComPtr<ID3DBlob> vs, ps, err2;
+        if (FAILED(D3DCompile(kVox, std::strlen(kVox), "voxel", nullptr, nullptr, "VSObb", "vs_5_1", cf, 0, &vs, &err2))) {
+            vox::log::Error("DX12: VSObb compile: {}", err2 ? static_cast<const char*>(err2->GetBufferPointer()) : "?");
+            return false;
+        }
+        if (FAILED(D3DCompile(kVox, std::strlen(kVox), "voxel", nullptr, nullptr, "PSObb", "ps_5_1", cf, 0, &ps, &err2))) {
+            vox::log::Error("DX12: PSObb compile: {}", err2 ? static_cast<const char*>(err2->GetBufferPointer()) : "?");
+            return false;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psod{};
+        psod.pRootSignature = d.obbRootSig.Get();
+        psod.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+        psod.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        for (int i = 0; i < 5; ++i) psod.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psod.SampleMask = UINT_MAX;
+        psod.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        // BACKFACES ONLY: cull the camera-facing (near) faces so the far faces always
+        // cover the screen, even with the camera inside the box. The cube is wound OUTWARD
+        // CCW, so FrontCounterClockwise=TRUE makes the near (outside-visible) faces "front"
+        // and CULL_FRONT removes them, leaving the far faces.
+        psod.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+        psod.RasterizerState.FrontCounterClockwise = TRUE;
+        psod.RasterizerState.DepthClipEnable = TRUE;
+        psod.DepthStencilState.DepthEnable = TRUE;
+        psod.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        psod.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        psod.DepthStencilState.StencilEnable = FALSE;
+        psod.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        psod.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psod.NumRenderTargets = 5;
+        for (int i = 0; i < 5; ++i) psod.RTVFormats[i] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        psod.SampleDesc.Count = 1;
+        if (FAILED(d.device->CreateGraphicsPipelineState(&psod, IID_PPV_ARGS(&d.obbPso)))) {
+            vox::log::Error("DX12: OBB PSO"); return false;
+        }
+    }
+
     d.denoiseReady = true;
     vox::log::Info("DX12: GI denoiser ready (a-trous + SVGF, {}x{})", W, H);
     return true;
@@ -1690,6 +1900,11 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     d.camBuf = d.MakeUpload(256);
     if (!d.camBuf) return false;
     d.camBuf->Map(0, &none, reinterpret_cast<void**>(&d.camPtr));
+
+    // --- A1 OBB-object CBV (b1, persistently mapped, 256-byte aligned) ---
+    d.obbBuf = d.MakeUpload(256);
+    if (!d.obbBuf) return false;
+    d.obbBuf->Map(0, &none, reinterpret_cast<void**>(&d.obbPtr));
 
     // --- GI temporal buffers: PING-PONG accumulation + hit-position (default-heap
     // UAVs, float4 per pixel each). Two of each so we can read the previous frame's
@@ -1995,6 +2210,33 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         // Remember this frame's VP for next frame's reprojection.
         std::memcpy(d.prevVP, curVP, sizeof(d.prevVP));
         d.havePrevVP = true;
+
+        // --- A1: per-OBB-object constants for the deferred G-buffer pass ---
+        // The OBB cube needs a world->clip matrix with a REAL perspective-z (curVP's z is
+        // degenerate -- z==w -> NDC z==1 -- which is fine for reprojection but useless as a
+        // depth buffer). Reuse curVP's rows 0/1/3 (so the cube projects to EXACTLY the
+        // screen positions the PS reconstructs its rays for) and replace row 2 with a
+        // standard [0,1] perspective-depth row: clip.z = A*zv + B, zv = fwd.P - dotF.
+        // For the single world object the model matrix is identity, so obbMVP == this
+        // world->clip matrix and obbInvModel == identity (world space == voxel space).
+        {
+            const float zn = 0.1f, zf = 2048.0f;     // near/far bracketing the [0,128]^3 scene
+            const float A = zf / (zf - zn);
+            const float B = -zn * zf / (zf - zn);
+            ObbCB ob{};
+            const float mvp[16] = {
+                right[0] * invX, right[1] * invX, right[2] * invX, -dotR * invX,        // clip.x
+                up[0]    * invY, up[1]    * invY, up[2]    * invY, -dotU * invY,        // clip.y
+                A * fwd[0],      A * fwd[1],      A * fwd[2],       A * (-dotF) + B,     // clip.z (perspective depth)
+                fwd[0],          fwd[1],          fwd[2],          -dotF,               // clip.w (== zv)
+            };
+            std::memcpy(ob.mvp, mvp, sizeof(mvp));
+            // invModel = identity (object #0: object-local voxel space IS world space).
+            ob.invModel[0] = ob.invModel[5] = ob.invModel[10] = ob.invModel[15] = 1.0f;
+            ob.dims[0] = ob.dims[1] = ob.dims[2] = static_cast<float>(kGrid);
+            ob.skyOnMiss = 1;   // enclosing world object: a DDA miss writes the sky (pixel-identical to A0)
+            std::memcpy(d.obbPtr, &ob, sizeof(ob));
+        }
     }
 
     // Temporal accumulation with motion-adaptive denoise.
@@ -2195,9 +2437,11 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         constexpr D3D12_RESOURCE_STATES kRT  = D3D12_RESOURCE_STATE_RENDER_TARGET;
         constexpr D3D12_RESOURCE_STATES kPSR = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
-        // ---- 1) G-BUFFER PASS (SHADE): full-screen raymarch the global grid, write the
-        //        5 MRT G-buffer targets (indirect[0], direct, albedo, gbuf=normal+depth, variance) ----
-        // All 6 RTs start RENDER_TARGET (from the previous frame's restore / Init).
+        // ---- 1) G-BUFFER PASS (A1 OBB raster): draw the world object's OBB backfaces-only
+        //        with depth test+write, fragment-DDA the LOCAL grid, write the 5 MRT G-buffer
+        //        targets (indirect[0], direct, albedo, gbuf=normal+depth, variance) ----
+        // All 6 RTs start RENDER_TARGET (from the previous frame's restore / Init). The
+        // depth buffer stays permanently in DEPTH_WRITE (never read as an SRV).
         for (int i = 0; i < 6; ++i) toState((UINT)i, kRT);
         D3D12_CPU_DESCRIPTOR_HANDLE shadeRtvs[5] = {
             d.OffRtv(0),  // SV_Target0 indirect[0]
@@ -2206,8 +2450,11 @@ void Renderer::RenderFrame(const FrameParams& fp) {
             d.OffRtv(4),  // SV_Target3 gbuf
             d.OffRtv(5),  // SV_Target4 variance
         };
-        d.list->OMSetRenderTargets(5, shadeRtvs, FALSE, nullptr);
-        d.list->SetGraphicsRootSignature(d.shadeRootSig.Get());
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = d.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        d.list->OMSetRenderTargets(5, shadeRtvs, FALSE, &dsv);
+        d.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        d.list->SetGraphicsRootSignature(d.obbRootSig.Get());
+        d.list->SetPipelineState(d.obbPso.Get());
         d.list->SetGraphicsRootConstantBufferView(0, d.camBuf->GetGPUVirtualAddress());
         d.list->SetGraphicsRootShaderResourceView(1, d.voxelBuf->GetGPUVirtualAddress());
         d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf[curBuf]->GetGPUVirtualAddress());    // u0 Accum
@@ -2221,7 +2468,8 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         d.list->SetGraphicsRootUnorderedAccessView(10, d.momentBuf[prevBuf]->GetGPUVirtualAddress()); // u5 PrevMoments
         d.list->SetGraphicsRootUnorderedAccessView(11, d.directAccumBuf[curBuf]->GetGPUVirtualAddress());  // u6 DirectAccum (current, write)
         d.list->SetGraphicsRootUnorderedAccessView(12, d.directAccumBuf[prevBuf]->GetGPUVirtualAddress()); // u7 PrevDirectAccum (previous, read)
-        d.list->DrawInstanced(3, 1, 0, 0);
+        d.list->SetGraphicsRootConstantBufferView(13, d.obbBuf->GetGPUVirtualAddress());              // b1 ObbObject (model/invModel/dims/skyOnMiss)
+        d.list->DrawInstanced(36, 1, 0, 0);   // 36 verts = the unit cube (generated in VSObb)
 
         // ---- 2) DEFERRED LIGHTING (a-trous): edge-aware wavelet over the G-buffer's
         //        demodulated indirect, ping-pong indirect[src]->indirect[dst] ----
