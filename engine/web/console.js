@@ -58,6 +58,7 @@ const GFX_ADVANCED_CVARS = [
     "renderer.gi.bounces",
     "renderer.gi.denoise",
     "renderer.gi.emissive",
+    "renderer.vox.emissive_boost",
     "renderer.empty_space_skip",
     "renderer.dither",
     "renderer.exposure",
