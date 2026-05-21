@@ -358,6 +358,17 @@ bool traceVoxel(float3 ro, float3 rd, int maxSteps, out float3 hp, out float3 nr
     float3 p = ro + rd * (max(tBox, 0.0) + 0.001);
     float3 cell = floor(p);
     float3 stepv = sign(rd);
+    // Seed nrm with the box ENTRY face (the axis that produced tBox). If the FIRST
+    // sampled cell is solid -- geometry sitting AT the world boundary, viewed from
+    // outside (tBox>0) -- the loop below returns on iteration 0 BEFORE any DDA step
+    // assigns a normal, so without this the hit keeps the bogus default-up nrm. That
+    // wrong normal points the AO/GI ray offset (hp + nrm*eps) ALONG the wall instead
+    // of off it -> the secondary rays self-occlude -> the whole boundary face goes BLACK.
+    [branch] if (tBox > 0.0) {
+        if      (tBox >= ts.y && tBox >= ts.z) nrm = float3(-stepv.x, 0, 0);  // entered through an X face
+        else if (tBox >= ts.z)                 nrm = float3(0, -stepv.y, 0);  // entered through a Y face
+        else                                   nrm = float3(0, 0, -stepv.z);  // entered through a Z face
+    }
     float3 tDelta = abs(1.0 / rd);
     float3 tMax = ((cell + (stepv * 0.5 + 0.5)) - p) / rd;
     float tEnter = 0.0;
