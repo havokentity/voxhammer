@@ -129,6 +129,7 @@ void RegisterCoreCvars() {
     reg("renderer.gi.bounces", "1", "QUALITY GI path depth: 0 = direct only (no indirect fill, dramatic dark shadows); 1 = clean single bounce (default); 2-5 fills enclosed rooms but is noisier.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 5, .range_step = 1});
     reg("renderer.gi.emissive", "1.0", "Global emissive multiplier (scales ALL emitters incl. the demo orb). Keep ~1 for sane values; use renderer.vox.emissive_boost to brighten loaded .vox maps instead.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 8.0f, .range_step = 0.25f});
     reg("renderer.vox.emissive_boost", "8.0", "LIVE emissive multiplier for LOADED .vox maps only (MagicaVoxel _emit is dim; crank high to flood-light a room, 1 = raw). Demo/code emissive is unaffected. Uncapped.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 64.0f, .range_step = 1.0f});
+    reg("renderer.emissive.surface", "1.0", "How bright an emitter's OWN surface looks when viewed directly (1 = full glow; lower so a strong room-light emitter shows its color instead of blowing to white). Does NOT change how much it lights the scene.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.05f});
     reg("renderer.gi.restir.spatial_passes", "2", "ReSTIR GI spatial resampling passes.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 4, .range_step = 1});
     reg("renderer.upscaling.mode", "DLSS_Q", "Super-resolution / upscaler preset.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"DLSS_DLAA", "DLSS_Q", "DLSS_B", "DLSS_P", "DLSS_UP", "FSR_Q", "FSR_B", "FSR_P", "NATIVE"}});
     reg("renderer.frame_gen.factor", "OFF", "Frame-generation multiplier.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"OFF", "2X", "3X", "4X"}});
@@ -685,6 +686,7 @@ int main(int argc, char** argv) {
             // Boost emissive ONLY for loaded .vox maps (MagicaVoxel _emit is dim); the
             // demo/code emissive stays at the sane gi.emissive. Live + uncapped.
             fp.vox_emissive = voxLoaded ? console.FindCVar("renderer.vox.emissive_boost")->GetFloat() : 1.0f;
+            fp.emissive_surface = console.FindCVar("renderer.emissive.surface")->GetFloat();
             renderer.SetGiDenoise(console.FindCVar("renderer.gi.denoise")->GetBool());  // self-guards; resets accum only on toggle
             renderer.SetEmptySpaceSkip(console.FindCVar("renderer.empty_space_skip")->GetBool());  // self-guards
             renderer.SetGiDebug(console.FindCVar("renderer.gi.debug")->GetBool());  // self-guards

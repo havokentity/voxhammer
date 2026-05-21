@@ -35,6 +35,7 @@ struct FrameParams {
     int   gi_bounces      = 1;       // QUALITY path depth: bounces light walks per path (1..5; 1 = single bounce, the clean default)
     float gi_emissive     = 1.0f;    // global emissive multiplier (all emitters; keep ~1 = sane)
     float vox_emissive    = 1.0f;    // extra emissive boost for LOADED .vox maps only (host sets; 1 = demo/none)
+    float emissive_surface = 1.0f;   // scales the emitter's OWN surface glow (1 = full; lower so strong emitters don't blow white). Not its GI contribution.
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen
