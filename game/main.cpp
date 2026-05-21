@@ -330,6 +330,7 @@ void RegisterCoreCvars() {
     reg("renderer.shadow.samples", "12", "Soft-shadow penumbra rays per pixel.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 16, .range_step = 1});
     reg("renderer.gi.samples", "1", "QUALITY: indirect GI bounce samples accumulated per frame.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 8, .range_step = 1});
     reg("renderer.gi.denoise", "1", "QUALITY: temporal denoise so path-traced GI stays clean while the camera moves (slight ghosting trade-off).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("renderer.gi.reproject", "1", "QUALITY: temporally REPROJECT GI history across camera motion (realigns each pixel to the same world point) so motion stays sharp with little ghosting. Off = screen-space EMA only.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("renderer.empty_space_skip", "1", "Skip empty bricks in the voxel raymarch (faster; visually identical). Off = per-voxel DDA.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("renderer.gi.debug", "0", "QUALITY debug: show ONLY the indirect GI bounce (no direct/albedo) to confirm GI is contributing.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("physics.gpu_rigids.enabled", "1", "GPU rigid bodies (NVIDIA).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
@@ -930,6 +931,7 @@ int main(int argc, char** argv) {
             renderer.SetGiDenoise(console.FindCVar("renderer.gi.denoise")->GetBool());  // self-guards; resets accum only on toggle
             renderer.SetEmptySpaceSkip(console.FindCVar("renderer.empty_space_skip")->GetBool());  // self-guards
             renderer.SetGiDebug(console.FindCVar("renderer.gi.debug")->GetBool());  // self-guards
+            renderer.SetGiReproject(console.FindCVar("renderer.gi.reproject")->GetBool());  // self-guards; resets accum only on toggle
             renderer.RenderFrame(fp);  // vsync caps the loop
         }
 

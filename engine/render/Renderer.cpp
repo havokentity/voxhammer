@@ -474,7 +474,18 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
                 break;
             }
         }
-        indirectSum += min(L, float3(8.0, 8.0, 8.0));   // firefly clamp: tame rare bright-path spikes (faster convergence)
+        // Soft firefly suppression (replaces a hard min() clamp). A hard min() puts a
+        // C0 KNEE in indirect radiance at a FIXED brightness (8); on a lit surface the
+        // "L == 8" iso-contour then reads as a hard lighting SEAM -- and giIntensity,
+        // which multiplies AFTER (below), scales that step up the more you boost. The
+        // temporal accumulator faithfully converges TO the kinked value, so more frames
+        // sharpen the seam instead of hiding it. This reciprocal luminance roll-off is
+        // smooth everywhere (no knee -> no seam), leaves dim paths nearly untouched
+        // (lum << kFire => factor ~1), and asymptotes a path's luminance to ~kFire so a
+        // blown emissive bounce still lights the room (~kFire) without a spike OR a seam.
+        const float kFire = 8.0;
+        float plum = dot(L, float3(0.2126, 0.7152, 0.0722));   // path luminance (Rec.709)
+        indirectSum += L * (1.0 / (1.0 + plum * (1.0 / kFire)));
     }
     float3 indirectAvg = (indirectSum / float(numSamples)) * giIntensity;   // artistic indirect-strength dial (>1 brightens dim rooms)
     if (giDebug != 0) return indirectAvg;   // GI debug view: show ONLY the indirect bounce radiance
