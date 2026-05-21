@@ -63,17 +63,32 @@
         "CMAKE_BUILD_TYPE": "Release",
         "VOX_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "windows-release-physx",
+      "displayName": "Windows · Release + PhysX debris (MSVC)",
+      "inherits": "win-base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_BUILD_TYPE": "Release",
+        "VOX_BUILD_TESTS": "ON",
+        "VOX_ENABLE_PHYSX": "ON",
+        "VOX_PHYSX_CONFIG": "release"
+      }
     }
   ],
   "buildPresets": [
     { "name": "windows-debug", "configurePreset": "windows-debug", "jobs": 0 },
     { "name": "windows-clang-debug", "configurePreset": "windows-clang-debug", "jobs": 0 },
     { "name": "windows-relwithdebinfo", "configurePreset": "windows-relwithdebinfo", "jobs": 0 },
-    { "name": "windows-release", "configurePreset": "windows-release", "jobs": 0 }
+    { "name": "windows-release", "configurePreset": "windows-release", "jobs": 0 },
+    { "name": "windows-release-physx", "configurePreset": "windows-release-physx", "jobs": 0 }
   ],
   "testPresets": [
     { "name": "windows-debug", "configurePreset": "windows-debug", "output": { "outputOnFailure": true } },
     { "name": "windows-clang-debug", "configurePreset": "windows-clang-debug", "output": { "outputOnFailure": true } },
-    { "name": "windows-release", "configurePreset": "windows-release", "output": { "outputOnFailure": true } }
+    { "name": "windows-release", "configurePreset": "windows-release", "output": { "outputOnFailure": true } },
+    { "name": "windows-release-physx", "configurePreset": "windows-release-physx", "output": { "outputOnFailure": true } }
   ]
 }
