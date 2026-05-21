@@ -122,6 +122,26 @@ route the existing fracture chunks through it (finally drawing them as true rigi
     boxes. **Render stays voxels (ray-marched); physics is boxes** — the two are linked
     only by the rigid-body transform. Cheap, PhysX-native, scales. (Our #4 already used one
     box per chunk; this generalizes it to a box-compound per object, re-decomposed on break.)
+  - **Island extraction → own grid (non-AABB-slice):** each detached island is rebuilt as
+    its OWN new `VoxelObject` — the piece's voxels are copied into a **fresh local grid**
+    (same fixed voxel **resolution**, its own tight local space + transform), *not* an
+    axis-aligned slice of the parent. So pieces are arbitrary **CONCAVE** shapes — and that
+    is exactly **why the collider is a box-COMPOUND, not a convex hull**: a hull would
+    shrink-wrap and fill the concavities (wrong collisions), whereas a union of convex boxes
+    preserves the true concave shape. Concavity is free: the render is voxels (any shape),
+    the physics is the concave-capable box-compound.
+  - **Connected-component coalescing → one whole per island (re-synthesis):** the grid copy
+    *and* the box-compound are built **per connected component**, never per voxel. After a
+    carve, the dirty-region re-flood partitions the still-solid voxels into connected islands;
+    **each island — however many voxels it holds — is re-synthesized into ONE whole
+    `VoxelObject`** (its own grid + a single box-compound spanning all of it), *not* a cloud of
+    loose cubes. Break a table across the middle → BFS finds **two** islands → **two half-table
+    objects, each a single coherent rigid body** (themselves re-breakable). A region only bottoms
+    out at **1×1×1 cubes** once it has actually been reduced to isolated single voxels (the
+    Milestone C limit). So the box/object count tracks **connectivity, not voxel count**:
+    still-connected ⇒ coalesced whole (few big boxes); shattered ⇒ many small boxes ⇒ single
+    voxel cubes only at the extreme. (Inverse of fracture: fracture *splits* one object into
+    many; this *coalesces* a still-joined region back into one.)
 - **C — Material strength + fracture-point selection + re-fracture.** Per-material
   thresholds; the stability/stress picks **where** to break (an overloaded unsupported
   span resolves to its weakest point); detached objects are themselves re-breakable.
