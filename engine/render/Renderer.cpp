@@ -429,7 +429,7 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
     // albedo (the pi/pdf cancel). depth==1 reproduces the old single-bounce look;
     // depth>=2 is real multi-bounce GI. Temporal accumulation converges it.
     int    numSamples = clamp(giSamples, 1, 8);
-    int    maxDepth   = clamp(giBounces, 1, 5);   // >=1: always at least the single bounce (sky fill)
+    int    maxDepth   = clamp(giBounces, 0, 5);   // 0 = direct only (no indirect/sky fill); 1 = single bounce; 2-5 = multi
     float3 indirectSum = float3(0, 0, 0);
     int    kSalt = 6;
     [loop] for (int s = 0; s < numSamples; ++s) {

@@ -182,7 +182,7 @@ function mockCvars() {
                         enum_values: [], range_min: 0, range_max: 0, range_step: 0, live_tunable: true }, extra || {});
     const R = (min, max, step) => ({ range_min: min, range_max: max, range_step: step });
     return [
-        C("renderer.gi.bounces", "1", "int", F.ARCHIVE, "QUALITY GI path depth (1 = clean single bounce; 2-5 = room fill, noisier).", R(1, 5, 1)),
+        C("renderer.gi.bounces", "1", "int", F.ARCHIVE, "QUALITY GI path depth (0 = direct only; 1 = single bounce; 2-5 = room fill).", R(0, 5, 1)),
         C("renderer.gi.restir.spatial_passes", "2", "int", F.ARCHIVE, "ReSTIR GI spatial resampling passes.", R(0, 4, 1)),
         C("renderer.upscaling.mode", "DLSS_Q", "enum", F.ARCHIVE, "Super-resolution / upscaler preset.",
           { enum_values: ["DLSS_DLAA", "DLSS_Q", "DLSS_B", "DLSS_P", "DLSS_UP", "FSR_Q", "FSR_B", "FSR_P", "NATIVE"] }),
