@@ -670,9 +670,12 @@ RWStructuredBuffer<float4> PrevMoments : register(u5);  // PREVIOUS-frame moment
 RWStructuredBuffer<float4> DirectAccum     : register(u6);  // CURRENT direct accumulation: rgb (.a unused)
 RWStructuredBuffer<float4> PrevDirectAccum : register(u7);  // PREVIOUS-frame direct accumulation (read-only this frame)
 
-// MRT outputs of the offscreen SHADE pass (all RGBA16F full-res), consumed by the
-// a-trous + composite passes. INDIRECT is DEMODULATED (no primary albedo) so the
-// spatial filter never bleeds across albedo edges; albedo is re-applied at composite.
+// MRT outputs of the offscreen SHADE pass = the G-BUFFER (Milestone A0). All RGBA16F
+// full-res, consumed by the DEFERRED-LIGHTING passes (a-trous + composite). INDIRECT is
+// DEMODULATED (no primary albedo) so the spatial filter never bleeds across albedo edges;
+// albedo is re-applied at composite. (A1+ extend this G-buffer with explicit material +
+// motion-vector channels once OBB raster / per-object grids land; A0 keeps it as-is so
+// the deferred output stays pixel-identical to the fused single pass.)
 struct ShadeOut {
     float4 indirect : SV_Target0;  // temporally-accumulated DEMODULATED indirect irradiance (.a = sample count)
     float4 direct   : SV_Target1;  // direct sun*albedo + self-emission (NOT to be blurred)
@@ -681,12 +684,14 @@ struct ShadeOut {
     float4 variance : SV_Target4;  // .x = temporal luminance variance, .y = history sample count (SVGF)
 };
 
-// Offscreen variant of PSMain for the multi-pass denoiser (gi_denoiser != 0,
-// QUALITY mode). Traces the primary ray, computes the demodulated indirect / direct
-// / albedo via giShadeSplit, temporally accumulates the indirect EXACTLY like the
-// single pass (same reproject + Accum/PrevAccum ping-pong), accumulates luminance
-// moments for SVGF, and writes the five G-buffer-style targets. NO tonemap/dither
-// here -- that is the composite pass's job.
+// G-BUFFER PASS (Milestone A0). Offscreen variant of PSMain for the deferred path
+// (gi_denoiser != 0, QUALITY mode). STILL full-screen raymarches the one global voxel
+// grid exactly as PSMain does; instead of lighting+tonemapping to the backbuffer it
+// computes the demodulated indirect / direct / albedo via giShadeSplit, temporally
+// accumulates the indirect EXACTLY like the single pass (same reproject + Accum/PrevAccum
+// ping-pong), accumulates luminance moments for SVGF, and writes the five G-buffer
+// targets for the deferred-lighting passes to consume. NO tonemap/dither here -- that is
+// the composite (deferred-lighting) pass's job.
 ShadeOut PSShade(VSOut i) {
     ShadeOut o;
     float2 ndc = (i.pos.xy / viewport) * 2.0 - 1.0;
@@ -811,10 +816,12 @@ struct CamCB {
 static_assert(sizeof(CamCB) == 256, "CamCB must stay 256 bytes (16 x 16-byte rows) to match cbuffer + camBuf size");
 
 // ===========================================================================
-// MULTI-PASS GI DENOISER shaders (modes 1 & 2). A SEPARATE compilation unit from
-// kShader because these are pure image-space passes that need their OWN b0 cbuffer
-// (kShader's b0 is the 256-byte Camera). They are full-res 1:1, so all texture reads
-// use integer Load() at SV_Position -- NO sampler/static-sampler is required.
+// DEFERRED-LIGHTING shaders (Milestone A0; GI-denoiser modes 1 & 2). These read the
+// G-buffer that PSShade wrote and produce the final image -- the deferred half of the
+// G-buffer-pass/deferred-lighting-pass split. A SEPARATE compilation unit from kShader
+// because these are pure image-space passes that need their OWN b0 cbuffer (kShader's
+// b0 is the 256-byte Camera). They are full-res 1:1, so all texture reads use integer
+// Load() at SV_Position -- NO sampler/static-sampler is required.
 //
 //   VSFsq      full-screen triangle (shared by a-trous + composite)
 //   PSAtrous   one edge-aware 5x5 a-trous wavelet iteration on the DEMODULATED
@@ -2155,9 +2162,19 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
         d.list->ResourceBarrier(1, &bar);
     } else {
-        // ============================ MULTI PASS (mode 1 ATROUS / 2 SVGF) ============================
-        // SHADE (MRT offscreen) -> N edge-aware a-trous iterations on the demodulated
-        // indirect (ping-pong) -> COMPOSITE (re-modulate + tonemap + dither -> backbuffer).
+        // ===================== DEFERRED PIPELINE (mode 1 ATROUS / 2 SVGF) =====================
+        // The explicit two-pass split (Milestone A0): a G-BUFFER PASS that full-screen
+        // raymarches the one global voxel grid and writes its results into offscreen
+        // G-buffer targets (albedo, normal+linear-depth, demodulated indirect, direct,
+        // SVGF variance), followed by a DEFERRED-LIGHTING PASS that reads that G-buffer
+        // and produces the final image. Concretely:
+        //   1) G-BUFFER PASS  : PSShade -> 5 MRT offscreen G-buffer targets.
+        //   2) DEFERRED LIGHT : N edge-aware a-trous iterations on the demodulated
+        //                       indirect (ping-pong) + COMPOSITE (re-modulate the
+        //                       G-buffer albedo onto the filtered indirect, add the
+        //                       direct term, tonemap + dither -> backbuffer).
+        // (Mode 0 / PERFORMANCE still runs the original fused single pass above, kept
+        // unchanged so its output is byte-identical; A1+ migrate it onto this path.)
         d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         d.list->SetDescriptorHeaps(1, d.srvHeap.GetAddressOf());
 
@@ -2178,7 +2195,8 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         constexpr D3D12_RESOURCE_STATES kRT  = D3D12_RESOURCE_STATE_RENDER_TARGET;
         constexpr D3D12_RESOURCE_STATES kPSR = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
-        // ---- 1) SHADE: write the 5 MRT targets (indirect[0], direct, albedo, gbuf, variance) ----
+        // ---- 1) G-BUFFER PASS (SHADE): full-screen raymarch the global grid, write the
+        //        5 MRT G-buffer targets (indirect[0], direct, albedo, gbuf=normal+depth, variance) ----
         // All 6 RTs start RENDER_TARGET (from the previous frame's restore / Init).
         for (int i = 0; i < 6; ++i) toState((UINT)i, kRT);
         D3D12_CPU_DESCRIPTOR_HANDLE shadeRtvs[5] = {
@@ -2205,7 +2223,8 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         d.list->SetGraphicsRootUnorderedAccessView(12, d.directAccumBuf[prevBuf]->GetGPUVirtualAddress()); // u7 PrevDirectAccum (previous, read)
         d.list->DrawInstanced(3, 1, 0, 0);
 
-        // ---- 2) a-trous: edge-aware wavelet, ping-pong indirect[src]->indirect[dst] ----
+        // ---- 2) DEFERRED LIGHTING (a-trous): edge-aware wavelet over the G-buffer's
+        //        demodulated indirect, ping-pong indirect[src]->indirect[dst] ----
         // gbuf + variance are read every iteration; transition them to PSR once.
         toState(4, kPSR);  // gbuf
         toState(5, kPSR);  // variance
@@ -2256,7 +2275,8 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         toState(2, kPSR);  // direct
         toState(3, kPSR);  // albedo
 
-        // ---- 3) COMPOSITE: final = direct + albedo*filtered_indirect; tonemap; dither -> backbuffer ----
+        // ---- 3) DEFERRED LIGHTING (COMPOSITE): read the G-buffer -> final =
+        //        direct + albedo*filtered_indirect; tonemap; dither -> backbuffer ----
         D3D12_RESOURCE_BARRIER bb{};
         bb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         bb.Transition.pResource = d.targets[idx].Get();
