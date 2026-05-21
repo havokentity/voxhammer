@@ -55,7 +55,7 @@ cbuffer Camera : register(b0) {
     float  aoStrength;     float aoRadius;     int lightingMode; int accumFrame; // row 7
     int    dither;         int aoSamples;      int shadowSamples; int giSamples;  // row 8
     int    giDenoise;      float giHistMax;    int emptySkip;     int brickDim;   // row 9
-    int    giDebug;        int   giBounces;    float giEmissive;  int giPad10c;   // row 10
+    int    giDebug;        int   giBounces;    float giEmissive;  float voxEmissive; // row 10
 };
 StructuredBuffer<uint> Voxels : register(t0);
 RWStructuredBuffer<float4> Accum : register(u0);  // per-pixel GI accumulation: rgb + sample count
@@ -141,13 +141,12 @@ float3 palette(uint m) {
 
 // Emissive strength = (alpha/255) * 8 (the 8 is just the alpha-byte's HDR
 // encoding range, like RGB bytes encode 0..1) * giEmissive (sane global cvar,
-// default 1). The alpha byte is packed by the importer / set by code at SANE
-// values; loaded .vox maps get boosted separately at load time (the
-// renderer.vox.emissive_boost cvar), so the demo + code emissive stay sane
-// while dim MagicaVoxel _emit materials get amplified.
+// default 1) * voxEmissive (LIVE boost the host sets only when a .vox map is
+// loaded, else 1 -- so dim MagicaVoxel _emit materials can be cranked WAY up to
+// flood a room while the demo/code emissive stays sane; uncapped, no alpha clip).
 float emission(uint m) {
     uint p = Palette[m & 255u];
-    return (float((p >> 24) & 255u) / 255.0) * 8.0 * giEmissive;
+    return (float((p >> 24) & 255u) / 255.0) * 8.0 * giEmissive * voxEmissive;
 }
 
 // Blue-noise lookup: spatially uniform, spectrally high-frequency.
@@ -533,7 +532,7 @@ struct CamCB {
     float aoStrength;      float aoRadius;         int lightingMode; int accumFrame; // row 7
     int   dither;          int   aoSamples;        int shadowSamples; int giSamples; // row 8
     int   giDenoise;       float giHistMax;        int emptySkip; int brickDim;      // row 9
-    int   giDebug;         int   giBounces;        float giEmissive; int giPad10c;       // row 10
+    int   giDebug;         int   giBounces;        float giEmissive; float voxEmissive;  // row 10
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -642,7 +641,7 @@ struct Renderer::Impl {
     // changed" fires every frame -> accumFrame resets every frame -> GI never
     // converges. The sceneKey literal below uses these via static_assert.)
     static constexpr int kCamKeyLen   = 6;
-    static constexpr int kSceneKeyLen = 19;
+    static constexpr int kSceneKeyLen = 20;
     float                             accCamKey[kCamKeyLen]     = {};
     float                             accSceneKey[kSceneKeyLen] = {};
     bool                              accHave = false;
@@ -1106,6 +1105,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.giSamples      = std::max(1, std::min(fp.gi_samples,      8));
     cb.giBounces      = std::max(0, std::min(fp.gi_bounces,      5));
     cb.giEmissive     = std::max(0.0f, std::min(fp.gi_emissive, 8.0f));
+    cb.voxEmissive    = std::max(0.0f, fp.vox_emissive);   // host sets >1 only when a .vox map is loaded
 
     // Temporal accumulation with motion-adaptive denoise.
     //
@@ -1126,7 +1126,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         static_cast<float>(fp.lighting_mode), static_cast<float>(fp.hdr),
         static_cast<float>(fp.dither), static_cast<float>(fp.ao_samples),
         static_cast<float>(fp.shadow_samples), static_cast<float>(fp.gi_samples),
-        static_cast<float>(fp.gi_bounces), fp.gi_emissive,
+        static_cast<float>(fp.gi_bounces), fp.gi_emissive, fp.vox_emissive,
     };
     // Compile-time guard: the stored copies (Impl::accCamKey/accSceneKey) MUST be
     // the same length as these keys, or the memcmp/memcpy below over-run.

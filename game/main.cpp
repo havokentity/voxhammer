@@ -111,19 +111,6 @@ void GenerateDemoScene(vox::voxel::VoxScene& vs) {
     vs.voxelCount = count;
 }
 
-// Brighten emissive materials of a LOADED .vox by `boost` (the palette ALPHA
-// byte holds emission). MagicaVoxel _emit is often dim; this lets loaded maps
-// glow without touching the demo / code-set emissive. Applied on import only.
-void BoostVoxEmissive(vox::voxel::VoxPalette& pal, float boost) {
-    if (boost <= 1.0f) return;
-    for (auto& c : pal) {
-        const unsigned a = (c >> 24) & 0xFFu;
-        if (a == 0u) continue;  // not emissive
-        const unsigned na = static_cast<unsigned>(std::min(255.0f, static_cast<float>(a) * boost + 0.5f));
-        c = (c & 0x00FFFFFFu) | (na << 24);
-    }
-}
-
 void Usage() {
     vox::log::Info("Voxhammer {} -- standalone DX12 voxel-destruction engine", VOX_VERSION_STRING);
     vox::log::Info("Usage: voxhammer [flags]");
@@ -141,7 +128,7 @@ void RegisterCoreCvars() {
     auto reg = [&](const char* n, const char* d, const char* desc, CVarParams p) { c.RegisterCVar(n, d, desc, std::move(p)); };
     reg("renderer.gi.bounces", "1", "QUALITY GI path depth: 0 = direct only (no indirect fill, dramatic dark shadows); 1 = clean single bounce (default); 2-5 fills enclosed rooms but is noisier.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 5, .range_step = 1});
     reg("renderer.gi.emissive", "1.0", "Global emissive multiplier (scales ALL emitters incl. the demo orb). Keep ~1 for sane values; use renderer.vox.emissive_boost to brighten loaded .vox maps instead.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 8.0f, .range_step = 0.25f});
-    reg("renderer.vox.emissive_boost", "6.0", "Emissive boost applied to LOADED .vox maps on import (MagicaVoxel _emit is often dim; ~6 reads like Magica, 1 = raw/unboosted, higher = brighter). Re-load the .vox after changing.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 16.0f, .range_step = 0.5f});
+    reg("renderer.vox.emissive_boost", "8.0", "LIVE emissive multiplier for LOADED .vox maps only (MagicaVoxel _emit is dim; crank high to flood-light a room, 1 = raw). Demo/code emissive is unaffected. Uncapped.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 64.0f, .range_step = 1.0f});
     reg("renderer.gi.restir.spatial_passes", "2", "ReSTIR GI spatial resampling passes.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 4, .range_step = 1});
     reg("renderer.upscaling.mode", "DLSS_Q", "Super-resolution / upscaler preset.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"DLSS_DLAA", "DLSS_Q", "DLSS_B", "DLSS_P", "DLSS_UP", "FSR_Q", "FSR_B", "FSR_P", "NATIVE"}});
     reg("renderer.frame_gen.factor", "OFF", "Frame-generation multiplier.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"OFF", "2X", "3X", "4X"}});
@@ -412,13 +399,14 @@ int main(int argc, char** argv) {
     vox::voxel::VoxScene vs;
     std::vector<std::uint32_t> voxelGrid;
     bool haveVoxels = false;
+    bool voxLoaded  = false;   // true once a real .vox map is loaded (import/place/drop); gates the vox emissive boost
     const std::uint32_t* palettePtr = nullptr;
     if (CVar* ip = console.FindCVar("voxel.import_path"); ip && !ip->value.empty()) {
         if (vox::voxel::LoadVox(ip->value, vs)) {
-            BoostVoxEmissive(vs.palette, console.FindCVar("renderer.vox.emissive_boost")->GetFloat());
             world = std::move(vs.world);
             voxelGrid = world.BakeFlatGrid(vox::voxel::kWorldDim);
             haveVoxels = true;
+            voxLoaded  = true;
             palettePtr = vs.palette.data();
             vox::log::Info("voxel: imported {} ({} voxels, {} chunks)", ip->value, vs.voxelCount, world.ResidentChunks());
         } else {
@@ -463,7 +451,7 @@ int main(int argc, char** argv) {
         Console& c = Console::Get();
         c.RegisterCommand("voxel.place",
             "Stamp voxel.import_path into the world at (voxel.cursor.x/y/z). Additive.",
-            [&world, &renderer](std::span<const std::string_view>, Output& o) {
+            [&world, &renderer, &voxLoaded](std::span<const std::string_view>, Output& o) {
                 Console& cc = Console::Get();
                 CVar* ipCv = cc.FindCVar("voxel.import_path");
                 CVar* cxCv = cc.FindCVar("voxel.cursor.x");
@@ -479,8 +467,8 @@ int main(int argc, char** argv) {
                 const int cz = czCv ? czCv->GetInt() : 0;
                 vox::voxel::VoxScene vs;
                 if (vox::voxel::LoadVox(path, vs)) {
-                    BoostVoxEmissive(vs.palette, Console::Get().FindCVar("renderer.vox.emissive_boost")->GetFloat());
                     world.StampVox(vs.world, vs.palette, cx, cy, cz);
+                    voxLoaded = true;
                     auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
                     renderer.SetVoxels(grid, world.Palette().data());
                     o.Format("placed {} at ({},{},{}) - {} voxels", path, cx, cy, cz, vs.voxelCount);
@@ -491,8 +479,9 @@ int main(int argc, char** argv) {
 
         c.RegisterCommand("voxel.clear",
             "Clear all voxels from the world.",
-            [&world, &renderer](std::span<const std::string_view>, Output& o) {
+            [&world, &renderer, &voxLoaded](std::span<const std::string_view>, Output& o) {
                 world.Clear();
+                voxLoaded = false;
                 auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
                 renderer.SetVoxels(grid, world.Palette().data());
                 o.Print("voxel world cleared");
@@ -605,8 +594,8 @@ int main(int argc, char** argv) {
             int cx = console.FindCVar("voxel.cursor.x") ? console.FindCVar("voxel.cursor.x")->GetInt() : 0;
             int cy = console.FindCVar("voxel.cursor.y") ? console.FindCVar("voxel.cursor.y")->GetInt() : 0;
             int cz = console.FindCVar("voxel.cursor.z") ? console.FindCVar("voxel.cursor.z")->GetInt() : 0;
-            BoostVoxEmissive(vs.palette, console.FindCVar("renderer.vox.emissive_boost")->GetFloat());
             world.StampVox(vs.world, vs.palette, cx, cy, cz);
+            voxLoaded = true;
             auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
             renderer.SetVoxels(grid, world.Palette().data());
             vox::log::Info("voxel: dropped {} ({} voxels) at ({},{},{})", name, vs.voxelCount, cx, cy, cz);
@@ -693,6 +682,9 @@ int main(int argc, char** argv) {
             fp.gi_samples = console.FindCVar("renderer.gi.samples")->GetInt();
             fp.gi_bounces = console.FindCVar("renderer.gi.bounces")->GetInt();
             fp.gi_emissive = console.FindCVar("renderer.gi.emissive")->GetFloat();
+            // Boost emissive ONLY for loaded .vox maps (MagicaVoxel _emit is dim); the
+            // demo/code emissive stays at the sane gi.emissive. Live + uncapped.
+            fp.vox_emissive = voxLoaded ? console.FindCVar("renderer.vox.emissive_boost")->GetFloat() : 1.0f;
             renderer.SetGiDenoise(console.FindCVar("renderer.gi.denoise")->GetBool());  // self-guards; resets accum only on toggle
             renderer.SetEmptySpaceSkip(console.FindCVar("renderer.empty_space_skip")->GetBool());  // self-guards
             renderer.SetGiDebug(console.FindCVar("renderer.gi.debug")->GetBool());  // self-guards
