@@ -57,6 +57,13 @@ const GFX_ADVANCED_CVARS = [
     "renderer.gi.samples",
     "renderer.gi.bounces",
     "renderer.gi.denoise",
+    "renderer.gi.reproject",
+    "renderer.gi.reproject_history",
+    "renderer.gi.denoiser",
+    "renderer.gi.atrous_iters",
+    "renderer.gi.denoise_phi_normal",
+    "renderer.gi.denoise_phi_depth",
+    "renderer.gi.denoise_phi_lum",
     "renderer.gi.intensity",
     "renderer.gi.emissive",
     "renderer.vox.emissive_boost",
@@ -186,6 +193,14 @@ function mockCvars() {
     const R = (min, max, step) => ({ range_min: min, range_max: max, range_step: step });
     return [
         C("renderer.gi.bounces", "1", "int", F.ARCHIVE, "QUALITY GI path depth (0 = direct only; 1 = single bounce; 2-5 = room fill).", R(0, 5, 1)),
+        C("renderer.gi.denoise", "1", "bool", F.ARCHIVE, "QUALITY temporal GI denoise (history across motion)."),
+        C("renderer.gi.reproject", "1", "bool", F.ARCHIVE, "QUALITY GI temporal reprojection (realign history across camera motion)."),
+        C("renderer.gi.reproject_history", "8", "int", F.ARCHIVE, "Reproject history depth during motion (swim<->grain knob).", R(8, 1024, 8)),
+        C("renderer.gi.denoiser", "NONE", "enum", F.ARCHIVE, "GI spatial denoiser: NONE (single pass) / ATROUS / SVGF.", { enum_values: ["NONE", "ATROUS", "SVGF"] }),
+        C("renderer.gi.atrous_iters", "5", "int", F.ARCHIVE, "Denoiser a-trous wavelet iterations.", R(1, 6, 1)),
+        C("renderer.gi.denoise_phi_normal", "64.0", "float", F.ARCHIVE, "Denoiser normal edge-stop exponent.", R(1, 256, 1)),
+        C("renderer.gi.denoise_phi_depth", "1.0", "float", F.ARCHIVE, "Denoiser depth edge-stop scale.", R(0.05, 8, 0.05)),
+        C("renderer.gi.denoise_phi_lum", "4.0", "float", F.ARCHIVE, "Denoiser luminance edge-stop sigma (SVGF scales by sqrt(variance)).", R(0.1, 32, 0.1)),
         C("renderer.gi.restir.spatial_passes", "2", "int", F.ARCHIVE, "ReSTIR GI spatial resampling passes.", R(0, 4, 1)),
         C("renderer.upscaling.mode", "DLSS_Q", "enum", F.ARCHIVE, "Super-resolution / upscaler preset.",
           { enum_values: ["DLSS_DLAA", "DLSS_Q", "DLSS_B", "DLSS_P", "DLSS_UP", "FSR_Q", "FSR_B", "FSR_P", "NATIVE"] }),
@@ -423,10 +438,11 @@ function afterValueChange(name) {
     const cv = state.cvars.get(name);
     if (cv) { const card = $(`.ctrl[data-name="${cssEsc(name)}"]`); if (card) card.classList.toggle("changed", cv.value !== cv.default); }
     if (name.startsWith("renderer.") || name === "debug.show_brick_grid" || name === "debug.pause_simulation") updateViewport();
-    // When the lighting tier changes, re-render the deck so context-sensitive
-    // cvar visibility (AO vs GI) is immediately reflected in both the Render
+    // When the lighting tier OR the GI denoiser mode changes, re-render the deck so
+    // context-sensitive cvar visibility (AO vs GI; and the denoiser sub-settings that
+    // gray out when the denoiser is NONE) is immediately reflected in both the Render
     // category and the Graphics Advanced panel.
-    if (name === "renderer.lighting.mode") renderDeck();
+    if (name === "renderer.lighting.mode" || name === "renderer.gi.denoiser") renderDeck();
 }
 // Merge an incoming cvar in place (keep the object identity) so a widget that
 // captured the reference -- e.g. an open color picker -- keeps repainting.
@@ -681,12 +697,32 @@ function captureKey(btn) {
 // Returns true if the given cvar name is INACTIVE (does not apply) for the current
 // lighting mode.  Cards are kept in their stable positions — the caller adds a
 // `ctrl-inactive` class instead of removing them from the DOM.
-const LIGHTING_INACTIVE_PERFORMANCE = new Set(["renderer.gi.samples", "renderer.gi.bounces"]);
+// QUALITY-only GI cvars: all gray out in PERFORMANCE (no GI is computed there).
+const LIGHTING_INACTIVE_PERFORMANCE = new Set([
+    "renderer.gi.samples", "renderer.gi.bounces", "renderer.gi.intensity",
+    "renderer.gi.denoise", "renderer.gi.reproject", "renderer.gi.reproject_history",
+    "renderer.gi.denoiser", "renderer.gi.atrous_iters",
+    "renderer.gi.denoise_phi_normal", "renderer.gi.denoise_phi_depth", "renderer.gi.denoise_phi_lum",
+]);
 const LIGHTING_INACTIVE_QUALITY     = new Set(["renderer.ao.samples", "renderer.ao.strength", "renderer.ao.radius"]);
+// The a-trous/SVGF sub-settings only apply when a multi-pass denoiser is SELECTED
+// (renderer.gi.denoiser != NONE) -- so they gray out in-place when it's NONE. This is
+// the "mutually exclusive denoiser, respective settings grayed when not selected" rule.
+const DENOISER_SUBSETTINGS = new Set([
+    "renderer.gi.atrous_iters", "renderer.gi.denoise_phi_normal",
+    "renderer.gi.denoise_phi_depth", "renderer.gi.denoise_phi_lum",
+]);
 function isInactiveForLightingMode(name) {
     const mode = (state.cvars.get("renderer.lighting.mode") || {}).value || "PERFORMANCE";
     if (mode === "PERFORMANCE") return LIGHTING_INACTIVE_PERFORMANCE.has(name);
-    if (mode === "QUALITY")     return LIGHTING_INACTIVE_QUALITY.has(name);
+    if (mode === "QUALITY") {
+        if (LIGHTING_INACTIVE_QUALITY.has(name)) return true;
+        // Denoiser sub-settings are live only when ATROUS or SVGF is the chosen denoiser.
+        if (DENOISER_SUBSETTINGS.has(name)) {
+            const dn = (state.cvars.get("renderer.gi.denoiser") || {}).value || "NONE";
+            return dn === "NONE";
+        }
+    }
     return false;
 }
 function lightingModeHint() {
