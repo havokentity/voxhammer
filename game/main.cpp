@@ -82,11 +82,11 @@ void GenerateDemoScene(vox::voxel::VoxScene& vs) {
     vs.palette[1] = rgb(173, 211, 148);  // grass
     vs.palette[2] = rgb(183, 160, 139);  // dirt
     vs.palette[3] = rgb(194, 196, 202);  // stone
-    // Floating orb is EMISSIVE (alpha=56 -> emission ~1.75x at the default
-    // gi.emissive=1): a glowing light that bleeds warm color onto the terrain
-    // below via GI -- showcases emissive voxels. Crank renderer.gi.emissive up
-    // for a blown-out sun, down to 0 to make it matte.
-    vs.palette[4] = rgb(255, 150, 95) | (56u << 24);  // warm glowing orb
+    // Floating orb is EMISSIVE (alpha=28 -> emission ~1.75x at the default
+    // gi.emissive=1, given the x16 expand): a glowing light that bleeds warm
+    // color onto the terrain below via GI -- showcases emissive voxels. Crank
+    // renderer.gi.emissive up for a blown-out sun, down to 0 to make it matte.
+    vs.palette[4] = rgb(255, 150, 95) | (28u << 24);  // warm glowing orb
 
     const int   dim   = static_cast<int>(vox::voxel::kWorldDim);
     const float g     = static_cast<float>(dim);

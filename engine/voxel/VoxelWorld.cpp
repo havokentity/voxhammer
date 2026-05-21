@@ -176,7 +176,7 @@ std::uint8_t VoxelWorld::GetVoxel(int x, int y, int z) const noexcept {
 int VoxelWorld::CarveSphere(int cx, int cy, int cz, int radius) {
     if (radius < 0) return 0;
 
-    const int kDim = static_cast<int>(kWorldDim);
+    constexpr int kDim = static_cast<int>(kWorldDim);
     // Bounding box of the sphere, clamped to the valid voxel range [0,kDim).
     const int x0 = std::max(0, cx - radius);
     const int y0 = std::max(0, cy - radius);
@@ -211,7 +211,7 @@ bool VoxelWorld::RaycastSolid(const float origin[3], const float dir[3], float m
     if (len < 1e-12f) return false;
     dx /= len; dy /= len; dz /= len;
 
-    const int kDim = static_cast<int>(kWorldDim);
+    constexpr int kDim = static_cast<int>(kWorldDim);
 
     // Current voxel cell (floor of the origin).
     int vx = static_cast<int>(std::floor(origin[0]));
@@ -219,7 +219,7 @@ bool VoxelWorld::RaycastSolid(const float origin[3], const float dir[3], float m
     int vz = static_cast<int>(std::floor(origin[2]));
 
     // If the ray starts inside a solid, in-bounds voxel, that cell is the hit.
-    auto inBounds = [kDim](int x, int y, int z) {
+    auto inBounds = [](int x, int y, int z) {
         return x >= 0 && y >= 0 && z >= 0 && x < kDim && y < kDim && z < kDim;
     };
     if (inBounds(vx, vy, vz) && GetVoxel(vx, vy, vz) != 0) {

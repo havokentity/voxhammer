@@ -141,11 +141,13 @@ float3 palette(uint m) {
 
 // Emissive strength, packed in the palette ALPHA byte (0 = not emissive). The
 // .vox importer writes saturate(emit * 2^(flux-1)) there; here we expand back to
-// an HDR range (x8) and scale by the giEmissive cvar. Emissive surfaces act as
+// an HDR range (x16) and scale by the giEmissive cvar. Emissive surfaces act as
 // light sources in the GI path, so (with multi-bounce) bright voxels fill rooms.
+// (x16 -> typical MagicaVoxel _emit materials read bright enough to actually
+//  light a scene; crank renderer.gi.emissive for more.)
 float emission(uint m) {
     uint p = Palette[m & 255u];
-    return (float((p >> 24) & 255u) / 255.0) * 8.0 * giEmissive;
+    return (float((p >> 24) & 255u) / 255.0) * 16.0 * giEmissive;
 }
 
 // Blue-noise lookup: spatially uniform, spectrally high-frequency.
