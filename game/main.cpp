@@ -16,6 +16,7 @@
 #include "platform/Window.h"
 #include "ecs/EcsWorld.h"
 #include "jobs/JobScheduler.h"
+#include "physics/PhysicsWorld.h"
 #include "render/Renderer.h"
 #include "script/ScriptHost.h"
 #include "voxel/VoxImport.h"
@@ -27,9 +28,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -110,6 +113,182 @@ void GenerateDemoScene(vox::voxel::VoxScene& vs) {
     vs.sizeX = vs.sizeY = vs.sizeZ = static_cast<decltype(vs.sizeX)>(dim);
     vs.voxelCount = count;
 }
+
+#if defined(VOX_HAVE_PHYSX)
+// ---------------------------------------------------------------------------
+// Carve debris (PASS 2). Spawns a few dynamic PhysX boxes when the player
+// carves and renders each as a chunky voxel cube by RE-INSERTING it into the
+// live GPU voxel grid via Renderer::EditVoxels -- the renderer is untouched.
+//
+// Debris voxels live ONLY in the GPU grid, never in the VoxelWorld. So the
+// authoritative terrain at any cell is always world.GetVoxel(): to ERASE a
+// debris cube we simply rewrite its cells with whatever the VoxelWorld says is
+// there (usually air), which is non-destructive even when debris falls through
+// solid terrain. To DRAW one we overwrite its cells with the debris material.
+// We track each body's previous + current grid AABB so each frame clears last
+// frame's footprint before painting the new one.
+// ---------------------------------------------------------------------------
+class DebrisField {
+public:
+    // The debris material index (a palette slot chosen by main to be free in the
+    // live render palette and pinned in both that palette and world.Palette()).
+    void Init(std::uint8_t debrisMaterial) { debrisMat_ = debrisMaterial; }
+
+    // Spawn a small burst (4..12) of debris boxes at a carved hit, each a
+    // kCubeVox-edged cube with outward+upward velocity so they scatter.
+    void Spawn(vox::physics::PhysicsWorld& physics, int hx, int hy, int hz,
+               int carveRadius) {
+        const int n = 4 + (rng_() % 9);  // 4..12 boxes
+        const float half = 0.5f * static_cast<float>(kCubeVox);  // PhysX cube half-extent (world units == voxels)
+        for (int i = 0; i < n; ++i) {
+            // Jitter the spawn within the carved sphere so they don't stack.
+            const float jx = Frand(-1.0f, 1.0f) * static_cast<float>(carveRadius) * 0.5f;
+            const float jy = Frand(0.0f, 1.0f) * static_cast<float>(carveRadius) * 0.5f;
+            const float jz = Frand(-1.0f, 1.0f) * static_cast<float>(carveRadius) * 0.5f;
+            const float sx = static_cast<float>(hx) + 0.5f + jx;
+            const float sy = static_cast<float>(hy) + 0.5f + jy;
+            const float sz = static_cast<float>(hz) + 0.5f + jz;
+            // Outward (from hit) + upward pop.
+            const float vx = jx * 2.0f + Frand(-2.0f, 2.0f);
+            const float vy = Frand(3.0f, 8.0f);
+            const float vz = jz * 2.0f + Frand(-2.0f, 2.0f);
+            const int id = physics.AddBox(sx, sy, sz, half, vx, vy, vz);
+            if (id >= 0) {
+                live_.push_back(Tracked{id, /*hasPrev=*/false, {}});
+            }
+        }
+    }
+
+    // Per-frame: cull dead bodies (clearing their last footprint), then for each
+    // live body clear its previous footprint and paint its current one.
+    void Update(vox::voxel::VoxelWorld& world, vox::physics::PhysicsWorld& physics,
+                vox::render::Renderer& renderer, float dt) {
+        // 1) Cull bodies that fell below the ground or aged out, clearing cells.
+        for (auto it = live_.begin(); it != live_.end();) {
+            it->age += dt;
+            const float y = physics.BodyPosY(it->id);
+            const bool dead = !std::isfinite(y) || y < kKillY || it->age > kTtlSeconds;
+            if (dead) {
+                if (it->hasPrev) ClearBox(world, renderer, it->prev);
+                physics.RemoveBody(it->id);
+                it = live_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // 2) Read live poses and re-insert each as a voxel cube.
+        physics.EnumerateBodies(states_);
+        // Map id -> pose for the survivors we track (EnumerateBodies returns ALL
+        // live bodies; here that's exactly our debris).
+        for (auto& t : live_) {
+            const vox::physics::BodyState* st = Find(states_, t.id);
+            if (!st) continue;  // removed underneath us; skip
+            const Aabb cur = CubeAabb(st->px, st->py, st->pz);
+            // Clear the previous footprint cells that are NOT also covered by the
+            // new one (overlap is overwritten by the paint step anyway).
+            if (t.hasPrev) ClearBoxExcept(world, renderer, t.prev, cur);
+            PaintBox(renderer, cur);
+            t.prev = cur;
+            t.hasPrev = true;
+        }
+    }
+
+    // Clear every debris cell (e.g. on world clear/reload) and forget bodies.
+    void ClearAll(vox::voxel::VoxelWorld& world, vox::physics::PhysicsWorld& physics,
+                  vox::render::Renderer& renderer) {
+        for (auto& t : live_)
+            if (t.hasPrev) ClearBox(world, renderer, t.prev);
+        physics.ClearDynamics();
+        live_.clear();
+    }
+
+    bool Empty() const { return live_.empty(); }
+
+private:
+    static constexpr int   kCubeVox    = 2;       // debris cube edge in voxels
+    static constexpr float kKillY      = -2.0f;   // cull below this world Y
+    static constexpr float kTtlSeconds = 12.0f;   // max debris lifetime
+
+    struct Aabb { int x0, y0, z0, x1, y1, z1; };  // exclusive max
+    struct Tracked { int id; bool hasPrev; Aabb prev; float age = 0.0f; };
+
+    std::uint8_t debrisMat_ = 0;
+    std::vector<Tracked> live_;
+    std::vector<vox::physics::BodyState> states_;
+    std::mt19937 rng_{0xC0FFEEu};
+
+    float Frand(float lo, float hi) {
+        std::uniform_real_distribution<float> d(lo, hi);
+        return d(rng_);
+    }
+
+    static const vox::physics::BodyState* Find(
+        const std::vector<vox::physics::BodyState>& v, int id) {
+        for (const auto& s : v) if (s.id == id) return &s;
+        return nullptr;
+    }
+
+    // Grid AABB (clamped to the world) covering a cube centered at (cx,cy,cz).
+    static Aabb CubeAabb(float cx, float cy, float cz) {
+        const int G = static_cast<int>(vox::voxel::kWorldDim);
+        const int ix = static_cast<int>(std::floor(cx));
+        const int iy = static_cast<int>(std::floor(cy));
+        const int iz = static_cast<int>(std::floor(cz));
+        const int h0 = kCubeVox / 2;
+        const int h1 = kCubeVox - h0;  // covers even edge lengths symmetrically
+        Aabb a{ix - h0, iy - h0, iz - h0, ix + h1, iy + h1, iz + h1};
+        a.x0 = std::clamp(a.x0, 0, G); a.y0 = std::clamp(a.y0, 0, G); a.z0 = std::clamp(a.z0, 0, G);
+        a.x1 = std::clamp(a.x1, 0, G); a.y1 = std::clamp(a.y1, 0, G); a.z1 = std::clamp(a.z1, 0, G);
+        return a;
+    }
+    static bool EmptyBox(const Aabb& a) { return a.x0 >= a.x1 || a.y0 >= a.y1 || a.z0 >= a.z1; }
+
+    // Paint the cube's cells with the debris material.
+    void PaintBox(vox::render::Renderer& renderer, const Aabb& a) {
+        if (EmptyBox(a)) return;
+        BuildRegion(a, /*fillTerrain=*/false, nullptr);
+        renderer.EditVoxels(a.x0, a.y0, a.z0, a.x1, a.y1, a.z1, region_.data(), nullptr);
+    }
+    // Clear the cube's cells back to the authoritative terrain (usually air).
+    void ClearBox(vox::voxel::VoxelWorld& world, vox::render::Renderer& renderer, const Aabb& a) {
+        if (EmptyBox(a)) return;
+        BuildRegion(a, /*fillTerrain=*/true, &world);
+        renderer.EditVoxels(a.x0, a.y0, a.z0, a.x1, a.y1, a.z1, region_.data(), nullptr);
+    }
+    // Clear `a`'s cells that are NOT inside `keep` (overlap is repainted later).
+    void ClearBoxExcept(vox::voxel::VoxelWorld& world, vox::render::Renderer& renderer,
+                        const Aabb& a, const Aabb& keep) {
+        if (EmptyBox(a)) return;
+        region_.clear();
+        region_.reserve(static_cast<std::size_t>(a.x1 - a.x0) * (a.y1 - a.y0) * (a.z1 - a.z0));
+        for (int z = a.z0; z < a.z1; ++z)
+            for (int y = a.y0; y < a.y1; ++y)
+                for (int x = a.x0; x < a.x1; ++x) {
+                    const bool inKeep = x >= keep.x0 && x < keep.x1 && y >= keep.y0 &&
+                                        y < keep.y1 && z >= keep.z0 && z < keep.z1;
+                    // Inside the kept (new) box: leave as debris (it will be
+                    // repainted this frame). Otherwise restore terrain.
+                    region_.push_back(inKeep ? static_cast<std::uint32_t>(debrisMat_)
+                                             : static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
+                }
+        renderer.EditVoxels(a.x0, a.y0, a.z0, a.x1, a.y1, a.z1, region_.data(), nullptr);
+    }
+
+    // Fill region_ for box `a`. fillTerrain=true -> world terrain (clear path);
+    // false -> solid debris material (paint path).
+    void BuildRegion(const Aabb& a, bool fillTerrain, vox::voxel::VoxelWorld* world) {
+        region_.clear();
+        region_.reserve(static_cast<std::size_t>(a.x1 - a.x0) * (a.y1 - a.y0) * (a.z1 - a.z0));
+        for (int z = a.z0; z < a.z1; ++z)
+            for (int y = a.y0; y < a.y1; ++y)
+                for (int x = a.x0; x < a.x1; ++x)
+                    region_.push_back(fillTerrain ? static_cast<std::uint32_t>(world->GetVoxel(x, y, z))
+                                                  : static_cast<std::uint32_t>(debrisMat_));
+    }
+
+    std::vector<std::uint32_t> region_;
+};
+#endif  // VOX_HAVE_PHYSX
 
 void Usage() {
     vox::log::Info("Voxhammer {} -- standalone DX12 voxel-destruction engine", VOX_VERSION_STRING);
@@ -427,6 +606,32 @@ int main(int argc, char** argv) {
         vox::log::Info("voxel: generated destructible demo scene ({} voxels, {} chunks)", vs.voxelCount, world.ResidentChunks());
     }
 
+    // PhysX rigid-body world (PASS 2). Behind VOX_HAVE_PHYSX -> a logging stub
+    // when the SDK is off, so the default build is byte-for-byte unchanged.
+    vox::physics::PhysicsWorld physics;
+    physics.Init();
+    physics.AddGroundPlane();  // y = 0 floor for carve debris to land on
+
+#if defined(VOX_HAVE_PHYSX)
+    // Pin a debris material in a slot that is FREE in the live render palette
+    // (scan high->low for an empty entry; fall back to 255). Mirror it into both
+    // the world palette (so later place/clear/drop re-pushes keep debris colored)
+    // and a mutable copy of the initial palette handed to the renderer, so the
+    // debris color is present from frame 0 regardless of which palette is active.
+    vox::voxel::VoxPalette livePalette{};
+    if (palettePtr) std::memcpy(livePalette.data(), palettePtr, livePalette.size() * sizeof(std::uint32_t));
+    std::uint8_t debrisMat = 255;
+    for (int i = 255; i >= 1; --i) {
+        if (livePalette[static_cast<std::size_t>(i)] == 0u) { debrisMat = static_cast<std::uint8_t>(i); break; }
+    }
+    constexpr std::uint32_t kDebrisColor = 0x00404C66u;  // warm grey-orange rubble (RGBA8, alpha 0)
+    livePalette[debrisMat] = kDebrisColor;
+    world.SetPaletteColor(debrisMat, kDebrisColor);
+    palettePtr = livePalette.data();  // renderer.Init copies this; debris color included
+    DebrisField debris;
+    debris.Init(debrisMat);
+#endif
+
     // Window + DX12 + key dispatch.
     pf::Window window;
     vox::render::Renderer renderer;
@@ -481,7 +686,12 @@ int main(int argc, char** argv) {
 
         c.RegisterCommand("voxel.clear",
             "Clear all voxels from the world.",
+#if defined(VOX_HAVE_PHYSX)
+            [&world, &renderer, &voxLoaded, &physics, &debris](std::span<const std::string_view>, Output& o) {
+                debris.ClearAll(world, physics, renderer);  // drop debris bodies + their cells first
+#else
             [&world, &renderer, &voxLoaded](std::span<const std::string_view>, Output& o) {
+#endif
                 world.Clear();
                 voxLoaded = false;
                 auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
@@ -493,7 +703,11 @@ int main(int argc, char** argv) {
         // a sphere (voxel.break_radius) out of the first solid voxel that's hit.
         c.RegisterCommand("voxel.break",
             "Carve a sphere (voxel.break_radius) out of the voxel the camera looks at.",
+#if defined(VOX_HAVE_PHYSX)
+            [&world, &renderer, &physics, &debris](std::span<const std::string_view>, Output& o) {
+#else
             [&world, &renderer](std::span<const std::string_view>, Output& o) {
+#endif
                 Console& cc = Console::Get();
                 float pos[3] = {0.0f, 0.0f, 0.0f};
                 if (CVar* cp = cc.FindCVar("camera.pos")) ParseRGB(cp->value, pos[0], pos[1], pos[2]);
@@ -527,6 +741,11 @@ int main(int argc, char** argv) {
                         for (int x = x0; x < x1; ++x)
                             region.push_back(static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
                 renderer.EditVoxels(x0, y0, z0, x1, y1, z1, region.data(), nullptr);  // palette unchanged by carve
+#if defined(VOX_HAVE_PHYSX)
+                // Spawn a small burst of dynamic rigid-body debris at the hit; the
+                // run loop re-inserts each as a chunky voxel cube every frame.
+                debris.Spawn(physics, hx, hy, hz, radius);
+#endif
                 o.Format("voxel.break: removed {} voxels around hit ({},{},{}) r={}",
                          removed, hx, hy, hz, radius);
             });
@@ -658,6 +877,18 @@ int main(int argc, char** argv) {
 
         ecs.Step(dt);  // advance ECS systems (kinematics + lifetimes)
 
+        // PhysX rigid-body step (no-op stub when VOX_HAVE_PHYSX is off). Honor
+        // debug.pause_simulation so the debris freezes when the sim is paused.
+        if (!console.FindCVar("debug.pause_simulation")->GetBool()) {
+            physics.Step(dt);
+#if defined(VOX_HAVE_PHYSX)
+            // Re-insert live debris bodies into the GPU voxel grid (clear last
+            // frame's cells, paint this frame's) -- only when the renderer is up.
+            if (renderer.Valid() && (!debris.Empty()))
+                debris.Update(world, physics, renderer, dt);
+#endif
+        }
+
         if (renderer.Valid()) {
             vox::render::FrameParams fp;
             ParseRGB(console.FindCVar("renderer.debug.clear_color")->value, fp.clear[0], fp.clear[1], fp.clear[2]);
@@ -700,8 +931,8 @@ int main(int argc, char** argv) {
             float fps = dt > 0.0f ? 1.0f / dt : 0.0f;
             bool paused = console.FindCVar("debug.pause_simulation")->GetBool();
             std::string data = fmt::format(
-                R"({{"fps":{:.1f},"frame_ms":{:.2f},"gpu_mem_mb":0,"gpu_budget_mb":16384,"chunks":{},"islands":0,"archetypes":{},"denoiser_ms":0,"upscaler_ms":0,"paused":{}}})",
-                fps, dt * 1000.0f, world.ResidentChunks(), ecs.EntityCount(), paused ? "true" : "false");
+                R"({{"fps":{:.1f},"frame_ms":{:.2f},"gpu_mem_mb":0,"gpu_budget_mb":16384,"chunks":{},"islands":{},"archetypes":{},"denoiser_ms":0,"upscaler_ms":0,"paused":{}}})",
+                fps, dt * 1000.0f, world.ResidentChunks(), physics.ActiveIslands(), ecs.EntityCount(), paused ? "true" : "false");
             server.BroadcastEvent("frame_stats", data);
         }
 
@@ -715,6 +946,7 @@ int main(int argc, char** argv) {
     if (hasWindow) window.Destroy();
     scripts.Shutdown();
     ecs.Shutdown();
+    physics.Shutdown();  // releases PhysX scene/actors (no-op stub when off)
     world.Shutdown();
     jobs.Shutdown();
     server.Stop();

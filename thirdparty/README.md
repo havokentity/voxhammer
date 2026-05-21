@@ -89,16 +89,23 @@ MSVC 19.50 toolchain here). Run from a VS x64 dev shell with CMake + Ninja on
 `PATH`. `NV_USE_STATIC_WINCRT=OFF` + `NV_USE_DEBUG_WINCRT=ON` ⇒ `/MDd`, matching
 the engine's `windows-debug` preset (CRT mismatch would break linking).
 
-```bat
+**Pass `PHYSX_ROOT` with FORWARD slashes.** PhysX's CMake stores the root dir
+verbatim into a cached string; CMake 4.2 (the VS "18" bundle here) rejects the
+backslash form with `Invalid character escape '\M'` while *detecting the
+compiler ABI* (the `\M` of `...\MyRepos\...` is read as an escape). Older CMake
+tolerated it. Use `/`-separated paths and configure succeeds. (PowerShell shown;
+in `cmd.exe` substitute `%CD%`-style vars but still write the value with `/`.)
+
+```powershell
 cd thirdparty
-set PHYSX_ROOT=%CD%\physx\physx
-cmake -S "%PHYSX_ROOT%\compiler\public" -B physx_build -G "Ninja Multi-Config" ^
-  -DTARGET_BUILD_PLATFORM=windows -DPX_OUTPUT_ARCH=x86 ^
-  -DPHYSX_ROOT_DIR="%PHYSX_ROOT%" ^
-  -DPX_OUTPUT_LIB_DIR="%PHYSX_ROOT%" -DPX_OUTPUT_BIN_DIR="%PHYSX_ROOT%" ^
-  -DNV_USE_STATIC_WINCRT=OFF -DNV_USE_DEBUG_WINCRT=ON ^
-  -DPX_GENERATE_STATIC_LIBRARIES=TRUE ^
-  -DPX_BUILDSNIPPETS=FALSE -DPX_BUILDPVDRUNTIME=FALSE ^
+$physxRoot = "$($PWD -replace '\\','/')/physx/physx"   # forward slashes!
+cmake -S "$physxRoot/compiler/public" -B physx_build -G "Ninja Multi-Config" `
+  -DTARGET_BUILD_PLATFORM=windows -DPX_OUTPUT_ARCH=x86 `
+  -DPHYSX_ROOT_DIR="$physxRoot" `
+  -DPX_OUTPUT_LIB_DIR="$physxRoot" -DPX_OUTPUT_BIN_DIR="$physxRoot" `
+  -DNV_USE_STATIC_WINCRT=OFF -DNV_USE_DEBUG_WINCRT=ON `
+  -DPX_GENERATE_STATIC_LIBRARIES=TRUE `
+  -DPX_BUILDSNIPPETS=FALSE -DPX_BUILDPVDRUNTIME=FALSE `
   -DPX_CMAKE_SUPPRESS_REGENERATION=ON --no-warn-unused-cli
 cmake --build physx_build --config debug
 ```

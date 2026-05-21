@@ -2,7 +2,19 @@
 // Copyright (c) 2026 Rajesh D'Monte
 #pragma once
 
+#include <vector>
+
 namespace vox::physics {
+
+// World-space pose of a live dynamic body, returned by EnumerateBodies(). The
+// id is the dense AddDynamicBox() / AddBox() index, stable for the body's
+// lifetime; px/py/pz is its current center of mass in world units. Rotation is
+// intentionally omitted -- the voxel-debris renderer snaps chunky cubes to the
+// grid and ignores orientation.
+struct BodyState {
+    int   id = -1;
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+};
 
 // NVIDIA PhysX 5 wrapper: rigid bodies, articulations, vehicles, FEM soft
 // bodies, cloth, fluids. GPU rigid bodies on NVIDIA (10K+ islands), CPU path
@@ -36,6 +48,35 @@ public:
     // World-space Y of dynamic box `idx` (as returned by AddDynamicBox). NaN in
     // the stub build or for an out-of-range index.
     float BodyY(int idx) const;
+
+    // --- Debris-on-carve helpers (PASS 2) ----------------------------------
+
+    // Add a dynamic cube of half-extent `half` (so edge = 2*half) at (x,y,z)
+    // with initial linear velocity (vx,vy,vz). Returns a dense body id (stable
+    // for the body's lifetime, reused after RemoveBody compacts the slot list)
+    // or -1 in the stub build / on failure. Used to spawn carve debris.
+    int AddBox(float x, float y, float z, float half, float vx, float vy, float vz);
+
+    // Append the current world pose of every live dynamic body to |out|
+    // (cleared first). Empty in the stub build. The renderer uses each body's
+    // position to stamp a voxel cube into the grid every frame.
+    void EnumerateBodies(std::vector<BodyState>& out) const;
+
+    // World-space Y of the body whose id is `id` (added via AddBox/AddDynamicBox),
+    // or NaN if it is not a live id. Lets the caller cull debris that fell below
+    // the ground.
+    float BodyPosY(int id) const;
+
+    // Remove (destroy) the dynamic body with id `id`. No-op for an unknown id or
+    // in the stub build. Other ids stay valid (the body's slot is tombstoned,
+    // not reindexed) so the caller's per-body bookkeeping is not invalidated.
+    void RemoveBody(int id);
+
+    // Destroy all dynamic bodies (debris), leaving the scene + ground intact.
+    void ClearDynamics();
+
+    // Number of live dynamic bodies (debris). 0 in the stub build.
+    unsigned BodyCount() const;
 
 private:
     // Opaque PIMPL so PhysX headers never leak into engine TUs that include

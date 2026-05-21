@@ -67,6 +67,38 @@ void VoxelWorld::Clear() {
     paletteUsed_ = 1;  // index 0 is reserved empty/air
 }
 
+std::uint8_t VoxelWorld::AddPaletteColor(std::uint32_t rgba) {
+    // Reuse an exact match in [1 .. paletteUsed_-1].
+    for (unsigned i = 1; i < paletteUsed_; ++i) {
+        if (palette_[i] == rgba) {
+            return static_cast<std::uint8_t>(i);
+        }
+    }
+    if (paletteUsed_ < 256) {
+        const std::uint8_t idx = static_cast<std::uint8_t>(paletteUsed_);
+        palette_[paletteUsed_++] = rgba;
+        return idx;
+    }
+    // Palette full: nearest existing color (Euclidean in RGB), matching StampVox.
+    auto r8 = [](std::uint32_t c) { return static_cast<int>( c        & 0xFF); };
+    auto g8 = [](std::uint32_t c) { return static_cast<int>((c >>  8) & 0xFF); };
+    auto b8 = [](std::uint32_t c) { return static_cast<int>((c >> 16) & 0xFF); };
+    const int rr = r8(rgba), rg = g8(rgba), rb = b8(rgba);
+    unsigned bestDist = UINT_MAX, bestIdx = 1;
+    for (unsigned i = 1; i < 256; ++i) {
+        const int dr = r8(palette_[i]) - rr, dg = g8(palette_[i]) - rg, db = b8(palette_[i]) - rb;
+        const unsigned d = static_cast<unsigned>(dr * dr + dg * dg + db * db);
+        if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    return static_cast<std::uint8_t>(bestIdx);
+}
+
+void VoxelWorld::SetPaletteColor(std::uint8_t idx, std::uint32_t rgba) {
+    if (idx == 0) return;  // index 0 is reserved air
+    palette_[idx] = rgba;
+    if (idx >= paletteUsed_) paletteUsed_ = idx + 1u;  // don't reuse this slot
+}
+
 void VoxelWorld::StampVox(const VoxelWorld& srcWorld, const VoxPalette& srcPalette,
                            int ox, int oy, int oz) {
     const int kMaxCoord = static_cast<int>(vox::voxel::kWorldDim);  // renderer grid; clip outside [0,kWorldDim)

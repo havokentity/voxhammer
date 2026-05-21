@@ -107,6 +107,19 @@ public:
     // Access the merged global palette (256 RGBA8 entries; index 0 = empty).
     const VoxPalette& Palette() const { return palette_; }
 
+    // Register an RGBA8 color in the merged palette and return its material
+    // index (1..255). Returns the existing index if the exact color is already
+    // present; allocates a new slot otherwise. If the palette is full it returns
+    // the nearest existing color's index. Used to reserve a stable material id
+    // for overlay content (e.g. physics debris cubes) without stamping voxels.
+    std::uint8_t AddPaletteColor(std::uint32_t rgba);
+
+    // Write |rgba| into palette slot |idx| (1..255) directly, bumping the
+    // next-free watermark past it so later StampVox/AddPaletteColor allocations
+    // do not reuse the slot. Used to pin an overlay material (debris) at a slot
+    // chosen to be free in the live render palette.
+    void SetPaletteColor(std::uint8_t idx, std::uint32_t rgba);
+
     // Produce the flat uint32 grid that the DX12 renderer reads via StructuredBuffer<uint>.
     // Encoding (matches Renderer.cpp GenerateScene / HLSL PSMain):
     //   index = z * dim * dim + y * dim + x

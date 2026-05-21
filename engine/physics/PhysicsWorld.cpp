@@ -39,10 +39,17 @@ struct PhysicsWorld::Impl {
     PxScene* scene = nullptr;
     PxMaterial* material = nullptr;
 
-    // Dense list of dynamic bodies in creation order; index == AddDynamicBox()
-    // return value. Owned by the scene (released via scene teardown), but we
-    // keep raw pointers to read their transforms back.
-    std::vector<PxRigidDynamic*> dynamics;
+    // Dense list of dynamic bodies in creation order; index == AddDynamicBox() /
+    // AddBox() return value (the id). Bodies are owned by the scene; we keep raw
+    // pointers to read transforms back. RemoveBody() tombstones a slot (releases
+    // the actor and nulls the pointer) WITHOUT reindexing, so previously handed
+    // out ids stay valid for the caller's per-body bookkeeping. `half` is the
+    // box half-extent so the voxel renderer can size each debris cube.
+    struct Body {
+        PxRigidDynamic* actor = nullptr;
+        float half = kBoxHalfExtent;
+    };
+    std::vector<Body> dynamics;
 
     float accumulator = 0.0f;
 };
@@ -193,7 +200,7 @@ int PhysicsWorld::AddDynamicBox(float x, float y, float z) {
     impl_->scene->addActor(*body);
 
     const int idx = static_cast<int>(impl_->dynamics.size());
-    impl_->dynamics.push_back(body);
+    impl_->dynamics.push_back({body, kBoxHalfExtent});
     return idx;
 }
 
@@ -201,11 +208,107 @@ float PhysicsWorld::BodyY(int idx) const {
     if (!impl_ || idx < 0 || idx >= static_cast<int>(impl_->dynamics.size())) {
         return std::nanf("");
     }
-    PxRigidDynamic* body = impl_->dynamics[static_cast<std::size_t>(idx)];
+    PxRigidDynamic* body = impl_->dynamics[static_cast<std::size_t>(idx)].actor;
     if (!body) {
         return std::nanf("");
     }
     return body->getGlobalPose().p.y;
+}
+
+// --- Debris-on-carve helpers (PASS 2) --------------------------------------
+
+int PhysicsWorld::AddBox(float x, float y, float z, float half, float vx, float vy,
+                         float vz) {
+    if (!impl_ || !impl_->scene || !impl_->physics || !impl_->material) {
+        return -1;
+    }
+    if (half <= 0.0f) {
+        half = kBoxHalfExtent;
+    }
+    PxRigidDynamic* body = impl_->physics->createRigidDynamic(PxTransform(PxVec3(x, y, z)));
+    if (!body) {
+        return -1;
+    }
+    PxBoxGeometry box(half, half, half);
+    PxShape* shape = impl_->physics->createShape(box, *impl_->material);
+    if (shape) {
+        body->attachShape(*shape);
+        shape->release();  // body retains a reference
+    }
+    PxRigidBodyExt::updateMassAndInertia(*body, 10.0f);  // density 10
+    body->setLinearVelocity(PxVec3(vx, vy, vz));
+    // A little spin makes the chunky debris read as tumbling even though the
+    // voxel renderer ignores orientation -- cheap and harmless.
+    body->setAngularVelocity(PxVec3(vy * 0.5f, vx * 0.5f, vz * 0.5f));
+    impl_->scene->addActor(*body);
+
+    const int idx = static_cast<int>(impl_->dynamics.size());
+    impl_->dynamics.push_back({body, half});
+    return idx;
+}
+
+void PhysicsWorld::EnumerateBodies(std::vector<BodyState>& out) const {
+    out.clear();
+    if (!impl_) {
+        return;
+    }
+    out.reserve(impl_->dynamics.size());
+    for (std::size_t i = 0; i < impl_->dynamics.size(); ++i) {
+        PxRigidDynamic* body = impl_->dynamics[i].actor;
+        if (!body) {
+            continue;  // tombstoned slot
+        }
+        const PxVec3 p = body->getGlobalPose().p;
+        out.push_back(BodyState{static_cast<int>(i), p.x, p.y, p.z});
+    }
+}
+
+float PhysicsWorld::BodyPosY(int id) const {
+    return BodyY(id);  // same dense-index lookup
+}
+
+void PhysicsWorld::RemoveBody(int id) {
+    if (!impl_ || id < 0 || id >= static_cast<int>(impl_->dynamics.size())) {
+        return;
+    }
+    PxRigidDynamic*& body = impl_->dynamics[static_cast<std::size_t>(id)].actor;
+    if (!body) {
+        return;  // already removed
+    }
+    if (impl_->scene) {
+        impl_->scene->removeActor(*body);
+    }
+    body->release();
+    body = nullptr;  // tombstone: keep the slot so other ids stay stable
+}
+
+void PhysicsWorld::ClearDynamics() {
+    if (!impl_) {
+        return;
+    }
+    for (auto& b : impl_->dynamics) {
+        if (b.actor) {
+            if (impl_->scene) {
+                impl_->scene->removeActor(*b.actor);
+            }
+            b.actor->release();
+            b.actor = nullptr;
+        }
+    }
+    impl_->dynamics.clear();
+}
+
+unsigned PhysicsWorld::BodyCount() const {
+    if (!impl_) {
+        return 0;
+    }
+    unsigned n = 0;
+    for (const auto& b : impl_->dynamics) {
+        if (b.actor) {
+            ++n;
+        }
+    }
+    return n;
 }
 
 }  // namespace vox::physics
@@ -236,6 +339,22 @@ float PhysicsWorld::BodyY(int idx) const {
     (void)idx;
     return std::nanf("");
 }
+
+// Debris-on-carve API (PASS 2) -- stubbed identically so the public surface is
+// the same in both builds; a future un-gated caller links cleanly here too.
+int PhysicsWorld::AddBox(float x, float y, float z, float half, float vx, float vy,
+                         float vz) {
+    (void)x; (void)y; (void)z; (void)half; (void)vx; (void)vy; (void)vz;
+    return -1;
+}
+void PhysicsWorld::EnumerateBodies(std::vector<BodyState>& out) const { out.clear(); }
+float PhysicsWorld::BodyPosY(int id) const {
+    (void)id;
+    return std::nanf("");
+}
+void PhysicsWorld::RemoveBody(int id) { (void)id; }
+void PhysicsWorld::ClearDynamics() {}
+unsigned PhysicsWorld::BodyCount() const { return 0; }
 
 }  // namespace vox::physics
 
