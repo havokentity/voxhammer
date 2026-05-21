@@ -835,6 +835,18 @@ Texture2D<float4> Indirect : register(t0);   // DEMODULATED indirect (source pin
 Texture2D<float4> GBuf     : register(t1);   // normal.xyz + linear depth.w
 Texture2D<float4> VarianceT: register(t2);   // .x = temporal luminance variance, .y = history count
 
+// SVGF temporal COLOUR feedback (classic 1st-iteration recirculation). On a-trous
+// iteration 0 ONLY we overwrite the temporal history that PSShade reprojects next
+// frame (the SAME physical buffer SHADE wrote this frame as Accum/u0) with the
+// FILTERED indirect instead of the raw pre-filter accumulator. This keeps the
+// reprojected history LOW-VARIANCE so a noisy new sample shifts the running mean far
+// less -> dark/shadow flicker is removed, while the mean still converges correctly.
+// The per-pixel sample count (n+1) is preserved verbatim from VarianceT.y (which
+// SHADE wrote alongside the colour) so PSShade's (hist*n + new)/(n+1) is unchanged.
+// Same indexing as Accum in kShader: pix = row * awidth + col. Iterations > 0 never
+// touch this buffer. Mode 0 (single pass) never runs this pass, so it is unaffected.
+RWStructuredBuffer<float4> Accum : register(u0);  // temporal indirect history (write iter-0 feedback)
+
 float lumOf(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
 // 3x3 luminance variance of the demodulated indirect around pixel p (used as the
@@ -926,6 +938,20 @@ float4 PSAtrous(VSOut i) : SV_Target {
         }
     }
     float3 outc = (wsum > 1e-8) ? (sum / wsum) : cInd.rgb;
+
+    // SVGF colour feedback: on the FIRST a-trous iteration recirculate the filtered
+    // result into the temporal history PSShade reprojects next frame (NOT the final,
+    // wide-blur output -- the 1st iteration is denoised enough to stabilise temporally
+    // without leaking spatial blur into the temporal signal). Preserve the count from
+    // VarianceT.y (the n+1 SHADE stored), so the running mean keeps converging. Both
+    // ATROUS (svgf==0) and SVGF (svgf==1) feed back identically. A UAV barrier in
+    // RenderFrame orders this write after SHADE's Accum write to the same buffer.
+    [branch] if (atrousIter == 0) {
+        uint pix = (uint)p.y * (uint)awidth + (uint)p.x;
+        float count = VarianceT.Load(int3(p, 0)).y;   // history sample count (n+1) from SHADE
+        Accum[pix] = float4(outc, count);
+    }
+
     return float4(outc, cInd.a);   // carry the centre sample count in .a (unused downstream)
 }
 )HLSL"
@@ -1347,14 +1373,19 @@ bool Renderer::Impl::InitDenoiser(const char* kVox, const char* kDenoise) {
     }
 
     // ===================== a-trous pass =====================
-    // Root sig: b0 = 8 root 32-bit constants (per-iteration params), then three
-    // single-SRV descriptor tables for t0 (indirect src), t1 (gbuf), t2 (variance).
+    // Root sig: b0 = 8 root 32-bit constants (per-iteration params), three single-SRV
+    // descriptor tables for t0 (indirect src), t1 (gbuf), t2 (variance), and a root UAV
+    // u0 (Accum) for the SVGF 1st-iteration COLOUR FEEDBACK. PSAtrous writes Accum on
+    // iteration 0 only (recirculating the filtered indirect into the temporal history
+    // PSShade reprojects next frame); other iterations leave it untouched. Bound to the
+    // SAME accumBuf SHADE wrote this frame, so the filtered result becomes next frame's
+    // PrevAccum. A root UAV needs no descriptor-heap slot (raw GPU VA, like SHADE's u0).
     {
         D3D12_DESCRIPTOR_RANGE r0{}, r1{}, r2{};
         r0.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r0.NumDescriptors = 1; r0.BaseShaderRegister = 0;
         r1.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r1.NumDescriptors = 1; r1.BaseShaderRegister = 1;
         r2.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r2.NumDescriptors = 1; r2.BaseShaderRegister = 2;
-        D3D12_ROOT_PARAMETER rp[4]{};
+        D3D12_ROOT_PARAMETER rp[5]{};
         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rp[0].Constants.ShaderRegister = 0; rp[0].Constants.Num32BitValues = 8;
         rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -1363,9 +1394,11 @@ bool Renderer::Impl::InitDenoiser(const char* kVox, const char* kDenoise) {
         rp[2].DescriptorTable.NumDescriptorRanges = 1; rp[2].DescriptorTable.pDescriptorRanges = &r1;
         rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         rp[3].DescriptorTable.NumDescriptorRanges = 1; rp[3].DescriptorTable.pDescriptorRanges = &r2;
+        rp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        rp[4].Descriptor.ShaderRegister = 0;  // u0 Accum (iter-0 colour feedback)
         for (auto& p : rp) p.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rs{};
-        rs.NumParameters = 4; rs.pParameters = rp;
+        rs.NumParameters = 5; rs.pParameters = rp;
         ComPtr<ID3DBlob> blob, err;
         if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) {
             vox::log::Error("DX12: a-trous root sig: {}", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
@@ -2143,6 +2176,18 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         // gbuf + variance are read every iteration; transition them to PSR once.
         toState(4, kPSR);  // gbuf
         toState(5, kPSR);  // variance
+        // SVGF colour feedback ordering: SHADE wrote accumBuf[curBuf] (u0) above and
+        // a-trous iteration 0 OVERWRITES the same buffer (the filtered indirect) via its
+        // own u0. A UAV barrier makes iter-0's write strictly ordered AFTER SHADE's so
+        // the filtered value -- not a late SHADE write -- becomes next frame's PrevAccum.
+        // Iterations > 0 don't touch Accum, so one barrier here suffices. The buffer
+        // stays in UNORDERED_ACCESS the whole time (no state transition needed).
+        {
+            D3D12_RESOURCE_BARRIER ub{};
+            ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            ub.UAV.pResource = d.accumBuf[curBuf].Get();
+            d.list->ResourceBarrier(1, &ub);
+        }
         const int iters = std::max(1, std::min(fp.gi_atrous_iters, 6));
         UINT srcT = 0;     // SHADE wrote indirect[0]
         for (int it = 0; it < iters; ++it) {
@@ -2163,6 +2208,10 @@ void Renderer::RenderFrame(const FrameParams& fp) {
             d.list->SetGraphicsRootDescriptorTable(1, d.SrvGpu(srcSlot));  // t0 indirect src
             d.list->SetGraphicsRootDescriptorTable(2, d.SrvGpu(4));        // t1 gbuf
             d.list->SetGraphicsRootDescriptorTable(3, d.SrvGpu(5));        // t2 variance
+            // u0 Accum: the SVGF colour-feedback target (same buffer SHADE wrote, i.e.
+            // next frame's PrevAccum). Bound every iteration; PSAtrous only WRITES it
+            // when atrousIter == 0, so iters > 0 leave the history untouched.
+            d.list->SetGraphicsRootUnorderedAccessView(4, d.accumBuf[curBuf]->GetGPUVirtualAddress());
             d.list->DrawInstanced(3, 1, 0, 0);
             srcT = dstT;   // dst becomes next source
         }
