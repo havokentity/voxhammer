@@ -658,6 +658,18 @@ R"HLSL(
 RWStructuredBuffer<float4> Moments     : register(u4);  // CURRENT luminance moments + count
 RWStructuredBuffer<float4> PrevMoments : register(u5);  // PREVIOUS-frame moments (read-only this frame)
 
+// DIRECT-term temporal buffers (PING-PONG, same indexing/reproject as Accum):
+//   DirectAccum     = CURRENT frame's accumulated direct (sun*albedo + emissive) written this frame (u6).
+//   PrevDirectAccum = PREVIOUS frame's accumulated direct read for temporal reprojection (u7).
+// .rgb = running-average direct radiance; .a unused (count tracked by Accum/Moments).
+// The DIRECT sun term is a single jittered soft-shadow ray per frame (penumbra jitter
+// via sampleXi), so in QUALITY denoiser modes it is NOISY without accumulation. Mirror
+// the indirect's temporal EMA -- REUSING the SAME reproject srcPix + sample count n --
+// so the frac-advanced soft-shadow samples converge. The direct is NOT a-trous filtered
+// (sharp shadow edges must not blur); temporal accumulation alone converges it.
+RWStructuredBuffer<float4> DirectAccum     : register(u6);  // CURRENT direct accumulation: rgb (.a unused)
+RWStructuredBuffer<float4> PrevDirectAccum : register(u7);  // PREVIOUS-frame direct accumulation (read-only this frame)
+
 // MRT outputs of the offscreen SHADE pass (all RGBA16F full-res), consumed by the
 // a-trous + composite passes. INDIRECT is DEMODULATED (no primary albedo) so the
 // spatial filter never bleeds across albedo edges; albedo is re-applied at composite.
@@ -749,17 +761,28 @@ ShadeOut PSShade(VSOut i) {
     float  m2    = (pm.y * n + lum * lum)  / (n + 1.0);
     float  tvar  = max(m2 - m1 * m1, 0.0);   // temporal luminance variance (>=0)
 
-    Accum[pix]   = float4(indAvg, n + 1.0);
-    HitPos[pix]  = float4(hp, primHit ? 1.0 : 0.0);
-    Moments[pix] = float4(m1, m2, n + 1.0, 0.0);
+    // Temporal accumulation of the DIRECT term (sun*albedo + self-emission). The
+    // soft-shadow sun ray is jittered fresh each frame (sampleXi penumbra), so a single
+    // frame is noisy in penumbrae; accumulate it EXACTLY like the indirect, REUSING the
+    // SAME reproject srcPix + sample count n (same primary world point, same disocclusion
+    // test -- do NOT recompute a second reproject). The emissive self-glow is constant
+    // per pixel, so folding it into the accumulated value is harmless. NOT a-trous
+    // filtered downstream (sharp shadow edges); temporal EMA alone converges the penumbra.
+    float3 emit = primHit ? (alb * emission(mat) * emissiveSurface) : float3(0, 0, 0);
+    float3 dcur   = direct * alb + emit;                          // this frame's direct (albedo-modulated) + self-emission
+    float3 dirAvg = (PrevDirectAccum[srcPix].rgb * n + dcur) / (n + 1.0);  // n==0 (fresh/disocclusion) => dirAvg == dcur (no stale read)
+
+    Accum[pix]       = float4(indAvg, n + 1.0);
+    HitPos[pix]      = float4(hp, primHit ? 1.0 : 0.0);
+    Moments[pix]     = float4(m1, m2, n + 1.0, 0.0);
+    DirectAccum[pix] = float4(dirAvg, n + 1.0);                   // ping-pong: write current frame's accumulated direct
 
     // Write the G-buffer targets. The composite reconstructs colour as
-    // DIRECT + ALBEDO * filtered(INDIRECT) + ALBEDO*self-emission. Fold the
-    // primary self-emission (scaled by emissiveSurface) into DIRECT so it is not
-    // blurred and survives demodulation (it is not part of the indirect bounce).
-    float3 emit = primHit ? (alb * emission(mat) * emissiveSurface) : float3(0, 0, 0);
+    // DIRECT + ALBEDO * filtered(INDIRECT) + ALBEDO*self-emission. The accumulated
+    // (albedo-modulated, soft-shadow-converged) direct + folded self-emission goes to
+    // SV_Target1; it is not blurred and survives demodulation.
     o.indirect = float4(indAvg, n + 1.0);
-    o.direct   = float4(direct * alb + emit, 1.0);   // direct is albedo-modulated here (not blurred)
+    o.direct   = float4(dirAvg, 1.0);                             // temporally-accumulated direct (soft shadow converges)
     o.albedo   = float4(alb, 1.0);
     float linDepth = primHit ? length(hp - camPos) : 1e6;
     o.gbuffer  = float4(nrm, linDepth);
@@ -1088,6 +1111,10 @@ struct Renderer::Impl {
     // which physical buffer is "current". Both default-heap RWStructuredBuffer<float4>.
     ComPtr<ID3D12Resource>            accumBuf[2];    // [i]=GI running avg+count
     ComPtr<ID3D12Resource>            hitPosBuf[2];   // [i]=primary-hit world pos + valid flag
+    // DIRECT-term temporal accumulation -- PING-PONG pair mirroring accumBuf (multi-pass
+    // denoiser modes 1/2 only; SHADE's u6/u7). curr=write (u6 DirectAccum), prev=read
+    // (u7 PrevDirectAccum); swapped by accumPair each frame. RWStructuredBuffer<float4>.
+    ComPtr<ID3D12Resource>            directAccumBuf[2]; // [i]=accumulated direct (sun*alb + emissive)
     UINT                              accumPair = 0;  // index of the CURRENT buffer this frame
     ComPtr<ID3D12Resource>            blueNoiseBuf;   // 64x64 blue-noise tile (StructuredBuffer<float> t1)
     ComPtr<ID3D12Resource>            paletteBuf;     // 256-entry RGBA8 palette (StructuredBuffer<uint> t2)
@@ -1315,9 +1342,10 @@ bool Renderer::Impl::InitDenoiser(const char* kVox, const char* kDenoise) {
 
     // ===================== SHADE pass (MRT) =====================
     // Root sig = the mode-0 layout (b0; t0,t1,t2,t3; u0,u1,u2,u3) PLUS moment UAVs
-    // u4 (Moments) and u5 (PrevMoments). 11 root descriptors, all buffers.
+    // u4 (Moments) and u5 (PrevMoments) PLUS the DIRECT-term ping-pong u6 (DirectAccum)
+    // and u7 (PrevDirectAccum). 13 root descriptors, all buffers.
     {
-        D3D12_ROOT_PARAMETER rp[11]{};
+        D3D12_ROOT_PARAMETER rp[13]{};
         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; rp[0].Descriptor.ShaderRegister = 0;
         rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[1].Descriptor.ShaderRegister = 0;  // t0 Voxels
         rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[2].Descriptor.ShaderRegister = 0;  // u0 Accum
@@ -1329,9 +1357,11 @@ bool Renderer::Impl::InitDenoiser(const char* kVox, const char* kDenoise) {
         rp[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[8].Descriptor.ShaderRegister = 3;  // u3 PrevHitPos
         rp[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[9].Descriptor.ShaderRegister = 4;  // u4 Moments
         rp[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[10].Descriptor.ShaderRegister = 5; // u5 PrevMoments
+        rp[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[11].Descriptor.ShaderRegister = 6; // u6 DirectAccum
+        rp[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[12].Descriptor.ShaderRegister = 7; // u7 PrevDirectAccum
         for (auto& p : rp) p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC rs{};
-        rs.NumParameters = 11; rs.pParameters = rp;
+        rs.NumParameters = 13; rs.pParameters = rp;
         rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
         ComPtr<ID3DBlob> blob, err;
         if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) return false;
@@ -1660,9 +1690,10 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     {
         const UINT64 pixBytes = static_cast<UINT64>(d.width) * d.height * 16;  // float4 per pixel
         for (int i = 0; i < 2; ++i) {
-            d.accumBuf[i]  = d.MakeDefaultUAV(pixBytes);
-            d.hitPosBuf[i] = d.MakeDefaultUAV(pixBytes);
-            if (!d.accumBuf[i] || !d.hitPosBuf[i]) return false;
+            d.accumBuf[i]       = d.MakeDefaultUAV(pixBytes);
+            d.hitPosBuf[i]      = d.MakeDefaultUAV(pixBytes);
+            d.directAccumBuf[i] = d.MakeDefaultUAV(pixBytes);  // DIRECT-term ping-pong (multi-pass SHADE u6/u7)
+            if (!d.accumBuf[i] || !d.hitPosBuf[i] || !d.directAccumBuf[i]) return false;
         }
     }
 
@@ -2170,6 +2201,8 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         d.list->SetGraphicsRootUnorderedAccessView(8, d.hitPosBuf[prevBuf]->GetGPUVirtualAddress());  // u3 PrevHitPos
         d.list->SetGraphicsRootUnorderedAccessView(9, d.momentBuf[curBuf]->GetGPUVirtualAddress());   // u4 Moments
         d.list->SetGraphicsRootUnorderedAccessView(10, d.momentBuf[prevBuf]->GetGPUVirtualAddress()); // u5 PrevMoments
+        d.list->SetGraphicsRootUnorderedAccessView(11, d.directAccumBuf[curBuf]->GetGPUVirtualAddress());  // u6 DirectAccum (current, write)
+        d.list->SetGraphicsRootUnorderedAccessView(12, d.directAccumBuf[prevBuf]->GetGPUVirtualAddress()); // u7 PrevDirectAccum (previous, read)
         d.list->DrawInstanced(3, 1, 0, 0);
 
         // ---- 2) a-trous: edge-aware wavelet, ping-pong indirect[src]->indirect[dst] ----
@@ -2267,9 +2300,10 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     d.swap->Present(1, 0);
     d.WaitIdle();
 
-    // Flip the ping-pong: the Accum/HitPos (and Moments) written this frame become
-    // next frame's "previous" (the reprojection source). Only meaningful in QUALITY
-    // mode but harmless to flip always.
+    // Flip the ping-pong: the Accum/HitPos (and Moments + DirectAccum) written this frame
+    // become next frame's "previous" (the reprojection source). Only meaningful in QUALITY
+    // mode but harmless to flip always. WaitIdle above guarantees the GPU finished this
+    // frame's writes before the swap reuses those buffers as the read side next frame.
     d.accumPair ^= 1u;
 }
 
