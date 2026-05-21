@@ -56,7 +56,7 @@ cbuffer Camera : register(b0) {
     int    dither;         int aoSamples;      int shadowSamples; int giSamples;  // row 8
     int    giDenoise;      float giHistMax;    int emptySkip;     int brickDim;   // row 9
     int    giDebug;        int   giBounces;    float giEmissive;  float voxEmissive; // row 10
-    float  emissiveSurface; int ePad11a;       int ePad11b;       int ePad11c;    // row 11
+    float  emissiveSurface; float giIntensity;  int ePad11b;       int ePad11c;    // row 11
 };
 StructuredBuffer<uint> Voxels : register(t0);
 RWStructuredBuffer<float4> Accum : register(u0);  // per-pixel GI accumulation: rgb + sample count
@@ -459,7 +459,7 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
         }
         indirectSum += min(L, float3(8.0, 8.0, 8.0));   // firefly clamp: tame rare bright-path spikes (faster convergence)
     }
-    float3 indirectAvg = indirectSum / float(numSamples);
+    float3 indirectAvg = (indirectSum / float(numSamples)) * giIntensity;   // artistic indirect-strength dial (>1 brightens dim rooms)
     if (giDebug != 0) return indirectAvg;   // GI debug view: show ONLY the indirect bounce radiance
     // Self-emission (the surface's OWN glow when viewed) is scaled by
     // emissiveSurface so a strong room-light emitter need not blow to white;
@@ -537,7 +537,7 @@ struct CamCB {
     int   dither;          int   aoSamples;        int shadowSamples; int giSamples; // row 8
     int   giDenoise;       float giHistMax;        int emptySkip; int brickDim;      // row 9
     int   giDebug;         int   giBounces;        float giEmissive; float voxEmissive;  // row 10
-    float emissiveSurface; int   ePad11a;          int ePad11b;      int ePad11c;        // row 11
+    float emissiveSurface; float giIntensity;      int ePad11b;      int ePad11c;        // row 11
 };
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
@@ -646,7 +646,7 @@ struct Renderer::Impl {
     // changed" fires every frame -> accumFrame resets every frame -> GI never
     // converges. The sceneKey literal below uses these via static_assert.)
     static constexpr int kCamKeyLen   = 6;
-    static constexpr int kSceneKeyLen = 21;
+    static constexpr int kSceneKeyLen = 22;
     float                             accCamKey[kCamKeyLen]     = {};
     float                             accSceneKey[kSceneKeyLen] = {};
     bool                              accHave = false;
@@ -1112,6 +1112,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.giEmissive     = std::max(0.0f, std::min(fp.gi_emissive, 8.0f));
     cb.voxEmissive    = std::max(0.0f, fp.vox_emissive);   // host sets >1 only when a .vox map is loaded
     cb.emissiveSurface = std::max(0.0f, fp.emissive_surface);  // dims the emitter's OWN surface glow (not its GI contribution)
+    cb.giIntensity    = std::max(0.0f, fp.gi_intensity);   // indirect-strength dial (>1 brightens dim rooms)
 
     // Temporal accumulation with motion-adaptive denoise.
     //
@@ -1132,7 +1133,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         static_cast<float>(fp.lighting_mode), static_cast<float>(fp.hdr),
         static_cast<float>(fp.dither), static_cast<float>(fp.ao_samples),
         static_cast<float>(fp.shadow_samples), static_cast<float>(fp.gi_samples),
-        static_cast<float>(fp.gi_bounces), fp.gi_emissive, fp.vox_emissive, fp.emissive_surface,
+        static_cast<float>(fp.gi_bounces), fp.gi_emissive, fp.vox_emissive, fp.emissive_surface, fp.gi_intensity,
     };
     // Compile-time guard: the stored copies (Impl::accCamKey/accSceneKey) MUST be
     // the same length as these keys, or the memcmp/memcpy below over-run.

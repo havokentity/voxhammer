@@ -36,6 +36,7 @@ struct FrameParams {
     float gi_emissive     = 1.0f;    // global emissive multiplier (all emitters; keep ~1 = sane)
     float vox_emissive    = 1.0f;    // extra emissive boost for LOADED .vox maps only (host sets; 1 = demo/none)
     float emissive_surface = 1.0f;   // scales the emitter's OWN surface glow (1 = full; lower so strong emitters don't blow white). Not its GI contribution.
+    float gi_intensity     = 1.0f;   // QUALITY indirect-GI strength (sky fill + inter-reflection); >1 brightens dim enclosed rooms
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen
