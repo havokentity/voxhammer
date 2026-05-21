@@ -134,27 +134,70 @@ public:
     // live render palette and pinned in both that palette and world.Palette()).
     void Init(std::uint8_t debrisMaterial) { debrisMat_ = debrisMaterial; }
 
-    // Spawn a small burst (4..12) of debris boxes at a carved hit, each a
-    // kCubeVox-edged cube with outward+upward velocity so they scatter.
+    // Live-debris cap (voxel.debris.max) -- skip spawning past this to bound perf.
+    void SetMaxLive(int maxLive) { maxLive_ = maxLive > 0 ? maxLive : 0; }
+    // Chunk-size multiplier (voxel.debris.scale) -- dials overall chunkiness.
+    void SetScale(float scale) { scale_ = scale > 0.0f ? scale : 0.0f; }
+
+    // Spawn a debris burst at a carved hit. Count scales with the carve radius
+    // (bigger carve -> more chunks), capped by voxel.debris.max. Each chunk gets
+    // its OWN random cube edge (1..4 voxels, * scale) so debris looks varied, and
+    // an outward+upward velocity so they scatter.
     void Spawn(vox::physics::PhysicsWorld& physics, int hx, int hy, int hz,
                int carveRadius) {
-        const int n = 4 + (rng_() % 9);  // 4..12 boxes
-        const float half = 0.5f * static_cast<float>(kCubeVox);  // PhysX cube half-extent (world units == voxels)
-        for (int i = 0; i < n; ++i) {
-            // Jitter the spawn within the carved sphere so they don't stack.
-            const float jx = Frand(-1.0f, 1.0f) * static_cast<float>(carveRadius) * 0.5f;
-            const float jy = Frand(0.0f, 1.0f) * static_cast<float>(carveRadius) * 0.5f;
-            const float jz = Frand(-1.0f, 1.0f) * static_cast<float>(carveRadius) * 0.5f;
-            const float sx = static_cast<float>(hx) + 0.5f + jx;
-            const float sy = static_cast<float>(hy) + 0.5f + jy;
-            const float sz = static_cast<float>(hz) + 0.5f + jz;
-            // Outward (from hit) + upward pop.
-            const float vx = jx * 2.0f + Frand(-2.0f, 2.0f);
-            const float vy = Frand(3.0f, 8.0f);
-            const float vz = jz * 2.0f + Frand(-2.0f, 2.0f);
+        // Count grows with radius: ~3 chunks per voxel of radius (+jitter),
+        // clamped to a sane burst size before the global live cap applies.
+        const int base = 4 + carveRadius * 3 + static_cast<int>(rng_() % 5);
+        SpawnBurst(physics, static_cast<float>(hx) + 0.5f,
+                   static_cast<float>(hy) + 0.5f, static_cast<float>(hz) + 0.5f,
+                   carveRadius, std::clamp(base, 4, 64),
+                   /*force=*/0.0f, /*radial=*/false);
+    }
+
+    // Spawn a burst of `count` debris boxes centered at world (cx,cy,cz). With
+    // radial=true each chunk's velocity points away from the center (a blast),
+    // its magnitude scaled by `force`; with radial=false it's the gentle
+    // outward+upward scatter used by a plain carve. `spread` (voxels) controls
+    // how far chunks are jittered from the center. Honors the live cap.
+    void SpawnBurst(vox::physics::PhysicsWorld& physics, float cx, float cy, float cz,
+                    int spread, int count, float force, bool radial) {
+        for (int i = 0; i < count; ++i) {
+            if (static_cast<int>(live_.size()) >= maxLive_) break;  // cap live debris
+            // Per-chunk size 1..4 voxels (scaled), so bursts mix small + big.
+            int size = kMinCubeVox + static_cast<int>(rng_() % (kMaxCubeVox - kMinCubeVox + 1));
+            size = std::clamp(static_cast<int>(std::lround(size * scale_)), 1, 16);
+            const float half = 0.5f * static_cast<float>(size);  // PhysX cube half-extent (world units == voxels)
+
+            // Jitter the spawn around the center so chunks don't stack.
+            const float jx = Frand(-1.0f, 1.0f) * static_cast<float>(spread) * 0.5f;
+            const float jy = Frand(0.0f, 1.0f) * static_cast<float>(spread) * 0.5f;
+            const float jz = Frand(-1.0f, 1.0f) * static_cast<float>(spread) * 0.5f;
+            const float sx = cx + jx;
+            const float sy = cy + jy;
+            const float sz = cz + jz;
+
+            float vx, vy, vz;
+            if (radial) {
+                // Velocity points radially out from the blast center + upward pop,
+                // magnitude scaled by `force`. Use the jitter offset as the
+                // outward direction (it already points away from center).
+                float dx = jx, dy = jy + 0.5f, dz = jz;  // bias slightly up
+                const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (len > 1e-4f) { dx /= len; dy /= len; dz /= len; }
+                else { dx = Frand(-1.0f, 1.0f); dy = 1.0f; dz = Frand(-1.0f, 1.0f); }
+                const float mag = force * Frand(0.6f, 1.0f);
+                vx = dx * mag;
+                vy = dy * mag + Frand(1.0f, 4.0f);  // extra upward kick
+                vz = dz * mag;
+            } else {
+                // Gentle outward (from hit) + upward pop.
+                vx = jx * 2.0f + Frand(-2.0f, 2.0f);
+                vy = Frand(3.0f, 8.0f);
+                vz = jz * 2.0f + Frand(-2.0f, 2.0f);
+            }
             const int id = physics.AddBox(sx, sy, sz, half, vx, vy, vz);
             if (id >= 0) {
-                live_.push_back(Tracked{id, /*hasPrev=*/false, {}});
+                live_.push_back(Tracked{id, /*hasPrev=*/false, {}, size});
             }
         }
     }
@@ -183,7 +226,7 @@ public:
         for (auto& t : live_) {
             const vox::physics::BodyState* st = Find(states_, t.id);
             if (!st) continue;  // removed underneath us; skip
-            const Aabb cur = CubeAabb(st->px, st->py, st->pz);
+            const Aabb cur = CubeAabb(st->px, st->py, st->pz, t.size);
             // Clear the previous footprint cells that are NOT also covered by the
             // new one (overlap is overwritten by the paint step anyway).
             if (t.hasPrev) ClearBoxExcept(world, renderer, t.prev, cur);
@@ -205,14 +248,19 @@ public:
     bool Empty() const { return live_.empty(); }
 
 private:
-    static constexpr int   kCubeVox    = 2;       // debris cube edge in voxels
+    static constexpr int   kMinCubeVox = 1;       // smallest debris cube edge (voxels)
+    static constexpr int   kMaxCubeVox = 4;       // largest debris cube edge (voxels)
     static constexpr float kKillY      = -2.0f;   // cull below this world Y
     static constexpr float kTtlSeconds = 12.0f;   // max debris lifetime
 
     struct Aabb { int x0, y0, z0, x1, y1, z1; };  // exclusive max
-    struct Tracked { int id; bool hasPrev; Aabb prev; float age = 0.0f; };
+    // `size` is this body's cube edge in voxels (varied per chunk), used to
+    // re-build its render AABB each frame so chunks look non-uniform.
+    struct Tracked { int id; bool hasPrev; Aabb prev; int size = kMinCubeVox; float age = 0.0f; };
 
     std::uint8_t debrisMat_ = 0;
+    int          maxLive_   = 256;    // voxel.debris.max (live-body cap)
+    float        scale_     = 1.0f;   // voxel.debris.scale (chunk-size multiplier)
     std::vector<Tracked> live_;
     std::vector<vox::physics::BodyState> states_;
     std::mt19937 rng_{0xC0FFEEu};
@@ -228,14 +276,15 @@ private:
         return nullptr;
     }
 
-    // Grid AABB (clamped to the world) covering a cube centered at (cx,cy,cz).
-    static Aabb CubeAabb(float cx, float cy, float cz) {
+    // Grid AABB (clamped to the world) covering a cube of edge `size` voxels
+    // centered at (cx,cy,cz). `size` is per-body so chunks render at varied sizes.
+    static Aabb CubeAabb(float cx, float cy, float cz, int size) {
         const int G = static_cast<int>(vox::voxel::kWorldDim);
         const int ix = static_cast<int>(std::floor(cx));
         const int iy = static_cast<int>(std::floor(cy));
         const int iz = static_cast<int>(std::floor(cz));
-        const int h0 = kCubeVox / 2;
-        const int h1 = kCubeVox - h0;  // covers even edge lengths symmetrically
+        const int h0 = size / 2;
+        const int h1 = size - h0;  // covers even edge lengths symmetrically
         Aabb a{ix - h0, iy - h0, iz - h0, ix + h1, iy + h1, iz + h1};
         a.x0 = std::clamp(a.x0, 0, G); a.y0 = std::clamp(a.y0, 0, G); a.z0 = std::clamp(a.z0, 0, G);
         a.x1 = std::clamp(a.x1, 0, G); a.y1 = std::clamp(a.y1, 0, G); a.z1 = std::clamp(a.z1, 0, G);
@@ -350,7 +399,11 @@ void RegisterCoreCvars() {
     reg("voxel.cursor.x", "0", "3D cursor X for voxel.place (0..127).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 127, .range_step = 1});
     reg("voxel.cursor.y", "0", "3D cursor Y for voxel.place (0..127).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 127, .range_step = 1});
     reg("voxel.cursor.z", "0", "3D cursor Z for voxel.place (0..127).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 127, .range_step = 1});
-    reg("voxel.break_radius", "2", "Carve radius (voxels) for voxel.break.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 16, .range_step = 1});
+    reg("voxel.break_radius", "3", "Carve radius (voxels) for voxel.break.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 16, .range_step = 1});
+    reg("voxel.explode_radius", "8", "Carve radius (voxels) for voxel.explode (a big blast crater).", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
+    reg("voxel.explode_force", "12.0", "Radial blast velocity (units/sec) for voxel.explode debris -- chunks fly outward from the blast center.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 64.0f, .range_step = 1.0f});
+    reg("voxel.debris.max", "256", "Max live debris bodies (carve + explode). Spawning is skipped at the cap to bound physics/render cost.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 4096, .range_step = 16});
+    reg("voxel.debris.scale", "1.0", "Debris chunk-size multiplier (dials chunkiness; 1 = stock 1..4-voxel cubes).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.25f, .range_max = 4.0f, .range_step = 0.25f});
     reg("audio.master_volume", "0.8", "Master output volume.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
     reg("camera.pos", "32 40 -24", "Free-fly camera position (world units).", {.type = CVarType::Vec3, .flags = CVAR_ARCHIVE});
     reg("camera.yaw", "0.0", "Camera yaw (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = -3.1416f, .range_max = 3.1416f, .range_step = 0.02f});
@@ -756,11 +809,75 @@ int main(int argc, char** argv) {
                             region.push_back(static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
                 renderer.EditVoxels(x0, y0, z0, x1, y1, z1, region.data(), nullptr);  // palette unchanged by carve
 #if defined(VOX_HAVE_PHYSX)
-                // Spawn a small burst of dynamic rigid-body debris at the hit; the
-                // run loop re-inserts each as a chunky voxel cube every frame.
+                // Spawn a burst of dynamic rigid-body debris at the hit (count
+                // scales with radius, capped by voxel.debris.max); the run loop
+                // re-inserts each as a chunky voxel cube every frame.
+                debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
+                debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
                 debris.Spawn(physics, hx, hy, hz, radius);
 #endif
                 o.Format("voxel.break: removed {} voxels around hit ({},{},{}) r={}",
+                         removed, hx, hy, hz, radius);
+            });
+
+        // voxel.explode: like voxel.break but carves a LARGER crater
+        // (voxel.explode_radius) and spawns a big RADIAL debris blast (chunks fly
+        // outward from the hit, scaled by voxel.explode_force). The CARVE half
+        // works in BOTH builds; only the debris spawn is gated on VOX_HAVE_PHYSX
+        // (in the OFF build it just blows a crater, no flying chunks).
+        c.RegisterCommand("voxel.explode",
+            "Blast a large crater (voxel.explode_radius) where the camera looks + a radial debris burst (voxel.explode_force).",
+#if defined(VOX_HAVE_PHYSX)
+            [&world, &renderer, &physics, &debris](std::span<const std::string_view>, Output& o) {
+#else
+            [&world, &renderer](std::span<const std::string_view>, Output& o) {
+#endif
+                Console& cc = Console::Get();
+                float pos[3] = {0.0f, 0.0f, 0.0f};
+                if (CVar* cp = cc.FindCVar("camera.pos")) ParseRGB(cp->value, pos[0], pos[1], pos[2]);
+                const float yaw = cc.FindCVar("camera.yaw") ? cc.FindCVar("camera.yaw")->GetFloat() : 0.0f;
+                const float pitch = cc.FindCVar("camera.pitch") ? cc.FindCVar("camera.pitch")->GetFloat() : 0.0f;
+
+                // Forward convention -- MUST match the flycam / voxel.break.
+                const float cp = std::cos(pitch), sp = std::sin(pitch);
+                const float cyw = std::cos(yaw), syw = std::sin(yaw);
+                const float fwd[3] = {cp * syw, sp, cp * cyw};
+
+                int hx = 0, hy = 0, hz = 0;
+                const float maxDist = static_cast<float>(vox::voxel::kWorldDim) * 2.0f;
+                if (!world.RaycastSolid(pos, fwd, maxDist, hx, hy, hz)) {
+                    o.Print("voxel.explode: nothing solid in range");
+                    return;
+                }
+                const int radius = cc.FindCVar("voxel.explode_radius")
+                                       ? cc.FindCVar("voxel.explode_radius")->GetInt() : 8;
+                const int removed = world.CarveSphere(hx, hy, hz, radius);
+                // Push ONLY the carved region to the GPU (incremental, same path
+                // as voxel.break -- no full re-bake / GPU stall).
+                const int G = static_cast<int>(vox::voxel::kWorldDim);
+                const int x0 = std::max(0, hx - radius), y0 = std::max(0, hy - radius), z0 = std::max(0, hz - radius);
+                const int x1 = std::min(G, hx + radius + 1), y1 = std::min(G, hy + radius + 1), z1 = std::min(G, hz + radius + 1);
+                std::vector<std::uint32_t> region;
+                region.reserve(static_cast<std::size_t>(x1 - x0) * (y1 - y0) * (z1 - z0));
+                for (int z = z0; z < z1; ++z)
+                    for (int y = y0; y < y1; ++y)
+                        for (int x = x0; x < x1; ++x)
+                            region.push_back(static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
+                renderer.EditVoxels(x0, y0, z0, x1, y1, z1, region.data(), nullptr);  // palette unchanged by carve
+#if defined(VOX_HAVE_PHYSX)
+                // Big radial blast: chunks fly outward from the crater center,
+                // magnitude scaled by voxel.explode_force. Count scales with the
+                // (larger) radius, capped by voxel.debris.max.
+                const float force = cc.FindCVar("voxel.explode_force")
+                                        ? cc.FindCVar("voxel.explode_force")->GetFloat() : 12.0f;
+                debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
+                debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
+                const int count = std::clamp(8 + radius * 5, 8, 256);
+                debris.SpawnBurst(physics, static_cast<float>(hx) + 0.5f,
+                                  static_cast<float>(hy) + 0.5f, static_cast<float>(hz) + 0.5f,
+                                  radius, count, force, /*radial=*/true);
+#endif
+                o.Format("voxel.explode: removed {} voxels around hit ({},{},{}) r={}",
                          removed, hx, hy, hz, radius);
             });
     }

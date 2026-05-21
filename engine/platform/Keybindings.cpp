@@ -24,6 +24,7 @@ std::vector<KeyBinding> DefaultBindings() {
         {"F6", MOD_NONE, "command physics.dump_islands"},
         {"F7", MOD_NONE, "command setcursor"},
         {"X", MOD_NONE, "command voxel.break"},
+        {"G", MOD_NONE, "command voxel.explode"},
         {"F11", MOD_NONE, "cvar.toggle renderer.hdr.enabled"},
         {"PrintScreen", MOD_NONE, "command pix_capture_next_frame"},
     };
