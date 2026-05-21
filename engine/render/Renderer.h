@@ -37,6 +37,7 @@ struct FrameParams {
     float vox_emissive    = 1.0f;    // extra emissive boost for LOADED .vox maps only (host sets; 1 = demo/none)
     float emissive_surface = 1.0f;   // scales the emitter's OWN surface glow (1 = full; lower so strong emitters don't blow white). Not its GI contribution.
     float gi_intensity     = 1.0f;   // QUALITY indirect-GI strength (sky fill + inter-reflection); >1 brightens dim enclosed rooms
+    int   gi_reproject_history = 128; // QUALITY+reproject: ceiling on accumulated GI samples DURING camera motion (the swim<->grain knob). Higher = smoother but more "swimming"/lag; lower = crisper/more responsive but grainier. Still frames always converge to the full cap.
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen

@@ -331,6 +331,7 @@ void RegisterCoreCvars() {
     reg("renderer.gi.samples", "1", "QUALITY: indirect GI bounce samples accumulated per frame.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 8, .range_step = 1});
     reg("renderer.gi.denoise", "1", "QUALITY: temporal denoise so path-traced GI stays clean while the camera moves (slight ghosting trade-off).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("renderer.gi.reproject", "1", "QUALITY: temporally REPROJECT GI history across camera motion (realigns each pixel to the same world point) so motion stays sharp with little ghosting. Off = screen-space EMA only.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("renderer.gi.reproject_history", "128", "QUALITY+reproject: max accumulated GI samples kept DURING camera motion (the swim<->grain knob). Higher = smoother but more swimming/lag; lower = crisper/more responsive but grainier. Still frames always converge fully.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 8, .range_max = 1024, .range_step = 8});
     reg("renderer.empty_space_skip", "1", "Skip empty bricks in the voxel raymarch (faster; visually identical). Off = per-voxel DDA.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("renderer.gi.debug", "0", "QUALITY debug: show ONLY the indirect GI bounce (no direct/albedo) to confirm GI is contributing.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("physics.gpu_rigids.enabled", "1", "GPU rigid bodies (NVIDIA).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
@@ -928,6 +929,7 @@ int main(int argc, char** argv) {
             fp.vox_emissive = voxLoaded ? console.FindCVar("renderer.vox.emissive_boost")->GetFloat() : 1.0f;
             fp.emissive_surface = console.FindCVar("renderer.emissive.surface")->GetFloat();
             fp.gi_intensity = console.FindCVar("renderer.gi.intensity")->GetFloat();
+            fp.gi_reproject_history = console.FindCVar("renderer.gi.reproject_history")->GetInt();
             renderer.SetGiDenoise(console.FindCVar("renderer.gi.denoise")->GetBool());  // self-guards; resets accum only on toggle
             renderer.SetEmptySpaceSkip(console.FindCVar("renderer.empty_space_skip")->GetBool());  // self-guards
             renderer.SetGiDebug(console.FindCVar("renderer.gi.debug")->GetBool());  // self-guards

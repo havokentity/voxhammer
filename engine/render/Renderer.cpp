@@ -1309,13 +1309,31 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     } else if (camSame) {
         ++d.accumFrame;                   // fully still: keep converging (cap stays 2048)
     } else if (d.giReproject) {
-        // Pure camera motion with REPROJECTION ON: history is realigned per-pixel
-        // in the shader (the current hit is projected through the previous VP and
-        // matched against the previous hit position), and disoccluded pixels reset
-        // themselves. So we KEEP history, keep advancing the sample sequence, and
-        // keep the cap large -- aligned history can be trusted just like a still
-        // frame, which is what makes motion clean instead of a 1-spp noise storm.
-        ++d.accumFrame;                   // cap stays kHistMaxStill
+        // Pure camera motion with REPROJECTION ON: history is realigned per-pixel in
+        // the shader (current hit projected through the previous VP, matched to the
+        // previous hit), so we KEEP history and keep advancing the sample sequence --
+        // but we must NOT freeze the cap at 2048. Reprojection is NEAREST-pixel (a
+        // sub-pixel snap error) and the disocclusion match isn't perfect, so a frozen
+        // 2048-deep history lets that error ACCUMULATE frame-over-frame into visible
+        // "swimming"/smearing that drags with the camera. Scale the cap by motion so
+        // realignment error decays over a handful-to-dozens of frames (still FAR
+        // cleaner than the reproject-OFF EMA below, which trusts ~6), then snap back to
+        // the full still cap the instant motion stops (the camSame branch above).
+        ++d.accumFrame;
+        float dp = 0.0f;
+        for (int i = 0; i < 3; ++i) { float e = fp.cam_pos[i] - d.accCamKey[i]; dp += e * e; }
+        const float posDelta = std::sqrt(dp);                              // world voxels moved
+        const float angDelta = std::fabs(fp.cam_yaw   - d.accCamKey[3]) +
+                               std::fabs(fp.cam_pitch - d.accCamKey[4]) +
+                               std::fabs(fp.cam_fov   - d.accCamKey[5]);   // radians
+        const float motion = posDelta * 0.20f + angDelta * 2.0f;
+        // Ceiling (how long realigned history is trusted) is user-tunable via
+        // renderer.gi.reproject_history -- the swim<->grain knob: a gentle pan keeps
+        // most of it, a fast swing decays toward a floor of 8. cap = ceil/(1+motion*4).
+        // Higher = smoother but more swim/lag; lower = crisper but grainier. Still
+        // frames ignore this entirely (the camSame branch keeps the full 2048 cap).
+        const float histCeil = static_cast<float>(std::max(8, fp.gi_reproject_history));
+        histMax = std::max(8.0f, histCeil / (1.0f + motion * 4.0f));
     } else if (d.giDenoise) {
         // Pure camera motion, reprojection OFF but denoise ON: screen-space EMA.
         // KEEP history, advance the sample sequence, and shorten the cap based on
