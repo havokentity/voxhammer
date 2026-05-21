@@ -441,10 +441,19 @@ float3 giSky(float3 rd) {
     return dome * (ambient * 2.0);
 }
 
-// One-bounce diffuse path-traced radiance at the primary hit.
-// giSamples indirect bounces are averaged per frame; temporal accumulation converges the result.
-float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
+// Core path-traced shading at the primary hit, returning the THREE terms the
+// multi-pass denoiser needs SEPARATELY (the single-pass giRadiance below composes
+// them exactly as before):
+//   outAlb      = primary surface albedo (for demodulation / re-modulation)
+//   outDirect   = direct sun (soft-shadowed, jittered) at the primary hit, NO albedo
+//   returns       the DEMODULATED indirect irradiance (sky fill + inter-reflection),
+//                 i.e. indirectAvg BEFORE the primary-albedo multiply, * giIntensity.
+// Keeping the indirect demodulated lets the spatial filter blur it without bleeding
+// across albedo/texture edges; albedo is re-applied at composite.
+float3 giShadeSplit(float3 hp, float3 nrm, uint mat, float2 screenPos,
+                    out float3 outAlb, out float3 outDirect) {
     float3 alb = palette(mat);
+    outAlb = alb;
 
     // Direct sun, jittered inside the penumbra cone (accumulates -> soft shadow).
     // k=4,5 reserved for this pair (k=0..3 used by shadow/AO blue samples).
@@ -454,6 +463,7 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
     float  rad = sqrt(xs.x) * tan(max(shadowSoftness, 0.0008));
     float3 sd  = normalize(sunDir + (st * cos(ang) + sb * sin(ang)) * rad);
     float3 direct = directSun(hp, nrm, sd);
+    outDirect = direct;
 
     // Indirect: average giSamples hemisphere PATHS, each up to giBounces deep.
     // Light "walks" surface->surface (sun -> floor -> wall -> ...) so enclosed
@@ -502,6 +512,16 @@ float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
         indirectSum += L * (1.0 / (1.0 + plum * (1.0 / kFire)));
     }
     float3 indirectAvg = (indirectSum / float(numSamples)) * giIntensity;   // artistic indirect-strength dial (>1 brightens dim rooms)
+    return indirectAvg;   // DEMODULATED indirect (no primary albedo); composed by callers
+}
+
+// One-bounce diffuse path-traced radiance at the primary hit (SINGLE-PASS path).
+// giSamples indirect bounces are averaged per frame; temporal accumulation converges
+// the result. Composes giShadeSplit's three terms EXACTLY as the original did, so
+// the gi_denoiser==0 path is bit-identical to before this refactor.
+float3 giRadiance(float3 hp, float3 nrm, uint mat, float2 screenPos) {
+    float3 alb, direct;
+    float3 indirectAvg = giShadeSplit(hp, nrm, mat, screenPos, alb, direct);
     if (giDebug != 0) return indirectAvg;   // GI debug view: show ONLY the indirect bounce radiance
     // Self-emission (the surface's OWN glow when viewed) is scaled by
     // emissiveSurface so a strong room-light emitter need not blow to white;
@@ -624,6 +644,128 @@ float4 PSMain(VSOut i) : SV_Target {
 
     return float4(col, 1.0);
 }
+)HLSL"
+// Adjacent raw-string literal #4 (C++ concatenates all chunks at compile time).
+// Holds the MULTI-PASS GI-DENOISER offscreen SHADE entry point (PSShade) and its
+// extra moment ping-pong UAVs. PSMain (single pass, mode 0) does not reference u4/u5
+// or PSShade, so the unused declarations are harmless to its PSO/root-sig (a shader's
+// USED resources need only be a subset of its root signature). Kept under 16380 bytes.
+R"HLSL(
+// SVGF luminance-moment temporal buffers (PING-PONG, same indexing as Accum):
+//   Moments     = CURRENT frame moments written this frame (u4).
+//   PrevMoments = PREVIOUS frame moments read for temporal reprojection (u5).
+// .x = E[luminance] (1st moment), .y = E[luminance^2] (2nd moment), .z = sample count.
+RWStructuredBuffer<float4> Moments     : register(u4);  // CURRENT luminance moments + count
+RWStructuredBuffer<float4> PrevMoments : register(u5);  // PREVIOUS-frame moments (read-only this frame)
+
+// MRT outputs of the offscreen SHADE pass (all RGBA16F full-res), consumed by the
+// a-trous + composite passes. INDIRECT is DEMODULATED (no primary albedo) so the
+// spatial filter never bleeds across albedo edges; albedo is re-applied at composite.
+struct ShadeOut {
+    float4 indirect : SV_Target0;  // temporally-accumulated DEMODULATED indirect irradiance (.a = sample count)
+    float4 direct   : SV_Target1;  // direct sun*albedo + self-emission (NOT to be blurred)
+    float4 albedo   : SV_Target2;  // primary surface albedo (for re-modulation at composite)
+    float4 gbuffer  : SV_Target3;  // world-space normal (.xyz) + linear camera depth (.w) for edge-stopping
+    float4 variance : SV_Target4;  // .x = temporal luminance variance, .y = history sample count (SVGF)
+};
+
+// Offscreen variant of PSMain for the multi-pass denoiser (gi_denoiser != 0,
+// QUALITY mode). Traces the primary ray, computes the demodulated indirect / direct
+// / albedo via giShadeSplit, temporally accumulates the indirect EXACTLY like the
+// single pass (same reproject + Accum/PrevAccum ping-pong), accumulates luminance
+// moments for SVGF, and writes the five G-buffer-style targets. NO tonemap/dither
+// here -- that is the composite pass's job.
+ShadeOut PSShade(VSOut i) {
+    ShadeOut o;
+    float2 ndc = (i.pos.xy / viewport) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float tf = tan(fov * 0.5);
+    float3 rd = normalize(camFwd + camRight * (ndc.x * tf * aspect) + camUp * (ndc.y * tf));
+    float3 ro = camPos;
+
+    float3 hp, nrm; uint mat;
+    bool primHit = traceVoxel(ro, rd, 768, hp, nrm, mat);
+
+    float3 alb, direct, indirect;
+    if (primHit) {
+        indirect = giShadeSplit(hp, nrm, mat, i.pos.xy, alb, direct);
+    } else {
+        // Sky/miss: the demodulated-indirect channel carries the background sky so the
+        // composite (DIRECT + ALBEDO*indirect) reproduces the sky where albedo=1,direct=0.
+        alb      = float3(1, 1, 1);
+        direct   = float3(0, 0, 0);
+        indirect = sky(rd);
+        nrm      = float3(0, 0, 0);
+    }
+
+    // Temporal accumulation of the DEMODULATED indirect -- identical scheme to PSMain
+    // (reproject this pixel's primary hit through prevVP, reuse aligned history only on
+    // the same world point, else start fresh). Ping-pong: read PrevAccum, write Accum.
+    uint w   = (uint)viewport.x;
+    uint h   = (uint)viewport.y;
+    uint pix = (uint)i.pos.y * w + (uint)i.pos.x;
+
+    uint  srcPix    = pix;
+    bool  histValid = true;
+    float cap       = (giDenoise != 0) ? max(giHistMax, 0.0) : 2048.0;
+
+    [branch] if (reproject != 0) {
+        [branch] if (primHit) {
+            float4 clip = mul(prevVP, float4(hp, 1.0));
+            [branch] if (clip.w > 1e-4) {
+                float2 pndc = clip.xy / clip.w;
+                float2 puv  = float2(pndc.x * 0.5 + 0.5, -pndc.y * 0.5 + 0.5);
+                [branch] if (all(puv >= 0.0) && all(puv < 1.0)) {
+                    int px = clamp((int)(puv.x * float(w)), 0, (int)w - 1);
+                    int py = clamp((int)(puv.y * float(h)), 0, (int)h - 1);
+                    uint ppix = (uint)py * w + (uint)px;
+                    float4 prevHP = PrevHitPos[ppix];
+                    float tol = max(0.75, clip.w * 0.02);
+                    float3 dlt = prevHP.xyz - hp;
+                    [branch] if (prevHP.w > 0.5 && dot(dlt, dlt) <= tol * tol) {
+                        srcPix = ppix;
+                    } else {
+                        histValid = false;
+                    }
+                } else {
+                    histValid = false;
+                }
+            } else {
+                histValid = false;
+            }
+        } else {
+            histValid = false;
+        }
+    }
+
+    float4 hist  = PrevAccum[srcPix];
+    float  n     = (accumFrame == 0 || !histValid) ? 0.0 : min(hist.a, cap);
+    float3 indAvg = (hist.rgb * n + indirect) / (n + 1.0);
+
+    // SVGF temporal luminance moments (1st & 2nd), accumulated like the colour above.
+    float  lum   = dot(indirect, float3(0.2126, 0.7152, 0.0722));
+    float4 pm    = PrevMoments[srcPix];
+    float  m1    = (pm.x * n + lum)        / (n + 1.0);
+    float  m2    = (pm.y * n + lum * lum)  / (n + 1.0);
+    float  tvar  = max(m2 - m1 * m1, 0.0);   // temporal luminance variance (>=0)
+
+    Accum[pix]   = float4(indAvg, n + 1.0);
+    HitPos[pix]  = float4(hp, primHit ? 1.0 : 0.0);
+    Moments[pix] = float4(m1, m2, n + 1.0, 0.0);
+
+    // Write the G-buffer targets. The composite reconstructs colour as
+    // DIRECT + ALBEDO * filtered(INDIRECT) + ALBEDO*self-emission. Fold the
+    // primary self-emission (scaled by emissiveSurface) into DIRECT so it is not
+    // blurred and survives demodulation (it is not part of the indirect bounce).
+    float3 emit = primHit ? (alb * emission(mat) * emissiveSurface) : float3(0, 0, 0);
+    o.indirect = float4(indAvg, n + 1.0);
+    o.direct   = float4(direct * alb + emit, 1.0);   // direct is albedo-modulated here (not blurred)
+    o.albedo   = float4(alb, 1.0);
+    float linDepth = primHit ? length(hp - camPos) : 1e6;
+    o.gbuffer  = float4(nrm, linDepth);
+    o.variance = float4(tvar, n + 1.0, 0.0, 0.0);
+    return o;
+}
 )HLSL";
 
 struct CamCB {
@@ -644,6 +786,190 @@ struct CamCB {
 // The CBV is uploaded into a 256-byte buffer (MakeUpload(256)); keep the mirror at
 // exactly 16 float4 rows so prevVP lands on rows 12-15 and nothing overruns.
 static_assert(sizeof(CamCB) == 256, "CamCB must stay 256 bytes (16 x 16-byte rows) to match cbuffer + camBuf size");
+
+// ===========================================================================
+// MULTI-PASS GI DENOISER shaders (modes 1 & 2). A SEPARATE compilation unit from
+// kShader because these are pure image-space passes that need their OWN b0 cbuffer
+// (kShader's b0 is the 256-byte Camera). They are full-res 1:1, so all texture reads
+// use integer Load() at SV_Position -- NO sampler/static-sampler is required.
+//
+//   VSFsq      full-screen triangle (shared by a-trous + composite)
+//   PSAtrous   one edge-aware 5x5 a-trous wavelet iteration on the DEMODULATED
+//              indirect (ping-ponged by RenderFrame, step doubles each iteration).
+//              svgf=0: fixed phiLum.  svgf=1: phiLum scaled by sqrt(variance) and a
+//              3x3 variance handling on iteration 0 (spatial estimate when history
+//              is short, gaussian pre-blur otherwise).
+//   PSComposite  final = DIRECT + ALBEDO*filtered(INDIRECT); then exposure + ACES +
+//              blue-noise dither (identical math to the single pass) -> backbuffer.
+//
+// The per-iteration a-trous params are supplied as ROOT 32-BIT CONSTANTS (not a CBV)
+// so each recorded draw can carry its own stepSize/iter without juggling N upload
+// buffers within one command list. Composite params are likewise root constants.
+// ===========================================================================
+const char* kDenoiseShader = R"HLSL(
+struct VSOut { float4 pos : SV_Position; };
+VSOut VSFsq(uint vid : SV_VertexID) {
+    VSOut o;
+    float2 t = float2((vid << 1) & 2, vid & 2);   // (0,0)(2,0)(0,2) full-screen triangle
+    o.pos = float4(t * float2(2,-2) + float2(-1,1), 0, 1);
+    return o;
+}
+
+float3 tonemapACES(float3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+// ---- a-trous wavelet iteration -------------------------------------------
+cbuffer Atrous : register(b0) {
+    int   stepSize;     // 1,2,4,8,16,32 -- doubles each iteration
+    float phiNormal;    // normal edge-stop exponent
+    float phiDepth;     // depth edge-stop scale
+    float phiLum;       // luminance edge-stop sigma (svgf scales this by sqrt(variance))
+    int   svgf;         // 0 = ATROUS (fixed phiLum), 1 = SVGF (variance-driven)
+    int   atrousIter;   // 0-based iteration index (0 = first)
+    int   awidth;
+    int   aheight;
+};
+Texture2D<float4> Indirect : register(t0);   // DEMODULATED indirect (source ping)
+Texture2D<float4> GBuf     : register(t1);   // normal.xyz + linear depth.w
+Texture2D<float4> VarianceT: register(t2);   // .x = temporal luminance variance, .y = history count
+
+float lumOf(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+// 3x3 luminance variance of the demodulated indirect around pixel p (used as the
+// SVGF spatial fallback when temporal history is too short to be reliable).
+float spatialLumVar(int2 p) {
+    float s = 0.0, s2 = 0.0; int cnt = 0;
+    [unroll] for (int dy = -1; dy <= 1; ++dy)
+    [unroll] for (int dx = -1; dx <= 1; ++dx) {
+        int2 q = clamp(p + int2(dx, dy), int2(0,0), int2(awidth - 1, aheight - 1));
+        float l = lumOf(Indirect.Load(int3(q, 0)).rgb);
+        s += l; s2 += l * l; ++cnt;
+    }
+    float inv = 1.0 / float(cnt);
+    return max(s2 * inv - (s * inv) * (s * inv), 0.0);
+}
+
+// 3x3 gaussian pre-blur of the temporal variance (SVGF iteration-0 step).
+float gaussianVar(int2 p) {
+    const float k[3] = { 1.0, 2.0, 1.0 };  // [1 2 1]/16 separable
+    float vsum = 0.0, wsum = 0.0;
+    [unroll] for (int dy = -1; dy <= 1; ++dy)
+    [unroll] for (int dx = -1; dx <= 1; ++dx) {
+        int2 q = clamp(p + int2(dx, dy), int2(0,0), int2(awidth - 1, aheight - 1));
+        float wv = k[dx + 1] * k[dy + 1];
+        vsum += VarianceT.Load(int3(q, 0)).x * wv;
+        wsum += wv;
+    }
+    return (wsum > 0.0) ? (vsum / wsum) : 0.0;
+}
+
+float4 PSAtrous(VSOut i) : SV_Target {
+    int2 p = int2(i.pos.xy);
+
+    float4 cInd = Indirect.Load(int3(p, 0));
+    float4 cG   = GBuf.Load(int3(p, 0));
+    float3 nc   = cG.xyz;
+    float  zc   = cG.w;
+    float  lc   = lumOf(cInd.rgb);
+
+    // SVGF luminance edge-stop sigma. Mode 1 (svgf==0) uses a fixed phiLum. Mode 2
+    // drives it by the local variance: low variance (converged) -> small sigma ->
+    // sharp; high variance (noisy) -> large sigma -> aggressive blur. On iteration 0,
+    // fall back to a 3x3 spatial variance estimate when temporal history is short
+    // (< 4 samples), else use a 3x3 gaussian pre-blur of the temporal variance.
+    float lumSigma = max(phiLum, 1e-3);
+    [branch] if (svgf != 0) {
+        float vEst;
+        [branch] if (atrousIter == 0) {
+            float histLen = VarianceT.Load(int3(p, 0)).y;
+            vEst = (histLen < 4.0) ? spatialLumVar(p) : gaussianVar(p);
+        } else {
+            vEst = VarianceT.Load(int3(p, 0)).x;
+        }
+        lumSigma = phiLum * sqrt(max(vEst, 0.0)) + 1e-3;
+    }
+
+    const float kern[3] = { 1.0, 0.66666667, 0.16666667 };  // B3-spline 5-tap
+
+    float3 sum  = float3(0, 0, 0);
+    float  wsum = 0.0;
+    [loop] for (int dy = -2; dy <= 2; ++dy) {
+        [loop] for (int dx = -2; dx <= 2; ++dx) {
+            int2 q = p + int2(dx, dy) * stepSize;
+            // Clamp to screen; off-screen taps fold back to the centre (weight via clamp).
+            q = clamp(q, int2(0, 0), int2(awidth - 1, aheight - 1));
+
+            float h = kern[abs(dx)] * kern[abs(dy)];
+            [branch] if (dx == 0 && dy == 0) {
+                // Centre tap always keeps full kernel weight (no edge-stop), so sky /
+                // zero-normal / short-history pixels never reject themselves.
+                sum  += cInd.rgb * h;
+                wsum += h;
+                continue;
+            }
+
+            float4 tInd = Indirect.Load(int3(q, 0));
+            float4 tG   = GBuf.Load(int3(q, 0));
+            float3 nt   = tG.xyz;
+            float  zt   = tG.w;
+            float  lt   = lumOf(tInd.rgb);
+
+            float wN = pow(max(0.0, dot(nc, nt)), phiNormal);
+            float wZ = exp(-abs(zc - zt) / max(phiDepth * (abs(zc) * 0.1 + 1.0), 1e-3));
+            float wL = exp(-abs(lc - lt) / lumSigma);
+            float wgt = h * wN * wZ * wL;
+
+            sum  += tInd.rgb * wgt;
+            wsum += wgt;
+        }
+    }
+    float3 outc = (wsum > 1e-8) ? (sum / wsum) : cInd.rgb;
+    return float4(outc, cInd.a);   // carry the centre sample count in .a (unused downstream)
+}
+)HLSL"
+R"HLSL(
+// ---- composite ------------------------------------------------------------
+cbuffer Comp : register(b0) {
+    float cExposure;
+    int   cHdr;
+    int   cDither;
+    int   cwidth;
+    int   cheight;
+};
+Texture2D<float4>      DirectT : register(t0);   // direct*albedo + emissive (not blurred)
+Texture2D<float4>      AlbedoT : register(t1);   // primary albedo (re-modulation)
+Texture2D<float4>      IndirT  : register(t2);   // filtered DEMODULATED indirect
+StructuredBuffer<float> BlueNoise : register(t3);
+
+float blueC(int2 px, int k) {
+    return BlueNoise[((px.x + k * 13) & 63) + (((px.y + k * 7) & 63) << 6)];
+}
+
+float4 PSComposite(VSOut i) : SV_Target {
+    int2 p = int2(i.pos.xy);
+    float3 direct = DirectT.Load(int3(p, 0)).rgb;
+    float3 albedo = AlbedoT.Load(int3(p, 0)).rgb;
+    float3 indir  = IndirT.Load(int3(p, 0)).rgb;
+
+    // Re-modulate: re-apply albedo to the (now denoised) indirect, add the unblurred
+    // direct+emissive. Identity-filter equivalence to the single pass:
+    //   direct*alb + emit + alb*indirectAvg  ==  alb*(direct+indirectAvg)+emit.
+    float3 col = direct + albedo * indir;
+
+    col *= cExposure;
+    col = (cHdr != 0) ? tonemapACES(col) : saturate(col);
+
+    [branch] if (cDither != 0) {
+        float u1 = blueC(p, 22);
+        float u2 = blueC(p, 23);
+        float tri = (u1 + u2 - 1.0) / 255.0;   // triangular PDF, range (-1/255, +1/255)
+        col = saturate(col + tri);
+    }
+    return float4(col, 1.0);
+}
+)HLSL";
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
     std::vector<std::uint32_t> v(static_cast<size_t>(g) * g * g, 0);
@@ -757,7 +1083,7 @@ struct Renderer::Impl {
     // changed" fires every frame -> accumFrame resets every frame -> GI never
     // converges. The sceneKey literal below uses these via static_assert.)
     static constexpr int kCamKeyLen   = 6;
-    static constexpr int kSceneKeyLen = 22;
+    static constexpr int kSceneKeyLen = 23;  // +1 for gi_denoiser (mode switch -> reset; see RenderFrame)
     float                             accCamKey[kCamKeyLen]     = {};
     float                             accSceneKey[kSceneKeyLen] = {};
     bool                              accHave = false;
@@ -768,6 +1094,53 @@ struct Renderer::Impl {
     bool                              giReproject = true; // QUALITY temporal reprojection (Renderer::SetGiReproject)
     float                             prevVP[16] = {};    // previous frame's view-projection (row-major) for reprojection
     bool                              havePrevVP = false; // false until the first frame's VP has been stored
+
+    // ---- Multi-pass GI DENOISER (gi_denoiser 1=ATROUS / 2=SVGF) -------------
+    // All resources are allocated up front in Init so switching modes at runtime is
+    // pure branching in RenderFrame; the extra passes only execute when multipass is
+    // active (gi_denoiser != 0 AND lighting_mode == 1 / QUALITY). Mode 0 ignores ALL
+    // of these and runs the original single pass via rootSig/pso/PSMain unchanged.
+    bool                              denoiseReady = false;        // true once all denoiser objects built
+    // Offscreen full-res RGBA16F targets (RTV written, SRV read). indirectTex is a
+    // ping-pong pair the a-trous filter bounces between (SHADE writes [0]).
+    ComPtr<ID3D12Resource>            indirectTex[2];              // demodulated indirect (a-trous ping-pong)
+    ComPtr<ID3D12Resource>            directTex;                   // direct*albedo + emissive
+    ComPtr<ID3D12Resource>            albedoTex;                   // primary albedo
+    ComPtr<ID3D12Resource>            gbufTex;                     // normal.xyz + linear depth.w
+    ComPtr<ID3D12Resource>            varianceTex;                 // .x variance, .y history count (SVGF)
+    D3D12_RESOURCE_STATES             texState[6] = {};            // tracked state of the 6 offscreen RTs
+    // Moments ping-pong for SVGF temporal accumulation (mirrors accumBuf indexing).
+    ComPtr<ID3D12Resource>            momentBuf[2];                // float4: m1, m2, count, pad
+    // RTV heap for the offscreen targets (separate from the swapchain rtvHeap).
+    ComPtr<ID3D12DescriptorHeap>      offRtvHeap;
+    UINT                              offRtvSize = 0;
+    // Shader-visible CBV_SRV_UAV heap holding the 6 offscreen-texture SRVs, in fixed
+    // slots: 0 indirect[0], 1 indirect[1], 2 direct, 3 albedo, 4 gbuf, 5 variance.
+    ComPtr<ID3D12DescriptorHeap>      srvHeap;
+    UINT                              srvInc = 0;
+    // SHADE pass: own root sig + PSO (adds moment UAVs u4/u5 over the mode-0 rootSig),
+    // MRT to the 5 offscreen targets. Reuses the Camera CBV + voxel/blue/palette/brick
+    // SRVs + Accum/HitPos ping-pong UAVs exactly like the single pass.
+    ComPtr<ID3D12RootSignature>       shadeRootSig;
+    ComPtr<ID3D12PipelineState>       shadePso;
+    // a-trous + composite root sigs and PSOs.
+    ComPtr<ID3D12RootSignature>       atrousRootSig;
+    ComPtr<ID3D12PipelineState>       atrousPso;
+    ComPtr<ID3D12RootSignature>       compositeRootSig;
+    ComPtr<ID3D12PipelineState>       compositePso;
+
+    // GPU descriptor handle for SRV heap slot |slot| (0..5).
+    D3D12_GPU_DESCRIPTOR_HANDLE SrvGpu(UINT slot) const {
+        D3D12_GPU_DESCRIPTOR_HANDLE h = srvHeap->GetGPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<UINT64>(slot) * srvInc;
+        return h;
+    }
+    // CPU descriptor handle for offscreen RTV |idx| (0..5).
+    D3D12_CPU_DESCRIPTOR_HANDLE OffRtv(UINT idx) const {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = offRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(idx) * offRtvSize;
+        return h;
+    }
 
     void WaitIdle() {
         if (!queue || !fence) return;
@@ -813,10 +1186,271 @@ struct Renderer::Impl {
                                         IID_PPV_ARGS(&r));
         return r;
     }
+    // Full-res RGBA16F render-target texture (RTV-writable + SRV-readable) for the
+    // multi-pass denoiser offscreen targets. Created in RENDER_TARGET state so every
+    // frame can start from a known state (RenderFrame restores all to RT at frame end).
+    ComPtr<ID3D12Resource> MakeRenderTex(UINT w, UINT h) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w;
+        rd.Height = h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE cv{};
+        cv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        ComPtr<ID3D12Resource> r;
+        device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
+                                        IID_PPV_ARGS(&r));
+        return r;
+    }
+    // Build every multi-pass-denoiser object (offscreen RTs + RTV/SRV heaps + moment
+    // buffers + SHADE/a-trous/composite root sigs & PSOs). Returns true on success
+    // (sets denoiseReady). Defined out-of-line below Init. |kVox|/|kDenoise| are the
+    // two HLSL source blobs (kShader / kDenoiseShader).
+    bool InitDenoiser(const char* kVox, const char* kDenoise);
 };
 
 Renderer::Renderer() : impl_(std::make_unique<Impl>()) {}
 Renderer::~Renderer() { Shutdown(); }
+
+bool Renderer::Impl::InitDenoiser(const char* kVox, const char* kDenoise) {
+    Impl& d = *this;
+    const UINT W = d.width, H = d.height;
+
+    // --- 6 offscreen RGBA16F render targets (all start RENDER_TARGET) ---
+    d.indirectTex[0] = d.MakeRenderTex(W, H);
+    d.indirectTex[1] = d.MakeRenderTex(W, H);
+    d.directTex      = d.MakeRenderTex(W, H);
+    d.albedoTex      = d.MakeRenderTex(W, H);
+    d.gbufTex        = d.MakeRenderTex(W, H);
+    d.varianceTex    = d.MakeRenderTex(W, H);
+    if (!d.indirectTex[0] || !d.indirectTex[1] || !d.directTex || !d.albedoTex ||
+        !d.gbufTex || !d.varianceTex) return false;
+    for (int i = 0; i < 6; ++i) d.texState[i] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+    // --- Moment ping-pong buffers (float4 per pixel: m1, m2, count, pad) ---
+    {
+        const UINT64 pixBytes = static_cast<UINT64>(W) * H * 16;
+        for (int i = 0; i < 2; ++i) {
+            d.momentBuf[i] = d.MakeDefaultUAV(pixBytes);
+            if (!d.momentBuf[i]) return false;
+        }
+    }
+
+    // --- RTV heap for the 6 offscreen targets (slots match texState[] order) ---
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.NumDescriptors = 6;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        if (FAILED(d.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&d.offRtvHeap)))) return false;
+        d.offRtvSize = d.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        ID3D12Resource* rts[6] = { d.indirectTex[0].Get(), d.indirectTex[1].Get(), d.directTex.Get(),
+                                   d.albedoTex.Get(), d.gbufTex.Get(), d.varianceTex.Get() };
+        D3D12_RENDER_TARGET_VIEW_DESC rv{};
+        rv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        for (UINT i = 0; i < 6; ++i)
+            d.device->CreateRenderTargetView(rts[i], &rv, d.OffRtv(i));
+    }
+
+    // --- Shader-visible SRV heap: 6 SRVs in fixed slots ---
+    //   0 indirect[0], 1 indirect[1], 2 direct, 3 albedo, 4 gbuf, 5 variance
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.NumDescriptors = 6;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(d.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&d.srvHeap)))) return false;
+        d.srvInc = d.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        ID3D12Resource* srcs[6] = { d.indirectTex[0].Get(), d.indirectTex[1].Get(), d.directTex.Get(),
+                                    d.albedoTex.Get(), d.gbufTex.Get(), d.varianceTex.Get() };
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE ch = d.srvHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < 6; ++i) {
+            d.device->CreateShaderResourceView(srcs[i], &sv, ch);
+            ch.ptr += d.srvInc;
+        }
+    }
+
+    UINT cf = 0;
+#if defined(_DEBUG)
+    cf = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+
+    // ===================== SHADE pass (MRT) =====================
+    // Root sig = the mode-0 layout (b0; t0,t1,t2,t3; u0,u1,u2,u3) PLUS moment UAVs
+    // u4 (Moments) and u5 (PrevMoments). 11 root descriptors, all buffers.
+    {
+        D3D12_ROOT_PARAMETER rp[11]{};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; rp[0].Descriptor.ShaderRegister = 0;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[1].Descriptor.ShaderRegister = 0;  // t0 Voxels
+        rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[2].Descriptor.ShaderRegister = 0;  // u0 Accum
+        rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[3].Descriptor.ShaderRegister = 1;  // t1 BlueNoise
+        rp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[4].Descriptor.ShaderRegister = 2;  // t2 Palette
+        rp[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[5].Descriptor.ShaderRegister = 3;  // t3 Brick
+        rp[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[6].Descriptor.ShaderRegister = 1;  // u1 HitPos
+        rp[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[7].Descriptor.ShaderRegister = 2;  // u2 PrevAccum
+        rp[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[8].Descriptor.ShaderRegister = 3;  // u3 PrevHitPos
+        rp[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[9].Descriptor.ShaderRegister = 4;  // u4 Moments
+        rp[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[10].Descriptor.ShaderRegister = 5; // u5 PrevMoments
+        for (auto& p : rp) p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rs{};
+        rs.NumParameters = 11; rs.pParameters = rp;
+        rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        ComPtr<ID3DBlob> blob, err;
+        if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) return false;
+        if (FAILED(d.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                 IID_PPV_ARGS(&d.shadeRootSig)))) return false;
+
+        ComPtr<ID3DBlob> vs, ps, err2;
+        if (FAILED(D3DCompile(kVox, std::strlen(kVox), "voxel", nullptr, nullptr, "VSMain", "vs_5_1", cf, 0, &vs, &err2))) {
+            vox::log::Error("DX12: SHADE VS compile: {}", err2 ? static_cast<const char*>(err2->GetBufferPointer()) : "?");
+            return false;
+        }
+        if (FAILED(D3DCompile(kVox, std::strlen(kVox), "voxel", nullptr, nullptr, "PSShade", "ps_5_1", cf, 0, &ps, &err2))) {
+            vox::log::Error("DX12: PSShade compile: {}", err2 ? static_cast<const char*>(err2->GetBufferPointer()) : "?");
+            return false;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psod{};
+        psod.pRootSignature = d.shadeRootSig.Get();
+        psod.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+        psod.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        for (int i = 0; i < 5; ++i) psod.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psod.SampleMask = UINT_MAX;
+        psod.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        psod.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        psod.RasterizerState.DepthClipEnable = TRUE;
+        psod.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psod.NumRenderTargets = 5;
+        for (int i = 0; i < 5; ++i) psod.RTVFormats[i] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        psod.SampleDesc.Count = 1;
+        if (FAILED(d.device->CreateGraphicsPipelineState(&psod, IID_PPV_ARGS(&d.shadePso)))) {
+            vox::log::Error("DX12: SHADE PSO"); return false;
+        }
+    }
+
+    // Common full-screen-triangle VS for a-trous + composite (from kDenoise).
+    ComPtr<ID3DBlob> fsqVs, fsqErr;
+    if (FAILED(D3DCompile(kDenoise, std::strlen(kDenoise), "denoise", nullptr, nullptr, "VSFsq", "vs_5_1", cf, 0, &fsqVs, &fsqErr))) {
+        vox::log::Error("DX12: VSFsq compile: {}", fsqErr ? static_cast<const char*>(fsqErr->GetBufferPointer()) : "?");
+        return false;
+    }
+
+    // ===================== a-trous pass =====================
+    // Root sig: b0 = 8 root 32-bit constants (per-iteration params), then three
+    // single-SRV descriptor tables for t0 (indirect src), t1 (gbuf), t2 (variance).
+    {
+        D3D12_DESCRIPTOR_RANGE r0{}, r1{}, r2{};
+        r0.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r0.NumDescriptors = 1; r0.BaseShaderRegister = 0;
+        r1.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r1.NumDescriptors = 1; r1.BaseShaderRegister = 1;
+        r2.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r2.NumDescriptors = 1; r2.BaseShaderRegister = 2;
+        D3D12_ROOT_PARAMETER rp[4]{};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[0].Constants.ShaderRegister = 0; rp[0].Constants.Num32BitValues = 8;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[1].DescriptorTable.NumDescriptorRanges = 1; rp[1].DescriptorTable.pDescriptorRanges = &r0;
+        rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[2].DescriptorTable.NumDescriptorRanges = 1; rp[2].DescriptorTable.pDescriptorRanges = &r1;
+        rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[3].DescriptorTable.NumDescriptorRanges = 1; rp[3].DescriptorTable.pDescriptorRanges = &r2;
+        for (auto& p : rp) p.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rs{};
+        rs.NumParameters = 4; rs.pParameters = rp;
+        ComPtr<ID3DBlob> blob, err;
+        if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) {
+            vox::log::Error("DX12: a-trous root sig: {}", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+            return false;
+        }
+        if (FAILED(d.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                 IID_PPV_ARGS(&d.atrousRootSig)))) return false;
+
+        ComPtr<ID3DBlob> ps, err2;
+        if (FAILED(D3DCompile(kDenoise, std::strlen(kDenoise), "denoise", nullptr, nullptr, "PSAtrous", "ps_5_1", cf, 0, &ps, &err2))) {
+            vox::log::Error("DX12: PSAtrous compile: {}", err2 ? static_cast<const char*>(err2->GetBufferPointer()) : "?");
+            return false;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psod{};
+        psod.pRootSignature = d.atrousRootSig.Get();
+        psod.VS = {fsqVs->GetBufferPointer(), fsqVs->GetBufferSize()};
+        psod.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        psod.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psod.SampleMask = UINT_MAX;
+        psod.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        psod.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        psod.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psod.NumRenderTargets = 1;
+        psod.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        psod.SampleDesc.Count = 1;
+        if (FAILED(d.device->CreateGraphicsPipelineState(&psod, IID_PPV_ARGS(&d.atrousPso)))) {
+            vox::log::Error("DX12: a-trous PSO"); return false;
+        }
+    }
+
+    // ===================== composite pass =====================
+    // Root sig: b0 = 5 root constants, three single-SRV tables (t0 direct, t1 albedo,
+    // t2 filtered indirect), plus a root SRV t3 for the blue-noise buffer.
+    {
+        D3D12_DESCRIPTOR_RANGE r0{}, r1{}, r2{};
+        r0.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r0.NumDescriptors = 1; r0.BaseShaderRegister = 0;
+        r1.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r1.NumDescriptors = 1; r1.BaseShaderRegister = 1;
+        r2.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r2.NumDescriptors = 1; r2.BaseShaderRegister = 2;
+        D3D12_ROOT_PARAMETER rp[5]{};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[0].Constants.ShaderRegister = 0; rp[0].Constants.Num32BitValues = 5;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[1].DescriptorTable.NumDescriptorRanges = 1; rp[1].DescriptorTable.pDescriptorRanges = &r0;
+        rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[2].DescriptorTable.NumDescriptorRanges = 1; rp[2].DescriptorTable.pDescriptorRanges = &r1;
+        rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[3].DescriptorTable.NumDescriptorRanges = 1; rp[3].DescriptorTable.pDescriptorRanges = &r2;
+        rp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[4].Descriptor.ShaderRegister = 3;  // t3 BlueNoise
+        for (auto& p : rp) p.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rs{};
+        rs.NumParameters = 5; rs.pParameters = rp;
+        ComPtr<ID3DBlob> blob, err;
+        if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) {
+            vox::log::Error("DX12: composite root sig: {}", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+            return false;
+        }
+        if (FAILED(d.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                 IID_PPV_ARGS(&d.compositeRootSig)))) return false;
+
+        ComPtr<ID3DBlob> ps, err2;
+        if (FAILED(D3DCompile(kDenoise, std::strlen(kDenoise), "denoise", nullptr, nullptr, "PSComposite", "ps_5_1", cf, 0, &ps, &err2))) {
+            vox::log::Error("DX12: PSComposite compile: {}", err2 ? static_cast<const char*>(err2->GetBufferPointer()) : "?");
+            return false;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psod{};
+        psod.pRootSignature = d.compositeRootSig.Get();
+        psod.VS = {fsqVs->GetBufferPointer(), fsqVs->GetBufferSize()};
+        psod.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        psod.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psod.SampleMask = UINT_MAX;
+        psod.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        psod.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        psod.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psod.NumRenderTargets = 1;
+        psod.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;   // writes the backbuffer
+        psod.SampleDesc.Count = 1;
+        if (FAILED(d.device->CreateGraphicsPipelineState(&psod, IID_PPV_ARGS(&d.compositePso)))) {
+            vox::log::Error("DX12: composite PSO"); return false;
+        }
+    }
+
+    d.denoiseReady = true;
+    vox::log::Info("DX12: GI denoiser ready (a-trous + SVGF, {}x{})", W, H);
+    return true;
+}
 
 bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std::uint32_t>* voxels,
                     const std::uint32_t* palette256) {
@@ -997,6 +1631,16 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
             d.hitPosBuf[i] = d.MakeDefaultUAV(pixBytes);
             if (!d.accumBuf[i] || !d.hitPosBuf[i]) return false;
         }
+    }
+
+    // --- Multi-pass GI DENOISER resources (allocated up front; only USED when
+    // gi_denoiser != 0 in QUALITY mode). Builds: 6 offscreen RGBA16F targets + their
+    // RTVs and SRVs, the moment ping-pong buffers, and three root-sig/PSO triples
+    // (SHADE / a-trous / composite). On any failure we leave denoiseReady=false so the
+    // renderer still runs the single pass; the multi-pass branch checks the flag. ---
+    if (!d.InitDenoiser(kShader, kDenoiseShader)) {
+        vox::log::Error("DX12: GI denoiser init failed; multi-pass modes disabled (single pass still works)");
+        d.denoiseReady = false;
     }
 
     // --- Blue-noise tile: 64x64 floats generated via void-and-cluster on the CPU ---
@@ -1302,6 +1946,13 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         static_cast<float>(fp.dither), static_cast<float>(fp.ao_samples),
         static_cast<float>(fp.shadow_samples), static_cast<float>(fp.gi_samples),
         static_cast<float>(fp.gi_bounces), fp.gi_emissive, fp.vox_emissive, fp.emissive_surface, fp.gi_intensity,
+        // gi_denoiser is part of the SCENE key because mode 0 accumulates FULL radiance
+        // into Accum while modes 1/2 accumulate the DEMODULATED indirect -- different
+        // quantities, so switching modes must hard-reset the running average (else the
+        // EMA blends the two for a few frames). The atrous iters/phi knobs are NOT in
+        // the key: they only affect the post-accumulation spatial filter, not what is
+        // stored, so changing them needs no reset.
+        static_cast<float>(fp.gi_denoiser),
     };
     // Compile-time guard: the stored copies (Impl::accCamKey/accSceneKey) MUST be
     // the same length as these keys, or the memcmp/memcpy below over-run.
@@ -1389,46 +2040,177 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     const UINT curBuf  = d.accumPair;
     const UINT prevBuf = d.accumPair ^ 1u;
 
+    // The multi-pass GI denoiser only applies in QUALITY mode (lighting_mode==1, the
+    // only tier that computes path-traced indirect) AND when its resources built OK.
+    // In every other case (mode 0, PERFORMANCE, or a denoiser-init failure) the
+    // ORIGINAL single pass runs, completely unchanged -- this is the default.
+    const bool multipass = d.denoiseReady && fp.gi_denoiser != 0 && fp.lighting_mode == 1;
+    const int  svgf      = (fp.gi_denoiser == 2) ? 1 : 0;
+
     d.alloc->Reset();
-    d.list->Reset(d.alloc.Get(), d.pso.Get());
+    d.list->Reset(d.alloc.Get(), multipass ? d.shadePso.Get() : d.pso.Get());
 
     const UINT idx = d.swap->GetCurrentBackBufferIndex();
-    D3D12_RESOURCE_BARRIER bar{};
-    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    bar.Transition.pResource = d.targets[idx].Get();
-    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    bar.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    d.list->ResourceBarrier(1, &bar);
-
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = d.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    rtv.ptr += static_cast<SIZE_T>(idx) * d.rtvSize;
-    d.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-
     D3D12_VIEWPORT vp{0, 0, float(d.width), float(d.height), 0, 1};
     D3D12_RECT sc{0, 0, static_cast<LONG>(d.width), static_cast<LONG>(d.height)};
     d.list->RSSetViewports(1, &vp);
     d.list->RSSetScissorRects(1, &sc);
 
-    const float clear[4] = {fp.clear[0], fp.clear[1], fp.clear[2], 1.0f};
-    d.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    if (!multipass) {
+        // ============================ SINGLE PASS (mode 0 / PERFORMANCE) ============================
+        // Unchanged from the original: one full-screen draw -> tonemapped backbuffer.
+        D3D12_RESOURCE_BARRIER bar{};
+        bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bar.Transition.pResource = d.targets[idx].Get();
+        bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        bar.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        d.list->ResourceBarrier(1, &bar);
 
-    d.list->SetGraphicsRootSignature(d.rootSig.Get());
-    d.list->SetGraphicsRootConstantBufferView(0, d.camBuf->GetGPUVirtualAddress());
-    d.list->SetGraphicsRootShaderResourceView(1, d.voxelBuf->GetGPUVirtualAddress());
-    d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf[curBuf]->GetGPUVirtualAddress());    // u0 Accum (current, write)
-    d.list->SetGraphicsRootShaderResourceView(3, d.blueNoiseBuf->GetGPUVirtualAddress());
-    d.list->SetGraphicsRootShaderResourceView(4, d.paletteBuf->GetGPUVirtualAddress());
-    d.list->SetGraphicsRootShaderResourceView(5, d.brickBuf->GetGPUVirtualAddress());
-    d.list->SetGraphicsRootUnorderedAccessView(6, d.hitPosBuf[curBuf]->GetGPUVirtualAddress());   // u1 HitPos (current, write)
-    d.list->SetGraphicsRootUnorderedAccessView(7, d.accumBuf[prevBuf]->GetGPUVirtualAddress());   // u2 PrevAccum (previous, read)
-    d.list->SetGraphicsRootUnorderedAccessView(8, d.hitPosBuf[prevBuf]->GetGPUVirtualAddress());  // u3 PrevHitPos (previous, read)
-    d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    d.list->DrawInstanced(3, 1, 0, 0);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = d.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += static_cast<SIZE_T>(idx) * d.rtvSize;
+        d.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
-    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    d.list->ResourceBarrier(1, &bar);
+        const float clear[4] = {fp.clear[0], fp.clear[1], fp.clear[2], 1.0f};
+        d.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+
+        d.list->SetGraphicsRootSignature(d.rootSig.Get());
+        d.list->SetGraphicsRootConstantBufferView(0, d.camBuf->GetGPUVirtualAddress());
+        d.list->SetGraphicsRootShaderResourceView(1, d.voxelBuf->GetGPUVirtualAddress());
+        d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf[curBuf]->GetGPUVirtualAddress());    // u0 Accum (current, write)
+        d.list->SetGraphicsRootShaderResourceView(3, d.blueNoiseBuf->GetGPUVirtualAddress());
+        d.list->SetGraphicsRootShaderResourceView(4, d.paletteBuf->GetGPUVirtualAddress());
+        d.list->SetGraphicsRootShaderResourceView(5, d.brickBuf->GetGPUVirtualAddress());
+        d.list->SetGraphicsRootUnorderedAccessView(6, d.hitPosBuf[curBuf]->GetGPUVirtualAddress());   // u1 HitPos (current, write)
+        d.list->SetGraphicsRootUnorderedAccessView(7, d.accumBuf[prevBuf]->GetGPUVirtualAddress());   // u2 PrevAccum (previous, read)
+        d.list->SetGraphicsRootUnorderedAccessView(8, d.hitPosBuf[prevBuf]->GetGPUVirtualAddress());  // u3 PrevHitPos (previous, read)
+        d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        d.list->DrawInstanced(3, 1, 0, 0);
+
+        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        d.list->ResourceBarrier(1, &bar);
+    } else {
+        // ============================ MULTI PASS (mode 1 ATROUS / 2 SVGF) ============================
+        // SHADE (MRT offscreen) -> N edge-aware a-trous iterations on the demodulated
+        // indirect (ping-pong) -> COMPOSITE (re-modulate + tonemap + dither -> backbuffer).
+        d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        d.list->SetDescriptorHeaps(1, d.srvHeap.GetAddressOf());
+
+        // Transition helper for the 6 offscreen targets (tracks d.texState[]).
+        auto toState = [&](UINT slot, D3D12_RESOURCE_STATES after) {
+            if (d.texState[slot] == after) return;
+            ID3D12Resource* res[6] = { d.indirectTex[0].Get(), d.indirectTex[1].Get(), d.directTex.Get(),
+                                       d.albedoTex.Get(), d.gbufTex.Get(), d.varianceTex.Get() };
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = res[slot];
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = d.texState[slot];
+            b.Transition.StateAfter = after;
+            d.list->ResourceBarrier(1, &b);
+            d.texState[slot] = after;
+        };
+        constexpr D3D12_RESOURCE_STATES kRT  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        constexpr D3D12_RESOURCE_STATES kPSR = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        // ---- 1) SHADE: write the 5 MRT targets (indirect[0], direct, albedo, gbuf, variance) ----
+        // All 6 RTs start RENDER_TARGET (from the previous frame's restore / Init).
+        for (int i = 0; i < 6; ++i) toState((UINT)i, kRT);
+        D3D12_CPU_DESCRIPTOR_HANDLE shadeRtvs[5] = {
+            d.OffRtv(0),  // SV_Target0 indirect[0]
+            d.OffRtv(2),  // SV_Target1 direct
+            d.OffRtv(3),  // SV_Target2 albedo
+            d.OffRtv(4),  // SV_Target3 gbuf
+            d.OffRtv(5),  // SV_Target4 variance
+        };
+        d.list->OMSetRenderTargets(5, shadeRtvs, FALSE, nullptr);
+        d.list->SetGraphicsRootSignature(d.shadeRootSig.Get());
+        d.list->SetGraphicsRootConstantBufferView(0, d.camBuf->GetGPUVirtualAddress());
+        d.list->SetGraphicsRootShaderResourceView(1, d.voxelBuf->GetGPUVirtualAddress());
+        d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf[curBuf]->GetGPUVirtualAddress());    // u0 Accum
+        d.list->SetGraphicsRootShaderResourceView(3, d.blueNoiseBuf->GetGPUVirtualAddress());
+        d.list->SetGraphicsRootShaderResourceView(4, d.paletteBuf->GetGPUVirtualAddress());
+        d.list->SetGraphicsRootShaderResourceView(5, d.brickBuf->GetGPUVirtualAddress());
+        d.list->SetGraphicsRootUnorderedAccessView(6, d.hitPosBuf[curBuf]->GetGPUVirtualAddress());   // u1 HitPos
+        d.list->SetGraphicsRootUnorderedAccessView(7, d.accumBuf[prevBuf]->GetGPUVirtualAddress());   // u2 PrevAccum
+        d.list->SetGraphicsRootUnorderedAccessView(8, d.hitPosBuf[prevBuf]->GetGPUVirtualAddress());  // u3 PrevHitPos
+        d.list->SetGraphicsRootUnorderedAccessView(9, d.momentBuf[curBuf]->GetGPUVirtualAddress());   // u4 Moments
+        d.list->SetGraphicsRootUnorderedAccessView(10, d.momentBuf[prevBuf]->GetGPUVirtualAddress()); // u5 PrevMoments
+        d.list->DrawInstanced(3, 1, 0, 0);
+
+        // ---- 2) a-trous: edge-aware wavelet, ping-pong indirect[src]->indirect[dst] ----
+        // gbuf + variance are read every iteration; transition them to PSR once.
+        toState(4, kPSR);  // gbuf
+        toState(5, kPSR);  // variance
+        const int iters = std::max(1, std::min(fp.gi_atrous_iters, 6));
+        UINT srcT = 0;     // SHADE wrote indirect[0]
+        for (int it = 0; it < iters; ++it) {
+            const UINT dstT = srcT ^ 1u;
+            const UINT srcSlot = (srcT == 0) ? 0u : 1u;   // SRV heap slot for indirect[src]
+            const UINT dstSlot = (dstT == 0) ? 0u : 1u;   // RTV index for indirect[dst]
+            toState(srcSlot, kPSR);  // read source
+            toState(dstSlot, kRT);   // write dest
+            D3D12_CPU_DESCRIPTOR_HANDLE dstRtv = d.OffRtv(dstSlot);
+            d.list->OMSetRenderTargets(1, &dstRtv, FALSE, nullptr);
+            d.list->SetGraphicsRootSignature(d.atrousRootSig.Get());
+            d.list->SetPipelineState(d.atrousPso.Get());
+            struct { int step; float phiN; float phiD; float phiL; int svgf; int iter; int w; int h; } ac = {
+                (1 << it), fp.gi_denoise_phi_normal, fp.gi_denoise_phi_depth, fp.gi_denoise_phi_lum,
+                svgf, it, (int)d.width, (int)d.height,
+            };
+            d.list->SetGraphicsRoot32BitConstants(0, 8, &ac, 0);
+            d.list->SetGraphicsRootDescriptorTable(1, d.SrvGpu(srcSlot));  // t0 indirect src
+            d.list->SetGraphicsRootDescriptorTable(2, d.SrvGpu(4));        // t1 gbuf
+            d.list->SetGraphicsRootDescriptorTable(3, d.SrvGpu(5));        // t2 variance
+            d.list->DrawInstanced(3, 1, 0, 0);
+            srcT = dstT;   // dst becomes next source
+        }
+        // After the loop, indirect[srcT] holds the final filtered result (it was the
+        // last dst, transitioned to RT in this iteration). Make it readable for composite.
+        const UINT finalSlot = (srcT == 0) ? 0u : 1u;
+        toState(finalSlot, kPSR);
+        // direct + albedo are read by composite too.
+        toState(2, kPSR);  // direct
+        toState(3, kPSR);  // albedo
+
+        // ---- 3) COMPOSITE: final = direct + albedo*filtered_indirect; tonemap; dither -> backbuffer ----
+        D3D12_RESOURCE_BARRIER bb{};
+        bb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bb.Transition.pResource = d.targets[idx].Get();
+        bb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        bb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        d.list->ResourceBarrier(1, &bb);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE bbRtv = d.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        bbRtv.ptr += static_cast<SIZE_T>(idx) * d.rtvSize;
+        d.list->OMSetRenderTargets(1, &bbRtv, FALSE, nullptr);
+        const float clear[4] = {fp.clear[0], fp.clear[1], fp.clear[2], 1.0f};
+        d.list->ClearRenderTargetView(bbRtv, clear, 0, nullptr);
+
+        d.list->SetGraphicsRootSignature(d.compositeRootSig.Get());
+        d.list->SetPipelineState(d.compositePso.Get());
+        struct { float exposure; int hdr; int dither; int w; int h; } cc = {
+            fp.exposure, fp.hdr, fp.dither, (int)d.width, (int)d.height,
+        };
+        d.list->SetGraphicsRoot32BitConstants(0, 5, &cc, 0);
+        d.list->SetGraphicsRootDescriptorTable(1, d.SrvGpu(2));          // t0 direct
+        d.list->SetGraphicsRootDescriptorTable(2, d.SrvGpu(3));          // t1 albedo
+        d.list->SetGraphicsRootDescriptorTable(3, d.SrvGpu(finalSlot));  // t2 filtered indirect
+        d.list->SetGraphicsRootShaderResourceView(4, d.blueNoiseBuf->GetGPUVirtualAddress());  // t3 BlueNoise
+        d.list->DrawInstanced(3, 1, 0, 0);
+
+        bb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        d.list->ResourceBarrier(1, &bb);
+
+        // Restore ALL offscreen targets to RENDER_TARGET so next frame starts from a
+        // known state (the toState() tracker has them mostly in PSR now). WaitIdle at
+        // frame end guarantees the GPU is done before next frame mutates them.
+        for (int i = 0; i < 6; ++i) toState((UINT)i, kRT);
+    }
+
     d.list->Close();
 
     ID3D12CommandList* lists[] = {d.list.Get()};
@@ -1436,9 +2218,9 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     d.swap->Present(1, 0);
     d.WaitIdle();
 
-    // Flip the ping-pong: the Accum/HitPos written this frame become next frame's
-    // "previous" (the reprojection source). Only meaningful in QUALITY mode but
-    // harmless to flip always.
+    // Flip the ping-pong: the Accum/HitPos (and Moments) written this frame become
+    // next frame's "previous" (the reprojection source). Only meaningful in QUALITY
+    // mode but harmless to flip always.
     d.accumPair ^= 1u;
 }
 

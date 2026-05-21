@@ -38,6 +38,20 @@ struct FrameParams {
     float emissive_surface = 1.0f;   // scales the emitter's OWN surface glow (1 = full; lower so strong emitters don't blow white). Not its GI contribution.
     float gi_intensity     = 1.0f;   // QUALITY indirect-GI strength (sky fill + inter-reflection); >1 brightens dim enclosed rooms
     int   gi_reproject_history = 128; // QUALITY+reproject: ceiling on accumulated GI samples DURING camera motion (the swim<->grain knob). Higher = smoother but more "swimming"/lag; lower = crisper/more responsive but grainier. Still frames always converge to the full cap.
+    // ---- Multi-pass GI DENOISER (QUALITY/lighting_mode==1 only) -------------
+    // 0 = NONE: the original SINGLE-PASS path (default, unchanged). 1 = ATROUS:
+    // demodulated edge-aware a-trous wavelet spatial denoise. 2 = SVGF: same
+    // a-trous filter but variance-driven (per-pixel luminance variance scales the
+    // luminance edge-stop, plus a 3x3 variance pre-blur on the first iteration).
+    // Modes 1 & 2 run the multi-pass pipeline (offscreen SHADE -> a-trous -> composite)
+    // so temporal history can stay SHORT while the spatial filter removes per-frame
+    // grain. Only consulted in QUALITY mode; in PERFORMANCE mode (no GI) the value is
+    // ignored and the single pass runs. Switchable at runtime frame-to-frame.
+    int   gi_denoiser          = 0;      // 0 NONE(single pass) / 1 ATROUS / 2 SVGF
+    int   gi_atrous_iters      = 5;      // a-trous wavelet iterations (clamped 1..6); step doubles each (1,2,4,8,16,32)
+    float gi_denoise_phi_normal= 64.0f;  // normal edge-stop exponent: higher = sharper preservation of normal discontinuities
+    float gi_denoise_phi_depth = 1.0f;   // depth/position edge-stop scale: smaller = more sensitive to depth discontinuities
+    float gi_denoise_phi_lum   = 4.0f;   // luminance edge-stop sigma (mode 1 fixed; mode 2 scaled by sqrt(variance))
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen
