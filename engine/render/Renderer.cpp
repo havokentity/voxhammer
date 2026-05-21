@@ -56,10 +56,22 @@ cbuffer Camera : register(b0) {
     int    dither;         int aoSamples;      int shadowSamples; int giSamples;  // row 8
     int    giDenoise;      float giHistMax;    int emptySkip;     int brickDim;   // row 9
     int    giDebug;        int   giBounces;    float giEmissive;  float voxEmissive; // row 10
-    float  emissiveSurface; float giIntensity;  int ePad11b;       int ePad11c;    // row 11
+    float  emissiveSurface; float giIntensity;  int reproject;     int ePad11c;    // row 11
+    row_major float4x4 prevVP;                                                      // rows 12-15: previous-frame view-projection
 };
 StructuredBuffer<uint> Voxels : register(t0);
-RWStructuredBuffer<float4> Accum : register(u0);  // per-pixel GI accumulation: rgb + sample count
+// QUALITY GI temporal buffers (PING-PONG, swapped each frame in RenderFrame):
+//   Accum/HitPos        = CURRENT frame: written this frame (u0/u1).
+//   PrevAccum/PrevHitPos= PREVIOUS frame: read for temporal reprojection (u2/u3).
+// Accum.xyz = running-average indirect+direct radiance, Accum.w = sample count.
+// HitPos.xyz = primary-hit WORLD position seen by this pixel, HitPos.w = valid flag
+// (1 = solid hit, 0 = sky/miss). Reprojection maps the current hit through prevVP
+// into the previous frame's screen pixel and reuses that pixel's history when the
+// previous primary hit is the same world point (no disocclusion).
+RWStructuredBuffer<float4> Accum       : register(u0);  // CURRENT GI accumulation: rgb + sample count
+RWStructuredBuffer<float4> HitPos      : register(u1);  // CURRENT primary-hit world pos + valid flag
+RWStructuredBuffer<float4> PrevAccum   : register(u2);  // PREVIOUS-frame GI accumulation (read-only this frame)
+RWStructuredBuffer<float4> PrevHitPos  : register(u3);  // PREVIOUS-frame primary-hit world pos (read-only this frame)
 
 // Coarse occupancy acceleration structure (empty-space skipping). One uint per
 // BRICK_DIM^3 brick: nonzero iff ANY voxel in that brick is solid. The brick
@@ -215,7 +227,12 @@ bool occludedRay(float3 p, float3 d, int maxSteps) {
     }
     return false;
 }
-
+)HLSL"
+// Adjacent raw-string literal #2 (C++ concatenates all chunks at compile time).
+// MSVC caps a single string-literal token at 16380 bytes; adding the temporal-
+// reprojection cbuffer rows + ping-pong UAV declarations pushed the first chunk
+// over, so the shader is now split into THREE adjacent literals to stay under it.
+R"HLSL(
 // Soft shadow: average N jittered shadow rays within a cone of half-angle shadowSoftness.
 // Uses a deterministic screen-space seed so no temporal flicker.
 //
@@ -376,9 +393,9 @@ bool traceVoxel(float3 ro, float3 rd, int maxSteps, out float3 hp, out float3 nr
     return false;
 }
 )HLSL"
-// Split into two adjacent raw-string literals (C++ concatenates them at compile
-// time). MSVC caps a single string literal token at 16380 bytes; the combined
-// shader is near that, so the break keeps each chunk comfortably under the limit.
+// Adjacent raw-string literal #3 (C++ concatenates all chunks at compile time).
+// MSVC caps a single string literal token at 16380 bytes, so the shader is split
+// into three adjacent literals to keep each chunk comfortably under the limit.
 R"HLSL(
 // Per-frame-varying low-discrepancy 2D sample: an R2 sequence advanced by the
 // accumulation frame, Cranley-Patterson rotated by a per-pixel blue-noise offset,
@@ -476,7 +493,8 @@ float4 PSMain(VSOut i) : SV_Target {
 
     float3 hp, nrm; uint mat;
     float3 col;
-    if (!traceVoxel(ro, rd, 768, hp, nrm, mat)) {
+    bool primHit = traceVoxel(ro, rd, 768, hp, nrm, mat);   // primary-hit world pos in hp (for temporal reprojection)
+    if (!primHit) {
         col = sky(rd);
     } else if (lightingMode == 1) {
         col = giRadiance(hp, nrm, mat, i.pos.xy);
@@ -492,18 +510,76 @@ float4 PSMain(VSOut i) : SV_Target {
     }
 
     // QUALITY: progressive temporal accumulation. New-sample blend weight is
-    // 1/(n+1), so the per-pixel sample cap (giHistMax) is the only denoise knob:
+    // 1/(n+1), so the per-pixel sample cap (giHistMax) is the denoise knob:
     // still -> cap 2048 (converges clean); moving -> small cap => EMA that keeps
-    // history (kills the 1-spp noise storm). accumFrame==0 still forces a fresh
-    // start on a genuine reset; giDenoise off keeps the cap at 2048 (original).
+    // history (kills the 1-spp noise storm). accumFrame==0 forces a fresh start
+    // on a genuine reset; giDenoise off keeps the cap at 2048 (original).
+    //
+    // TEMPORAL REPROJECTION (reproject != 0): instead of blending the SAME screen
+    // pixel's history (which is a DIFFERENT world point once the camera moves ->
+    // smearing), project this pixel's primary-hit world point P through the
+    // PREVIOUS frame's view-projection (prevVP) to find where it was on screen
+    // last frame, and reuse THAT pixel's history -- but only if it landed on
+    // screen, the previous primary hit there was a valid solid hit, and it was the
+    // SAME world point (no disocclusion). Aligned history can be trusted far
+    // longer while moving (cap stays large), so motion is dramatically cleaner.
+    // reproject == 0 reproduces the original screen-space EMA (history = same pixel
+    // last frame) for A/B comparison. Ping-pong: read PrevAccum, write Accum.
     if (lightingMode == 1) {
         uint w = (uint)viewport.x;
+        uint h = (uint)viewport.y;
         uint pix = (uint)i.pos.y * w + (uint)i.pos.x;
-        float4 hist = Accum[pix];
-        float cap = (giDenoise != 0) ? max(giHistMax, 0.0) : 2048.0;
-        float n = (accumFrame == 0) ? 0.0 : min(hist.a, cap);
+
+        // Locate the history source pixel and decide whether it is valid history.
+        uint  srcPix    = pix;     // default: same screen pixel (screen-space EMA)
+        bool  histValid = true;    // false => start a fresh average (n = 0)
+        float cap       = (giDenoise != 0) ? max(giHistMax, 0.0) : 2048.0;
+
+        [branch] if (reproject != 0) {
+            // Reprojection only makes sense for a real surface hit; sky pixels have
+            // no stable world point, so they always restart (and stay noise-free).
+            [branch] if (primHit) {
+                float4 clip = mul(prevVP, float4(hp, 1.0));   // P -> previous clip space
+                // clip.w = depth along the previous camera forward; <=0 means the
+                // point was behind the previous camera -> no valid history.
+                [branch] if (clip.w > 1e-4) {
+                    float2 pndc = clip.xy / clip.w;                 // previous-frame NDC (x right, y up)
+                    float2 puv  = float2(pndc.x * 0.5 + 0.5, -pndc.y * 0.5 + 0.5);
+                    [branch] if (all(puv >= 0.0) && all(puv < 1.0)) {
+                        int px = (int)(puv.x * float(w));
+                        int py = (int)(puv.y * float(h));
+                        px = clamp(px, 0, (int)w - 1);
+                        py = clamp(py, 0, (int)h - 1);
+                        uint ppix = (uint)py * w + (uint)px;
+                        float4 prevHP = PrevHitPos[ppix];
+                        // Disocclusion test: the previous primary hit at that pixel
+                        // must be a valid solid hit (prevHP.w > 0.5) AND the SAME
+                        // world point as P. Tolerance scales with distance (clip.w)
+                        // so far surfaces -- where one pixel spans more world space
+                        // -- are not falsely rejected by sub-pixel parallax.
+                        float tol = max(0.75, clip.w * 0.02);
+                        float3 dlt = prevHP.xyz - hp;
+                        [branch] if (prevHP.w > 0.5 && dot(dlt, dlt) <= tol * tol) {
+                            srcPix = ppix;        // accept aligned history
+                        } else {
+                            histValid = false;    // disocclusion / different surface -> fresh
+                        }
+                    } else {
+                        histValid = false;        // reprojected off-screen -> fresh
+                    }
+                } else {
+                    histValid = false;            // behind previous camera -> fresh
+                }
+            } else {
+                histValid = false;                // sky / miss -> fresh
+            }
+        }
+
+        float4 hist = PrevAccum[srcPix];                       // ping-pong: read previous frame
+        float n = (accumFrame == 0 || !histValid) ? 0.0 : min(hist.a, cap);
         float3 avg = (hist.rgb * n + col) / (n + 1.0);
-        Accum[pix] = float4(avg, n + 1.0);
+        Accum[pix]  = float4(avg, n + 1.0);                    // ping-pong: write current frame
+        HitPos[pix] = float4(hp, primHit ? 1.0 : 0.0);         // primary-hit world pos for next-frame reprojection
         col = avg;
     }
 
@@ -537,8 +613,12 @@ struct CamCB {
     int   dither;          int   aoSamples;        int shadowSamples; int giSamples; // row 8
     int   giDenoise;       float giHistMax;        int emptySkip; int brickDim;      // row 9
     int   giDebug;         int   giBounces;        float giEmissive; float voxEmissive;  // row 10
-    float emissiveSurface; float giIntensity;      int ePad11b;      int ePad11c;        // row 11
+    float emissiveSurface; float giIntensity;      int reproject;    int ePad11c;        // row 11
+    float prevVP[16];                                                                    // rows 12-15: previous-frame view-projection (row-major)
 };
+// The CBV is uploaded into a 256-byte buffer (MakeUpload(256)); keep the mirror at
+// exactly 16 float4 rows so prevVP lands on rows 12-15 and nothing overruns.
+static_assert(sizeof(CamCB) == 256, "CamCB must stay 256 bytes (16 x 16-byte rows) to match cbuffer + camBuf size");
 
 std::vector<std::uint32_t> GenerateScene(UINT g) {
     std::vector<std::uint32_t> v(static_cast<size_t>(g) * g * g, 0);
@@ -625,7 +705,13 @@ struct Renderer::Impl {
     std::uint32_t*                    voxelPtr   = nullptr;      // persistent map into voxelBuf
     ComPtr<ID3D12Resource>            camBuf;
     std::uint8_t*                     camPtr = nullptr;
-    ComPtr<ID3D12Resource>            accumBuf;       // GI temporal accumulation (RWStructuredBuffer<float4>)
+    // GI temporal accumulation -- PING-PONG pair (swapped each frame): one set is
+    // CURRENT (written this frame: u0 accum / u1 hitpos), the other is PREVIOUS
+    // (read this frame for reprojection: u2 accum / u3 hitpos). accumPair selects
+    // which physical buffer is "current". Both default-heap RWStructuredBuffer<float4>.
+    ComPtr<ID3D12Resource>            accumBuf[2];    // [i]=GI running avg+count
+    ComPtr<ID3D12Resource>            hitPosBuf[2];   // [i]=primary-hit world pos + valid flag
+    UINT                              accumPair = 0;  // index of the CURRENT buffer this frame
     ComPtr<ID3D12Resource>            blueNoiseBuf;   // 64x64 blue-noise tile (StructuredBuffer<float> t1)
     ComPtr<ID3D12Resource>            paletteBuf;     // 256-entry RGBA8 palette (StructuredBuffer<uint> t2)
     std::uint32_t*                    palettePtr = nullptr;      // persistent map into paletteBuf
@@ -654,6 +740,9 @@ struct Renderer::Impl {
     bool                              giDenoise = true;   // QUALITY temporal denoise (Renderer::SetGiDenoise)
     bool                              emptySkip = true;   // empty-space skipping (Renderer::SetEmptySpaceSkip)
     bool                              giDebug   = false;  // GI-only debug view (Renderer::SetGiDebug)
+    bool                              giReproject = true; // QUALITY temporal reprojection (Renderer::SetGiReproject)
+    float                             prevVP[16] = {};    // previous frame's view-projection (row-major) for reprojection
+    bool                              havePrevVP = false; // false until the first frame's VP has been stored
 
     void WaitIdle() {
         if (!queue || !fence) return;
@@ -759,8 +848,12 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     if (FAILED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&d.fence)))) return false;
     d.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-    // --- root signature: CBV(b0) + SRV(t0 Voxels) + UAV(u0 Accum) + SRV(t1 BlueNoise) + SRV(t2 Palette) + SRV(t3 BrickOccupancy) ---
-    D3D12_ROOT_PARAMETER rp[6]{};
+    // --- root signature ---
+    // CBV(b0) + SRV(t0 Voxels) + UAV(u0 Accum) + SRV(t1 BlueNoise) + SRV(t2 Palette)
+    // + SRV(t3 BrickOccupancy) + UAV(u1 HitPos) + UAV(u2 PrevAccum) + UAV(u3 PrevHitPos).
+    // u0/u1 are the CURRENT ping-pong buffers (written), u2/u3 the PREVIOUS (read for
+    // temporal reprojection). The binding addresses are swapped each frame in RenderFrame.
+    D3D12_ROOT_PARAMETER rp[9]{};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister = 0;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -768,7 +861,7 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     rp[1].Descriptor.ShaderRegister = 0;
     rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-    rp[2].Descriptor.ShaderRegister = 0;
+    rp[2].Descriptor.ShaderRegister = 0;   // u0 Accum (current)
     rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     rp[3].Descriptor.ShaderRegister = 1;   // t1
@@ -779,8 +872,17 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     rp[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     rp[5].Descriptor.ShaderRegister = 3;   // t3 BrickOccupancy
     rp[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[6].Descriptor.ShaderRegister = 1;   // u1 HitPos (current)
+    rp[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[7].Descriptor.ShaderRegister = 2;   // u2 PrevAccum (previous)
+    rp[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rp[8].Descriptor.ShaderRegister = 3;   // u3 PrevHitPos (previous)
+    rp[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 6;
+    rs.NumParameters = 9;
     rs.pParameters = rp;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> rsBlob, rsErr;
@@ -860,9 +962,17 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     if (!d.camBuf) return false;
     d.camBuf->Map(0, &none, reinterpret_cast<void**>(&d.camPtr));
 
-    // --- GI temporal-accumulation buffer (default-heap UAV: float4 per pixel) ---
-    d.accumBuf = d.MakeDefaultUAV(static_cast<UINT64>(d.width) * d.height * 16);
-    if (!d.accumBuf) return false;
+    // --- GI temporal buffers: PING-PONG accumulation + hit-position (default-heap
+    // UAVs, float4 per pixel each). Two of each so we can read the previous frame's
+    // Accum/HitPos (for temporal reprojection) while writing the current frame's. ---
+    {
+        const UINT64 pixBytes = static_cast<UINT64>(d.width) * d.height * 16;  // float4 per pixel
+        for (int i = 0; i < 2; ++i) {
+            d.accumBuf[i]  = d.MakeDefaultUAV(pixBytes);
+            d.hitPosBuf[i] = d.MakeDefaultUAV(pixBytes);
+            if (!d.accumBuf[i] || !d.hitPosBuf[i]) return false;
+        }
+    }
 
     // --- Blue-noise tile: 64x64 floats generated via void-and-cluster on the CPU ---
     // Reference: Ulichney 1993, "The void-and-cluster method for dither array generation."
@@ -1113,6 +1223,39 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.voxEmissive    = std::max(0.0f, fp.vox_emissive);   // host sets >1 only when a .vox map is loaded
     cb.emissiveSurface = std::max(0.0f, fp.emissive_surface);  // dims the emitter's OWN surface glow (not its GI contribution)
     cb.giIntensity    = std::max(0.0f, fp.gi_intensity);   // indirect-strength dial (>1 brightens dim rooms)
+    cb.reproject      = d.giReproject ? 1 : 0;
+
+    // --- Build this frame's view-projection (row-major) for temporal reprojection.
+    // It is the exact algebraic inverse of the shader's primary-ray generation, so
+    // projecting a world point P gives the screen pixel whose ray hits P:
+    //   xv = (P-cam).right, yv = (P-cam).up, zv = (P-cam).fwd  (orthonormal basis)
+    //   clip = (xv/(tf*aspect), yv/tf, zv, zv);  ndc = clip.xy/clip.w
+    //   uv = (ndc.x*0.5+0.5, -ndc.y*0.5+0.5)   (matches PSMain's ndc.y = -ndc.y flip)
+    // Rows 0/1 are the right/up basis scaled by the inverse FOV terms, rows 2/3 are
+    // the forward basis (depth + perspective w). The shader does mul(prevVP, P).
+    {
+        const float tf      = std::tan(fp.cam_fov * 0.5f);
+        const float aspect  = cb.aspect;
+        const float invX    = 1.0f / std::max(tf * aspect, 1e-6f);
+        const float invY    = 1.0f / std::max(tf, 1e-6f);
+        const float* e      = fp.cam_pos;
+        const float dotR    = right[0] * e[0] + right[1] * e[1] + right[2] * e[2];
+        const float dotU    = up[0]    * e[0] + up[1]    * e[1] + up[2]    * e[2];
+        const float dotF    = fwd[0]   * e[0] + fwd[1]   * e[1] + fwd[2]   * e[2];
+        float curVP[16] = {
+            right[0] * invX, right[1] * invX, right[2] * invX, -dotR * invX,  // row 0 -> clip.x
+            up[0]    * invY, up[1]    * invY, up[2]    * invY, -dotU * invY,  // row 1 -> clip.y
+            fwd[0],          fwd[1],          fwd[2],          -dotF,         // row 2 -> clip.z (depth)
+            fwd[0],          fwd[1],          fwd[2],          -dotF,         // row 3 -> clip.w (== zv)
+        };
+        // Upload the PREVIOUS frame's VP (first frame: use current; accumFrame==0
+        // gates reprojection anyway, so the self-projection is harmless).
+        const float* vpSrc = d.havePrevVP ? d.prevVP : curVP;
+        std::memcpy(cb.prevVP, vpSrc, sizeof(cb.prevVP));
+        // Remember this frame's VP for next frame's reprojection.
+        std::memcpy(d.prevVP, curVP, sizeof(d.prevVP));
+        d.havePrevVP = true;
+    }
 
     // Temporal accumulation with motion-adaptive denoise.
     //
@@ -1154,10 +1297,19 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         d.accumFrame = 0;                 // scene/lighting changed: history invalid -> hard reset
     } else if (camSame) {
         ++d.accumFrame;                   // fully still: keep converging (cap stays 2048)
+    } else if (d.giReproject) {
+        // Pure camera motion with REPROJECTION ON: history is realigned per-pixel
+        // in the shader (the current hit is projected through the previous VP and
+        // matched against the previous hit position), and disoccluded pixels reset
+        // themselves. So we KEEP history, keep advancing the sample sequence, and
+        // keep the cap large -- aligned history can be trusted just like a still
+        // frame, which is what makes motion clean instead of a 1-spp noise storm.
+        ++d.accumFrame;                   // cap stays kHistMaxStill
     } else if (d.giDenoise) {
-        // Pure camera motion with denoise ON: KEEP history, advance the sample
-        // sequence, and shorten the cap based on motion magnitude. Larger motion
-        // -> smaller cap -> higher EMA alpha -> less ghosting (but a touch noisier).
+        // Pure camera motion, reprojection OFF but denoise ON: screen-space EMA.
+        // KEEP history, advance the sample sequence, and shorten the cap based on
+        // motion magnitude. Larger motion -> smaller cap -> higher EMA alpha ->
+        // less ghosting (but a touch noisier). This is the original behaviour.
         ++d.accumFrame;
         float dp = 0.0f;
         for (int i = 0; i < 3; ++i) { float e = fp.cam_pos[i] - d.accCamKey[i]; dp += e * e; }
@@ -1172,7 +1324,7 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         const float alpha  = std::min(0.45f, 0.15f + motion);
         histMax = (1.0f / alpha) - 1.0f;  // cap s.t. shader's 1/(n+1) == alpha
     } else {
-        d.accumFrame = 0;                 // camera moved, denoise OFF: original hard reset
+        d.accumFrame = 0;                 // camera moved, reproject + denoise OFF: original hard reset
     }
 
     std::memcpy(d.accCamKey,   camKey,   sizeof(camKey));
@@ -1185,6 +1337,14 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.emptySkip  = d.emptySkip ? 1 : 0;
     cb.brickDim   = static_cast<int>(kBrickDim);
     std::memcpy(d.camPtr, &cb, sizeof(cb));
+
+    // Ping-pong selection: this frame WRITES the "cur" Accum/HitPos (u0/u1) and
+    // READS last frame's "prev" Accum/HitPos (u2/u3). accumPair flips at the end so
+    // the buffers written this frame become next frame's "prev". WaitIdle() at the
+    // end of every frame guarantees the GPU finished the previous write before the
+    // swap reuses it, so no explicit UAV barrier is needed across frames.
+    const UINT curBuf  = d.accumPair;
+    const UINT prevBuf = d.accumPair ^ 1u;
 
     d.alloc->Reset();
     d.list->Reset(d.alloc.Get(), d.pso.Get());
@@ -1213,10 +1373,13 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     d.list->SetGraphicsRootSignature(d.rootSig.Get());
     d.list->SetGraphicsRootConstantBufferView(0, d.camBuf->GetGPUVirtualAddress());
     d.list->SetGraphicsRootShaderResourceView(1, d.voxelBuf->GetGPUVirtualAddress());
-    d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf->GetGPUVirtualAddress());
+    d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf[curBuf]->GetGPUVirtualAddress());    // u0 Accum (current, write)
     d.list->SetGraphicsRootShaderResourceView(3, d.blueNoiseBuf->GetGPUVirtualAddress());
     d.list->SetGraphicsRootShaderResourceView(4, d.paletteBuf->GetGPUVirtualAddress());
     d.list->SetGraphicsRootShaderResourceView(5, d.brickBuf->GetGPUVirtualAddress());
+    d.list->SetGraphicsRootUnorderedAccessView(6, d.hitPosBuf[curBuf]->GetGPUVirtualAddress());   // u1 HitPos (current, write)
+    d.list->SetGraphicsRootUnorderedAccessView(7, d.accumBuf[prevBuf]->GetGPUVirtualAddress());   // u2 PrevAccum (previous, read)
+    d.list->SetGraphicsRootUnorderedAccessView(8, d.hitPosBuf[prevBuf]->GetGPUVirtualAddress());  // u3 PrevHitPos (previous, read)
     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     d.list->DrawInstanced(3, 1, 0, 0);
 
@@ -1229,6 +1392,11 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     d.queue->ExecuteCommandLists(1, lists);
     d.swap->Present(1, 0);
     d.WaitIdle();
+
+    // Flip the ping-pong: the Accum/HitPos written this frame become next frame's
+    // "previous" (the reprojection source). Only meaningful in QUALITY mode but
+    // harmless to flip always.
+    d.accumPair ^= 1u;
 }
 
 void Renderer::SetVoxels(const std::vector<std::uint32_t>& grid, const std::uint32_t* palette256) {
@@ -1366,6 +1534,18 @@ void Renderer::SetGiDebug(bool enabled) {
     d.accHave    = false;
 }
 
+void Renderer::SetGiReproject(bool enabled) {
+    if (!impl_) return;
+    Impl& d = *impl_;
+    if (d.giReproject == enabled) return;
+    d.giReproject = enabled;
+    // Switching the history-alignment strategy (reprojected vs screen-space EMA)
+    // changes how history is interpreted, so restart accumulation for a clean A/B
+    // switch rather than blending the two regimes.
+    d.accumFrame = 0;
+    d.accHave    = false;
+}
+
 bool Renderer::CaptureScreenshot(const std::string& path, bool png) {
     if (!valid_) return false;
     Impl& d = *impl_;
@@ -1495,6 +1675,7 @@ void Renderer::EditVoxels(int, int, int, int, int, int, const std::uint32_t*, co
 void Renderer::SetGiDenoise(bool) {}
 void Renderer::SetEmptySpaceSkip(bool) {}
 void Renderer::SetGiDebug(bool) {}
+void Renderer::SetGiReproject(bool) {}
 bool Renderer::CaptureScreenshot(const std::string&, bool) { return false; }
 void Renderer::Shutdown() {}
 }  // namespace vox::render

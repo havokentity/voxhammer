@@ -85,6 +85,18 @@ public:
     // effect in PERFORMANCE mode (no GI is computed there).
     void SetGiDebug(bool enabled);
 
+    // QUALITY-mode GI temporal REPROJECTION toggle (default ON). When on, each
+    // pixel's accumulated GI history is realigned across camera motion: the current
+    // primary-hit world point is projected through the previous frame's
+    // view-projection to find where it appeared last frame, and that pixel's history
+    // is reused only when it is the same world point (no disocclusion). This lets a
+    // long, clean history be trusted while the camera moves, so motion is far
+    // sharper with little ghosting. Off falls back to the screen-space temporal EMA
+    // (SetGiDenoise) that blends the SAME screen pixel regardless of motion, for A/B
+    // comparison. No effect in PERFORMANCE mode. Independent of SetGiDenoise (which
+    // governs the off path's motion-adaptive history cap).
+    void SetGiReproject(bool enabled);
+
     // Hot-update the voxel grid and palette without restarting.
     // grid must contain exactly kGrid^3 (64^3 = 262144) uint32 entries.
     // palette256 must point to 256 RGBA8 uints (VoxPalette::data()).
