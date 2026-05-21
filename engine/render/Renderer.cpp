@@ -364,9 +364,12 @@ bool traceVoxel(float3 ro, float3 rd, int maxSteps, out float3 hp, out float3 nr
     // assigns a normal, so without this the hit keeps the bogus default-up nrm. That
     // wrong normal points the AO/GI ray offset (hp + nrm*eps) ALONG the wall instead
     // of off it -> the secondary rays self-occlude -> the whole boundary face goes BLACK.
+    // Pick the ENTRY axis = whichever per-axis entry distance equals tBox. (Must
+    // compare ts.x/ts.y/ts.z to EACH OTHER -- comparing tBox, which IS the max, to
+    // ts.y/ts.z is always true and would wrongly pick X for every direction.)
     [branch] if (tBox > 0.0) {
-        if      (tBox >= ts.y && tBox >= ts.z) nrm = float3(-stepv.x, 0, 0);  // entered through an X face
-        else if (tBox >= ts.z)                 nrm = float3(0, -stepv.y, 0);  // entered through a Y face
+        if      (ts.x >= ts.y && ts.x >= ts.z) nrm = float3(-stepv.x, 0, 0);  // entered through an X face
+        else if (ts.y >= ts.z)                 nrm = float3(0, -stepv.y, 0);  // entered through a Y face
         else                                   nrm = float3(0, 0, -stepv.z);  // entered through a Z face
     }
     float3 tDelta = abs(1.0 / rd);
