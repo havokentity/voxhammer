@@ -404,7 +404,8 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
     });
     c.RegisterCommand("pix_capture_next_frame", "Trigger a PIX GPU capture (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("pix: stub"); });
     c.RegisterCommand("reload_scene", "Reload the current scene (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("reload_scene: stub"); });
-    c.RegisterCommand("physics.dump_islands", "Dump active PhysX islands (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("0 active islands"); });
+    // physics.dump_islands is re-registered later (after `physics` is constructed) so it can
+    // report PhysicsWorld::ActiveIslands() instead of a hardcoded stub.
     c.RegisterCommand("voxel.dump_chunks", "Dump resident voxel chunks (stub).", [](std::span<const std::string_view>, Output& o) { o.Print("0 chunks resident"); });
     c.RegisterCommand("setcursor", "Snap the voxel placement cursor (voxel.cursor.*) to the current camera position.", [](std::span<const std::string_view>, Output& o) {
         Console& cc = Console::Get();
@@ -656,6 +657,12 @@ int main(int argc, char** argv) {
     // Both call renderer.SetVoxels (WaitIdle + memcpy) on the main thread (via console.Drain).
     {
         Console& c = Console::Get();
+        // Report the live count of awake dynamic rigid bodies. ActiveIslands() exists in
+        // both builds (real value under PhysX, 0 in the stub), so no gating is needed.
+        c.RegisterCommand("physics.dump_islands", "Report active (awake) dynamic rigid bodies.",
+            [&physics](std::span<const std::string_view>, Output& o) {
+                o.Format("{} active islands", physics.ActiveIslands());
+            });
         c.RegisterCommand("voxel.place",
             "Stamp voxel.import_path into the world at (voxel.cursor.x/y/z). Additive.",
             [&world, &renderer, &voxLoaded](std::span<const std::string_view>, Output& o) {
