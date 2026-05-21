@@ -635,8 +635,14 @@ struct Renderer::Impl {
     // invalidates history -> hard reset (accumFrame=0). A pure camera change keeps
     // history and only shortens the accumulation cap (motion-adaptive EMA) when
     // denoise is enabled; with denoise off it still hard-resets like the original.
-    float                             accCamKey[6]    = {};
-    float                             accSceneKey[17] = {};
+    // MUST equal the element count of the camKey / sceneKey arrays built in
+    // RenderFrame. (A mismatch makes memcmp/memcpy over/under-run -> "scene
+    // changed" fires every frame -> accumFrame resets every frame -> GI never
+    // converges. The sceneKey literal below uses these via static_assert.)
+    static constexpr int kCamKeyLen   = 6;
+    static constexpr int kSceneKeyLen = 19;
+    float                             accCamKey[kCamKeyLen]     = {};
+    float                             accSceneKey[kSceneKeyLen] = {};
     bool                              accHave = false;
     UINT                              accumFrame = 0;
     bool                              giDenoise = true;   // QUALITY temporal denoise (Renderer::SetGiDenoise)
@@ -1109,10 +1115,10 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     // motion-adaptive exponential moving average (alpha ~= 1/(cap+1)) -- this is
     // what removes the 1-spp noise storm in motion. With denoise off, a camera
     // change hard-resets like the original (full noise storm, for A/B testing).
-    const float camKey[6] = {
+    const float camKey[Impl::kCamKeyLen] = {
         fp.cam_pos[0], fp.cam_pos[1], fp.cam_pos[2], fp.cam_yaw, fp.cam_pitch, fp.cam_fov,
     };
-    const float sceneKey[19] = {
+    const float sceneKey[Impl::kSceneKeyLen] = {
         fp.sun[0], fp.sun[1], fp.sun[2], fp.exposure, fp.ambient,
         fp.clear[0], fp.clear[1], fp.clear[2], fp.shadow_softness, fp.ao_strength, fp.ao_radius,
         static_cast<float>(fp.lighting_mode), static_cast<float>(fp.hdr),
@@ -1120,6 +1126,10 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         static_cast<float>(fp.shadow_samples), static_cast<float>(fp.gi_samples),
         static_cast<float>(fp.gi_bounces), fp.gi_emissive,
     };
+    // Compile-time guard: the stored copies (Impl::accCamKey/accSceneKey) MUST be
+    // the same length as these keys, or the memcmp/memcpy below over-run.
+    static_assert(sizeof(camKey)   == sizeof(d.accCamKey),   "camKey vs accCamKey length mismatch");
+    static_assert(sizeof(sceneKey) == sizeof(d.accSceneKey), "sceneKey vs accSceneKey length mismatch");
     const bool sceneSame = d.accHave && std::memcmp(sceneKey, d.accSceneKey, sizeof(sceneKey)) == 0;
     const bool camSame   = d.accHave && std::memcmp(camKey,   d.accCamKey,   sizeof(camKey))   == 0;
 
