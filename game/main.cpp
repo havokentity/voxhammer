@@ -116,152 +116,265 @@ void GenerateDemoScene(vox::voxel::VoxScene& vs) {
 
 #if defined(VOX_HAVE_PHYSX)
 // ---------------------------------------------------------------------------
-// Carve debris (PASS 2). Spawns a few dynamic PhysX boxes when the player
-// carves and renders each as a chunky voxel cube by RE-INSERTING it into the
-// live GPU voxel grid via Renderer::EditVoxels -- the renderer is untouched.
+// Voxel-chunk fracture (Teardown-style). When the player carves, the REAL
+// voxels removed from that volume are captured (their grid positions + ORIGINAL
+// materials), grouped into a few rigid CHUNKS, and each chunk is spawned as a
+// pooled PhysX box. Every frame each live chunk is re-stamped into the live GPU
+// voxel grid at the body's FULL transform (position + rotation) so the actual
+// shape + colors fall out and TUMBLE -- not generic cubes.
 //
-// Debris voxels live ONLY in the GPU grid, never in the VoxelWorld. So the
-// authoritative terrain at any cell is always world.GetVoxel(): to ERASE a
-// debris cube we simply rewrite its cells with whatever the VoxelWorld says is
-// there (usually air), which is non-destructive even when debris falls through
-// solid terrain. To DRAW one we overwrite its cells with the debris material.
-// We track each body's previous + current grid AABB so each frame clears last
-// frame's footprint before painting the new one.
+// Render invariant (unchanged from the placeholder): debris voxels live ONLY in
+// the GPU grid, never in the VoxelWorld. The authoritative terrain at any cell
+// is always world.GetVoxel(). To draw a chunk we overwrite the cells inside its
+// rotated bounding box with either the chunk's voxel (if a cell maps inside the
+// chunk's local solid) or the terrain (if not). To erase last frame's footprint
+// we rewrite its previous bounding box with terrain. One EditVoxels per chunk.
+//
+// Rotated render uses INVERSE-SAMPLING: for every WORLD cell in the chunk's
+// rotated AABB we inverse-transform its center into chunk-local space and sample
+// the local solid array -- so a rotated chunk is gap-free (forward-rasterizing
+// local->world leaves holes once rotated).
+//
+// PASS 2 scale-up: bodies are object-pooled (PhysicsWorld Acquire/ReleaseBox);
+// the per-frame footprint clear+repaint is built in parallel across chunks via
+// JobScheduler::ParallelFor, then the EditVoxels uploads are applied serially on
+// the main thread (chunk AABBs overlap -> the shared mapped GPU buffer races).
 // ---------------------------------------------------------------------------
 class DebrisField {
 public:
-    // The debris material index (a palette slot chosen by main to be free in the
-    // live render palette and pinned in both that palette and world.Palette()).
+    // The debris material is no longer a single color: each chunk stores its
+    // voxels' ORIGINAL materials. `debrisMaterial` is kept only as a fallback
+    // for any captured cell whose material reads back as 0 (shouldn't happen).
     void Init(std::uint8_t debrisMaterial) { debrisMat_ = debrisMaterial; }
 
-    // Live-debris cap (voxel.debris.max) -- skip spawning past this to bound perf.
+    // Live-chunk cap (voxel.debris.max) -- also sizes the PhysX body pool.
     void SetMaxLive(int maxLive) { maxLive_ = maxLive > 0 ? maxLive : 0; }
-    // Chunk-size multiplier (voxel.debris.scale) -- dials overall chunkiness.
+    // Chunk-size multiplier (voxel.debris.scale) -- dials how finely the carve
+    // volume is partitioned into chunks (>1 = fewer/bigger chunks).
     void SetScale(float scale) { scale_ = scale > 0.0f ? scale : 0.0f; }
 
-    // Spawn a debris burst at a carved hit. Count scales with the carve radius
-    // (bigger carve -> more chunks), capped by voxel.debris.max. Each chunk gets
-    // its OWN random cube edge (1..4 voxels, * scale) so debris looks varied, and
-    // an outward+upward velocity so they scatter.
-    void Spawn(vox::physics::PhysicsWorld& physics, int hx, int hy, int hz,
-               int carveRadius) {
-        // Count grows with radius: ~3 chunks per voxel of radius (+jitter),
-        // clamped to a sane burst size before the global live cap applies.
-        const int base = 4 + carveRadius * 3 + static_cast<int>(rng_() % 5);
-        SpawnBurst(physics, static_cast<float>(hx) + 0.5f,
-                   static_cast<float>(hy) + 0.5f, static_cast<float>(hz) + 0.5f,
-                   carveRadius, std::clamp(base, 4, 64),
-                   /*force=*/0.0f, /*radial=*/false);
+    // Pre-size the PhysX body pool to the live cap so spawns recycle actors.
+    void ReservePool(vox::physics::PhysicsWorld& physics) {
+        physics.ReservePool(maxLive_);
     }
 
-    // Spawn a burst of `count` debris boxes centered at world (cx,cy,cz). With
-    // radial=true each chunk's velocity points away from the center (a blast),
-    // its magnitude scaled by `force`; with radial=false it's the gentle
-    // outward+upward scatter used by a plain carve. `spread` (voxels) controls
-    // how far chunks are jittered from the center. Honors the live cap.
-    void SpawnBurst(vox::physics::PhysicsWorld& physics, float cx, float cy, float cz,
-                    int spread, int count, float force, bool radial) {
-        for (int i = 0; i < count; ++i) {
-            if (static_cast<int>(live_.size()) >= maxLive_) break;  // cap live debris
-            // Per-chunk size 1..4 voxels (scaled), so bursts mix small + big.
-            int size = kMinCubeVox + static_cast<int>(rng_() % (kMaxCubeVox - kMinCubeVox + 1));
-            size = std::clamp(static_cast<int>(std::lround(size * scale_)), 1, 16);
-            const float half = 0.5f * static_cast<float>(size);  // PhysX cube half-extent (world units == voxels)
+    // Capture the solid voxels in the carve sphere (centered at the hit voxel,
+    // Euclidean |radius|) BEFORE they are carved, partition them into a few
+    // chunks, and spawn a pooled rigid body per chunk. `force`>0 + radial=true
+    // gives an explosion (velocity points outward from the blast center scaled
+    // by force); otherwise a gentle outward+upward scatter. MUST be called
+    // before world.CarveSphere so world.GetVoxel still returns the solids.
+    void SpawnFromCarve(vox::voxel::VoxelWorld& world, vox::physics::PhysicsWorld& physics,
+                        int hx, int hy, int hz, int radius, float force, bool radial) {
+        if (maxLive_ <= 0 || radius <= 0) return;
+        const int G = static_cast<int>(vox::voxel::kWorldDim);
+        const int x0 = std::max(0, hx - radius), y0 = std::max(0, hy - radius), z0 = std::max(0, hz - radius);
+        const int x1 = std::min(G, hx + radius + 1), y1 = std::min(G, hy + radius + 1), z1 = std::min(G, hz + radius + 1);
+        if (x0 >= x1 || y0 >= y1 || z0 >= z1) return;
+        const float r2 = static_cast<float>(radius) * static_cast<float>(radius);
 
-            // Jitter the spawn around the center so chunks don't stack.
-            const float jx = Frand(-1.0f, 1.0f) * static_cast<float>(spread) * 0.5f;
-            const float jy = Frand(0.0f, 1.0f) * static_cast<float>(spread) * 0.5f;
-            const float jz = Frand(-1.0f, 1.0f) * static_cast<float>(spread) * 0.5f;
-            const float sx = cx + jx;
-            const float sy = cy + jy;
-            const float sz = cz + jz;
+        // How many chunks along each axis: scale the carve box down by the chunk
+        // multiplier so bigger scale -> fewer, chunkier pieces. At least 1 split,
+        // capped so a huge crater doesn't make hundreds of chunks.
+        const float targetChunkVox = std::max(2.0f, 4.0f * scale_);  // ~edge of one chunk
+        auto splits = [&](int extent) {
+            int n = static_cast<int>(std::lround(static_cast<float>(extent) / targetChunkVox));
+            return std::clamp(n, 1, 4);
+        };
+        const int nx = splits(x1 - x0), ny = splits(y1 - y0), nz = splits(z1 - z0);
 
+        // Blast center in world units (cell-centered).
+        const float bcx = static_cast<float>(hx) + 0.5f;
+        const float bcy = static_cast<float>(hy) + 0.5f;
+        const float bcz = static_cast<float>(hz) + 0.5f;
+
+        // For each sub-box (octant-like cell of the nx*ny*nz partition) gather the
+        // solid voxels that fall inside the carve sphere into a local material grid.
+        for (int sz = 0; sz < nz; ++sz)
+        for (int sy = 0; sy < ny; ++sy)
+        for (int sx = 0; sx < nx; ++sx) {
+            if (static_cast<int>(live_.size()) >= maxLive_) return;  // cap reached
+            const int sbx0 = x0 + (x1 - x0) * sx / nx, sbx1 = x0 + (x1 - x0) * (sx + 1) / nx;
+            const int sby0 = y0 + (y1 - y0) * sy / ny, sby1 = y0 + (y1 - y0) * (sy + 1) / ny;
+            const int sbz0 = z0 + (z1 - z0) * sz / nz, sbz1 = z0 + (z1 - z0) * (sz + 1) / nz;
+            // Tight bounds of the SOLID-and-in-sphere voxels in this sub-box.
+            int mnx = sbx1, mny = sby1, mnz = sbz1, mxx = sbx0 - 1, mxy = sby0 - 1, mxz = sbz0 - 1;
+            for (int z = sbz0; z < sbz1; ++z)
+            for (int y = sby0; y < sby1; ++y)
+            for (int x = sbx0; x < sbx1; ++x) {
+                const float dx = static_cast<float>(x) + 0.5f - bcx;
+                const float dy = static_cast<float>(y) + 0.5f - bcy;
+                const float dz = static_cast<float>(z) + 0.5f - bcz;
+                if (dx * dx + dy * dy + dz * dz > r2) continue;     // outside carve sphere
+                if (world.GetVoxel(x, y, z) == 0) continue;          // not solid
+                mnx = std::min(mnx, x); mny = std::min(mny, y); mnz = std::min(mnz, z);
+                mxx = std::max(mxx, x); mxy = std::max(mxy, y); mxz = std::max(mxz, z);
+            }
+            if (mxx < mnx || mxy < mny || mxz < mnz) continue;  // no solids in this cell
+
+            Chunk c;
+            c.dx = mxx - mnx + 1; c.dy = mxy - mny + 1; c.dz = mxz - mnz + 1;
+            c.mats.assign(static_cast<std::size_t>(c.dx) * c.dy * c.dz, 0u);
+            c.solidCount = 0;
+            for (int z = mnz; z <= mxz; ++z)
+            for (int y = mny; y <= mxy; ++y)
+            for (int x = mnx; x <= mxx; ++x) {
+                const float dx = static_cast<float>(x) + 0.5f - bcx;
+                const float dy = static_cast<float>(y) + 0.5f - bcy;
+                const float dz = static_cast<float>(z) + 0.5f - bcz;
+                if (dx * dx + dy * dy + dz * dz > r2) continue;
+                const std::uint8_t m = world.GetVoxel(x, y, z);
+                if (!m) continue;
+                const int lx = x - mnx, ly = y - mny, lz = z - mnz;
+                c.mats[Idx(c, lx, ly, lz)] = m ? m : debrisMat_;
+                ++c.solidCount;
+            }
+            if (c.solidCount == 0) continue;
+
+            // Local box half-extents (world units == voxels). The body's center
+            // of mass coincides with the chunk's local geometric center
+            // localCenter = (dx/2, dy/2, dz/2); at spawn that maps to spawnCenter.
+            c.localCx = 0.5f * static_cast<float>(c.dx);
+            c.localCy = 0.5f * static_cast<float>(c.dy);
+            c.localCz = 0.5f * static_cast<float>(c.dz);
+            // Spawn the body so the chunk's voxels initially coincide with the
+            // grid cells they were captured from: world center of the local box
+            // = (min corner) + localCenter.
+            const float scx = static_cast<float>(mnx) + c.localCx;
+            const float scy = static_cast<float>(mny) + c.localCy;
+            const float scz = static_cast<float>(mnz) + c.localCz;
+
+            // Velocity: radial blast or gentle scatter, computed from the chunk's
+            // offset from the blast center.
+            float ox = scx - bcx, oy = scy - bcy, oz = scz - bcz;
             float vx, vy, vz;
-            if (radial) {
-                // Velocity points radially out from the blast center + upward pop,
-                // magnitude scaled by `force`. Use the jitter offset as the
-                // outward direction (it already points away from center).
-                float dx = jx, dy = jy + 0.5f, dz = jz;  // bias slightly up
+            if (radial && force > 0.0f) {
+                float dx = ox, dy = oy + 0.5f, dz = oz;  // bias up a touch
                 const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
                 if (len > 1e-4f) { dx /= len; dy /= len; dz /= len; }
                 else { dx = Frand(-1.0f, 1.0f); dy = 1.0f; dz = Frand(-1.0f, 1.0f); }
                 const float mag = force * Frand(0.6f, 1.0f);
                 vx = dx * mag;
-                vy = dy * mag + Frand(1.0f, 4.0f);  // extra upward kick
+                vy = dy * mag + Frand(1.0f, 4.0f);
                 vz = dz * mag;
             } else {
-                // Gentle outward (from hit) + upward pop.
-                vx = jx * 2.0f + Frand(-2.0f, 2.0f);
+                vx = ox * 1.5f + Frand(-2.0f, 2.0f);
                 vy = Frand(3.0f, 8.0f);
-                vz = jz * 2.0f + Frand(-2.0f, 2.0f);
+                vz = oz * 1.5f + Frand(-2.0f, 2.0f);
             }
-            const int id = physics.AddBox(sx, sy, sz, half, vx, vy, vz);
-            if (id >= 0) {
-                live_.push_back(Tracked{id, /*hasPrev=*/false, {}, size});
-            }
+            // A healthy random spin so chunks tumble visibly.
+            const float wx = Frand(-4.0f, 4.0f), wy = Frand(-4.0f, 4.0f), wz = Frand(-4.0f, 4.0f);
+
+            const int id = physics.AcquireBox(scx, scy, scz, c.localCx, c.localCy, c.localCz,
+                                              vx, vy, vz, wx, wy, wz);
+            if (id < 0) return;  // pool exhausted
+            c.id = id;
+            live_.push_back(std::move(c));
         }
     }
 
-    // Per-frame: cull dead bodies (clearing their last footprint), then for each
-    // live body clear its previous footprint and paint its current one.
+    // Per-frame: cull dead chunks (clearing their last footprint), then re-stamp
+    // each live chunk at its body's full transform. `jobs` parallelizes the
+    // per-chunk region build; uploads are serialized on the calling (main) thread.
     void Update(vox::voxel::VoxelWorld& world, vox::physics::PhysicsWorld& physics,
-                vox::render::Renderer& renderer, float dt) {
-        // 1) Cull bodies that fell below the ground or aged out, clearing cells.
+                vox::render::Renderer& renderer, vox::jobs::JobScheduler& jobs, float dt) {
+        // 1) Cull chunks that fell below the kill plane or aged out. Build their
+        //    "clear previous footprint to terrain" work, then release the body.
         for (auto it = live_.begin(); it != live_.end();) {
             it->age += dt;
             const float y = physics.BodyPosY(it->id);
             const bool dead = !std::isfinite(y) || y < kKillY || it->age > kTtlSeconds;
             if (dead) {
-                if (it->hasPrev) ClearBox(world, renderer, it->prev);
-                physics.RemoveBody(it->id);
+                if (it->hasPrev) ClearBoxToTerrain(world, renderer, it->prev);
+                physics.ReleaseBox(it->id);
                 it = live_.erase(it);
             } else {
                 ++it;
             }
         }
-        // 2) Read live poses and re-insert each as a voxel cube.
+        if (live_.empty()) return;
+
+        // 2) Read live poses; compute each chunk's current world AABB.
         physics.EnumerateBodies(states_);
-        // Map id -> pose for the survivors we track (EnumerateBodies returns ALL
-        // live bodies; here that's exactly our debris).
-        for (auto& t : live_) {
-            const vox::physics::BodyState* st = Find(states_, t.id);
-            if (!st) continue;  // removed underneath us; skip
-            const Aabb cur = CubeAabb(st->px, st->py, st->pz, t.size);
-            // Clear the previous footprint cells that are NOT also covered by the
-            // new one (overlap is overwritten by the paint step anyway).
-            if (t.hasPrev) ClearBoxExcept(world, renderer, t.prev, cur);
-            PaintBox(renderer, cur);
-            t.prev = cur;
+        jobItems_.clear();
+        jobItems_.reserve(live_.size());
+        for (std::size_t i = 0; i < live_.size(); ++i) {
+            Chunk& t = live_[i];
+            vox::physics::BodyState st;
+            if (!FindState(states_, t.id, st)) continue;  // not live this frame
+            t.pose = st;
+            t.cur = WorldAabb(t, st);
+            jobItems_.push_back(&t);
+        }
+        if (jobItems_.empty()) return;
+
+        // 3) PARALLEL: build each chunk's region buffer (the rotated inverse-sample
+        //    rasterization over its current world AABB) off the main thread. Each
+        //    job writes only its own chunk's buffer, so there is no data race here.
+        jobs.ParallelFor(static_cast<std::uint32_t>(jobItems_.size()),
+            [this, &world](std::uint32_t begin, std::uint32_t end) {
+                for (std::uint32_t k = begin; k < end; ++k) {
+                    Chunk& t = *jobItems_[k];
+                    BuildChunkRegion(world, t);
+                }
+            });
+
+        // 4) SERIAL (main thread): apply uploads. Chunk world-AABBs can overlap,
+        //    so writing the shared persistently-mapped GPU buffer must not race.
+        //    First clear each chunk's PREVIOUS footprint that its new AABB no
+        //    longer covers (restore terrain), then paint the freshly built region.
+        for (Chunk* tp : jobItems_) {
+            Chunk& t = *tp;
+            if (t.hasPrev) ClearBoxExcept(world, renderer, t.prev, t.cur);
+            if (!EmptyBox(t.cur)) {
+                renderer.EditVoxels(t.cur.x0, t.cur.y0, t.cur.z0, t.cur.x1, t.cur.y1, t.cur.z1,
+                                    t.region.data(), nullptr);
+            }
+            t.prev = t.cur;
             t.hasPrev = true;
         }
     }
 
-    // Clear every debris cell (e.g. on world clear/reload) and forget bodies.
+    // Clear every chunk's cells (e.g. on world clear/reload) and forget chunks.
     void ClearAll(vox::voxel::VoxelWorld& world, vox::physics::PhysicsWorld& physics,
                   vox::render::Renderer& renderer) {
         for (auto& t : live_)
-            if (t.hasPrev) ClearBox(world, renderer, t.prev);
-        physics.ClearDynamics();
+            if (t.hasPrev) ClearBoxToTerrain(world, renderer, t.prev);
+        physics.ClearDynamics();  // parks pooled bodies (keeps the pool)
         live_.clear();
     }
 
     bool Empty() const { return live_.empty(); }
 
 private:
-    static constexpr int   kMinCubeVox = 1;       // smallest debris cube edge (voxels)
-    static constexpr int   kMaxCubeVox = 4;       // largest debris cube edge (voxels)
     static constexpr float kKillY      = -2.0f;   // cull below this world Y
-    static constexpr float kTtlSeconds = 12.0f;   // max debris lifetime
+    static constexpr float kTtlSeconds = 12.0f;   // max chunk lifetime
 
     struct Aabb { int x0, y0, z0, x1, y1, z1; };  // exclusive max
-    // `size` is this body's cube edge in voxels (varied per chunk), used to
-    // re-build its render AABB each frame so chunks look non-uniform.
-    struct Tracked { int id; bool hasPrev; Aabb prev; int size = kMinCubeVox; float age = 0.0f; };
+
+    // A captured fracture chunk: a local solid+material grid of dims dx*dy*dz,
+    // its geometric center (localCx,localCy,localCz) in local voxel space (the
+    // physics body's center of mass), the pooled body id, the per-frame world
+    // AABB bookkeeping and the parallel-built region upload buffer.
+    struct Chunk {
+        int dx = 0, dy = 0, dz = 0;
+        std::vector<std::uint8_t> mats;             // dx*dy*dz, 0 = empty
+        std::uint32_t solidCount = 0;
+        float localCx = 0.f, localCy = 0.f, localCz = 0.f;
+        int id = -1;
+        float age = 0.0f;                            // seconds alive (TTL / kill-plane cull)
+        bool hasPrev = false;
+        Aabb prev{};                                 // last frame's painted AABB
+        Aabb cur{};                                  // this frame's AABB
+        vox::physics::BodyState pose{};              // this frame's transform
+        std::vector<std::uint32_t> region;           // built in parallel
+    };
 
     std::uint8_t debrisMat_ = 0;
-    int          maxLive_   = 256;    // voxel.debris.max (live-body cap)
-    float        scale_     = 1.0f;   // voxel.debris.scale (chunk-size multiplier)
-    std::vector<Tracked> live_;
+    int          maxLive_   = 256;    // voxel.debris.max (live-chunk cap + pool size)
+    float        scale_     = 1.0f;   // voxel.debris.scale (chunk partition coarseness)
+    std::vector<Chunk> live_;
+    std::vector<Chunk*> jobItems_;    // chunks active THIS frame (parallel set)
     std::vector<vox::physics::BodyState> states_;
     std::mt19937 rng_{0xC0FFEEu};
 
@@ -270,72 +383,140 @@ private:
         return d(rng_);
     }
 
-    static const vox::physics::BodyState* Find(
-        const std::vector<vox::physics::BodyState>& v, int id) {
-        for (const auto& s : v) if (s.id == id) return &s;
-        return nullptr;
+    static std::size_t Idx(const Chunk& c, int lx, int ly, int lz) {
+        return static_cast<std::size_t>(lz) * c.dx * c.dy
+             + static_cast<std::size_t>(ly) * c.dx + static_cast<std::size_t>(lx);
     }
 
-    // Grid AABB (clamped to the world) covering a cube of edge `size` voxels
-    // centered at (cx,cy,cz). `size` is per-body so chunks render at varied sizes.
-    static Aabb CubeAabb(float cx, float cy, float cz, int size) {
+    static bool FindState(const std::vector<vox::physics::BodyState>& v, int id,
+                          vox::physics::BodyState& out) {
+        for (const auto& s : v) if (s.id == id) { out = s; return true; }
+        return false;
+    }
+
+    static bool EmptyBox(const Aabb& a) { return a.x0 >= a.x1 || a.y0 >= a.y1 || a.z0 >= a.z1; }
+
+    // Rotate vector v by quaternion q (x,y,z,w). Standard q*v*conj(q).
+    static void QuatRotate(const vox::physics::BodyState& q, float vx, float vy, float vz,
+                           float& ox, float& oy, float& oz) {
+        // t = 2 * cross(q.xyz, v); out = v + q.w*t + cross(q.xyz, t)
+        const float tx = 2.0f * (q.qy * vz - q.qz * vy);
+        const float ty = 2.0f * (q.qz * vx - q.qx * vz);
+        const float tz = 2.0f * (q.qx * vy - q.qy * vx);
+        ox = vx + q.qw * tx + (q.qy * tz - q.qz * ty);
+        oy = vy + q.qw * ty + (q.qz * tx - q.qx * tz);
+        oz = vz + q.qw * tz + (q.qx * ty - q.qy * tx);
+    }
+    // Rotate by the CONJUGATE (inverse) of q -- world delta -> local delta.
+    static void QuatRotateInv(const vox::physics::BodyState& q, float vx, float vy, float vz,
+                              float& ox, float& oy, float& oz) {
+        // conj(q) negates the xyz part.
+        const float tx = 2.0f * (-q.qy * vz + q.qz * vy);
+        const float ty = 2.0f * (-q.qz * vx + q.qx * vz);
+        const float tz = 2.0f * (-q.qx * vy + q.qy * vx);
+        ox = vx + q.qw * tx + (-q.qy * tz + q.qz * ty);
+        oy = vy + q.qw * ty + (-q.qz * tx + q.qx * tz);
+        oz = vz + q.qw * tz + (-q.qx * ty + q.qy * tx);
+    }
+
+    // World-space integer AABB (clamped, exclusive max) covering the chunk's
+    // rotated local box. Rotate the 8 corners of [0,dx]x[0,dy]x[0,dz] (offset by
+    // -localCenter) by the body quat, add the body position, bound, floor/ceil,
+    // pad by 1 cell so the inverse-sample never clips an edge voxel.
+    static Aabb WorldAabb(const Chunk& c, const vox::physics::BodyState& st) {
         const int G = static_cast<int>(vox::voxel::kWorldDim);
-        const int ix = static_cast<int>(std::floor(cx));
-        const int iy = static_cast<int>(std::floor(cy));
-        const int iz = static_cast<int>(std::floor(cz));
-        const int h0 = size / 2;
-        const int h1 = size - h0;  // covers even edge lengths symmetrically
-        Aabb a{ix - h0, iy - h0, iz - h0, ix + h1, iy + h1, iz + h1};
+        float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+        const float ex[2] = {-c.localCx, c.localCx};  // local box corner offsets
+        const float ey[2] = {-c.localCy, c.localCy};
+        const float ez[2] = {-c.localCz, c.localCz};
+        for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j)
+        for (int k = 0; k < 2; ++k) {
+            float rx, ry, rz;
+            QuatRotate(st, ex[i], ey[j], ez[k], rx, ry, rz);
+            const float wx = st.px + rx, wy = st.py + ry, wz = st.pz + rz;
+            lo[0] = std::min(lo[0], wx); hi[0] = std::max(hi[0], wx);
+            lo[1] = std::min(lo[1], wy); hi[1] = std::max(hi[1], wy);
+            lo[2] = std::min(lo[2], wz); hi[2] = std::max(hi[2], wz);
+        }
+        Aabb a;
+        a.x0 = static_cast<int>(std::floor(lo[0])) - 1;
+        a.y0 = static_cast<int>(std::floor(lo[1])) - 1;
+        a.z0 = static_cast<int>(std::floor(lo[2])) - 1;
+        a.x1 = static_cast<int>(std::ceil(hi[0])) + 1;
+        a.y1 = static_cast<int>(std::ceil(hi[1])) + 1;
+        a.z1 = static_cast<int>(std::ceil(hi[2])) + 1;
         a.x0 = std::clamp(a.x0, 0, G); a.y0 = std::clamp(a.y0, 0, G); a.z0 = std::clamp(a.z0, 0, G);
         a.x1 = std::clamp(a.x1, 0, G); a.y1 = std::clamp(a.y1, 0, G); a.z1 = std::clamp(a.z1, 0, G);
         return a;
     }
-    static bool EmptyBox(const Aabb& a) { return a.x0 >= a.x1 || a.y0 >= a.y1 || a.z0 >= a.z1; }
 
-    // Paint the cube's cells with the debris material.
-    void PaintBox(vox::render::Renderer& renderer, const Aabb& a) {
+    // Build chunk t's `region` buffer for its current AABB t.cur via inverse
+    // sampling: for each WORLD cell center, inverse-transform to chunk-local
+    // space, locate the containing local voxel; if solid write its ORIGINAL
+    // material, else write the authoritative terrain. Pure read of `world` +
+    // write to t.region only -> safe to run in parallel across chunks.
+    void BuildChunkRegion(const vox::voxel::VoxelWorld& world, Chunk& t) const {
+        const Aabb& a = t.cur;
+        t.region.clear();
         if (EmptyBox(a)) return;
-        BuildRegion(a, /*fillTerrain=*/false, nullptr);
-        renderer.EditVoxels(a.x0, a.y0, a.z0, a.x1, a.y1, a.z1, region_.data(), nullptr);
-    }
-    // Clear the cube's cells back to the authoritative terrain (usually air).
-    void ClearBox(vox::voxel::VoxelWorld& world, vox::render::Renderer& renderer, const Aabb& a) {
-        if (EmptyBox(a)) return;
-        BuildRegion(a, /*fillTerrain=*/true, &world);
-        renderer.EditVoxels(a.x0, a.y0, a.z0, a.x1, a.y1, a.z1, region_.data(), nullptr);
-    }
-    // Clear `a`'s cells that are NOT inside `keep` (overlap is repainted later).
-    void ClearBoxExcept(vox::voxel::VoxelWorld& world, vox::render::Renderer& renderer,
-                        const Aabb& a, const Aabb& keep) {
-        if (EmptyBox(a)) return;
-        region_.clear();
-        region_.reserve(static_cast<std::size_t>(a.x1 - a.x0) * (a.y1 - a.y0) * (a.z1 - a.z0));
+        const std::size_t n = static_cast<std::size_t>(a.x1 - a.x0) * (a.y1 - a.y0) * (a.z1 - a.z0);
+        t.region.resize(n);
+        std::size_t w = 0;
         for (int z = a.z0; z < a.z1; ++z)
-            for (int y = a.y0; y < a.y1; ++y)
-                for (int x = a.x0; x < a.x1; ++x) {
-                    const bool inKeep = x >= keep.x0 && x < keep.x1 && y >= keep.y0 &&
-                                        y < keep.y1 && z >= keep.z0 && z < keep.z1;
-                    // Inside the kept (new) box: leave as debris (it will be
-                    // repainted this frame). Otherwise restore terrain.
-                    region_.push_back(inKeep ? static_cast<std::uint32_t>(debrisMat_)
-                                             : static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
-                }
-        renderer.EditVoxels(a.x0, a.y0, a.z0, a.x1, a.y1, a.z1, region_.data(), nullptr);
+        for (int y = a.y0; y < a.y1; ++y)
+        for (int x = a.x0; x < a.x1; ++x, ++w) {
+            // World cell center -> delta from body origin -> inverse-rotate ->
+            // shift by localCenter to get the continuous local position.
+            const float wx = static_cast<float>(x) + 0.5f - t.pose.px;
+            const float wy = static_cast<float>(y) + 0.5f - t.pose.py;
+            const float wz = static_cast<float>(z) + 0.5f - t.pose.pz;
+            float lx, ly, lz;
+            QuatRotateInv(t.pose, wx, wy, wz, lx, ly, lz);
+            lx += t.localCx; ly += t.localCy; lz += t.localCz;
+            // Containing local voxel = floor of the continuous local coordinate.
+            const int ix = static_cast<int>(std::floor(lx));
+            const int iy = static_cast<int>(std::floor(ly));
+            const int iz = static_cast<int>(std::floor(lz));
+            std::uint8_t m = 0;
+            if (ix >= 0 && ix < t.dx && iy >= 0 && iy < t.dy && iz >= 0 && iz < t.dz) {
+                m = t.mats[Idx(t, ix, iy, iz)];
+            }
+            t.region[w] = m ? static_cast<std::uint32_t>(m)
+                            : static_cast<std::uint32_t>(world.GetVoxel(x, y, z));
+        }
     }
 
-    // Fill region_ for box `a`. fillTerrain=true -> world terrain (clear path);
-    // false -> solid debris material (paint path).
-    void BuildRegion(const Aabb& a, bool fillTerrain, vox::voxel::VoxelWorld* world) {
-        region_.clear();
-        region_.reserve(static_cast<std::size_t>(a.x1 - a.x0) * (a.y1 - a.y0) * (a.z1 - a.z0));
+    // Clear `a`'s cells back to the authoritative terrain (cull / world clear).
+    void ClearBoxToTerrain(const vox::voxel::VoxelWorld& world, vox::render::Renderer& renderer,
+                           const Aabb& a) {
+        if (EmptyBox(a)) return;
+        scratch_.clear();
+        scratch_.reserve(static_cast<std::size_t>(a.x1 - a.x0) * (a.y1 - a.y0) * (a.z1 - a.z0));
         for (int z = a.z0; z < a.z1; ++z)
             for (int y = a.y0; y < a.y1; ++y)
                 for (int x = a.x0; x < a.x1; ++x)
-                    region_.push_back(fillTerrain ? static_cast<std::uint32_t>(world->GetVoxel(x, y, z))
-                                                  : static_cast<std::uint32_t>(debrisMat_));
+                    scratch_.push_back(static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
+        renderer.EditVoxels(a.x0, a.y0, a.z0, a.x1, a.y1, a.z1, scratch_.data(), nullptr);
     }
 
-    std::vector<std::uint32_t> region_;
+    // Restore the previous footprint to terrain. The paint step (which uploads
+    // the full `keep`=cur region right after, in the same frame) overwrites the
+    // prev/cur overlap, so clearing the WHOLE prev box to terrain is correct --
+    // cells still under the chunk get terrain then are immediately repainted
+    // before present (no visible flash). Fast-path: if prev is fully inside cur,
+    // the paint step covers all of it, so there's nothing to clear.
+    void ClearBoxExcept(const vox::voxel::VoxelWorld& world, vox::render::Renderer& renderer,
+                        const Aabb& a, const Aabb& keep) {
+        if (EmptyBox(a)) return;
+        if (a.x0 >= keep.x0 && a.x1 <= keep.x1 && a.y0 >= keep.y0 && a.y1 <= keep.y1 &&
+            a.z0 >= keep.z0 && a.z1 <= keep.z1) {
+            return;  // prev fully covered by the upcoming paint of cur
+        }
+        ClearBoxToTerrain(world, renderer, a);
+    }
+
+    std::vector<std::uint32_t> scratch_;  // serial-only (main-thread) upload buffer
 };
 #endif  // VOX_HAVE_PHYSX
 
@@ -795,6 +976,17 @@ int main(int argc, char** argv) {
                 }
                 const int radius = cc.FindCVar("voxel.break_radius")
                                        ? cc.FindCVar("voxel.break_radius")->GetInt() : 2;
+#if defined(VOX_HAVE_PHYSX)
+                // Capture the REAL voxels about to be removed as falling chunks
+                // BEFORE carving (so world.GetVoxel still returns the solids).
+                // Each chunk keeps its true shape + original colors and tumbles;
+                // the run loop re-stamps it at the body's full transform.
+                debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
+                debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
+                debris.ReservePool(physics);
+                debris.SpawnFromCarve(world, physics, hx, hy, hz, radius,
+                                      /*force=*/0.0f, /*radial=*/false);
+#endif
                 const int removed = world.CarveSphere(hx, hy, hz, radius);
                 // Push ONLY the carved region to the GPU (incremental, no full
                 // re-bake and no GPU stall) so rapid carving stays smooth.
@@ -808,14 +1000,6 @@ int main(int argc, char** argv) {
                         for (int x = x0; x < x1; ++x)
                             region.push_back(static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
                 renderer.EditVoxels(x0, y0, z0, x1, y1, z1, region.data(), nullptr);  // palette unchanged by carve
-#if defined(VOX_HAVE_PHYSX)
-                // Spawn a burst of dynamic rigid-body debris at the hit (count
-                // scales with radius, capped by voxel.debris.max); the run loop
-                // re-inserts each as a chunky voxel cube every frame.
-                debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
-                debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
-                debris.Spawn(physics, hx, hy, hz, radius);
-#endif
                 o.Format("voxel.break: removed {} voxels around hit ({},{},{}) r={}",
                          removed, hx, hy, hz, radius);
             });
@@ -851,6 +1035,18 @@ int main(int argc, char** argv) {
                 }
                 const int radius = cc.FindCVar("voxel.explode_radius")
                                        ? cc.FindCVar("voxel.explode_radius")->GetInt() : 8;
+#if defined(VOX_HAVE_PHYSX)
+                // Capture the REAL voxels about to be removed as a RADIAL debris
+                // burst BEFORE carving (so world.GetVoxel still sees the solids):
+                // each chunk keeps its true shape + original colors and tumbles
+                // outward from the crater, magnitude scaled by voxel.explode_force.
+                const float force = cc.FindCVar("voxel.explode_force")
+                                        ? cc.FindCVar("voxel.explode_force")->GetFloat() : 12.0f;
+                debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
+                debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
+                debris.ReservePool(physics);
+                debris.SpawnFromCarve(world, physics, hx, hy, hz, radius, /*force=*/force, /*radial=*/true);
+#endif
                 const int removed = world.CarveSphere(hx, hy, hz, radius);
                 // Push ONLY the carved region to the GPU (incremental, same path
                 // as voxel.break -- no full re-bake / GPU stall).
@@ -864,19 +1060,6 @@ int main(int argc, char** argv) {
                         for (int x = x0; x < x1; ++x)
                             region.push_back(static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
                 renderer.EditVoxels(x0, y0, z0, x1, y1, z1, region.data(), nullptr);  // palette unchanged by carve
-#if defined(VOX_HAVE_PHYSX)
-                // Big radial blast: chunks fly outward from the crater center,
-                // magnitude scaled by voxel.explode_force. Count scales with the
-                // (larger) radius, capped by voxel.debris.max.
-                const float force = cc.FindCVar("voxel.explode_force")
-                                        ? cc.FindCVar("voxel.explode_force")->GetFloat() : 12.0f;
-                debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
-                debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
-                const int count = std::clamp(8 + radius * 5, 8, 256);
-                debris.SpawnBurst(physics, static_cast<float>(hx) + 0.5f,
-                                  static_cast<float>(hy) + 0.5f, static_cast<float>(hz) + 0.5f,
-                                  radius, count, force, /*radial=*/true);
-#endif
                 o.Format("voxel.explode: removed {} voxels around hit ({},{},{}) r={}",
                          removed, hx, hy, hz, radius);
             });
@@ -1016,7 +1199,7 @@ int main(int argc, char** argv) {
             // Re-insert live debris bodies into the GPU voxel grid (clear last
             // frame's cells, paint this frame's) -- only when the renderer is up.
             if (renderer.Valid() && (!debris.Empty()))
-                debris.Update(world, physics, renderer, dt);
+                debris.Update(world, physics, renderer, jobs, dt);
 #endif
         }
 

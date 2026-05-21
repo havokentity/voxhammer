@@ -7,13 +7,15 @@
 namespace vox::physics {
 
 // World-space pose of a live dynamic body, returned by EnumerateBodies(). The
-// id is the dense AddDynamicBox() / AddBox() index, stable for the body's
-// lifetime; px/py/pz is its current center of mass in world units. Rotation is
-// intentionally omitted -- the voxel-debris renderer snaps chunky cubes to the
-// grid and ignores orientation.
+// id is the dense AddDynamicBox() / AddBox() / AcquireBox() index, stable for
+// the body's lifetime; px/py/pz is its current center of mass in world units.
+// (qx,qy,qz,qw) is the body's orientation quaternion (identity in the stub
+// build). The voxel-chunk renderer uses BOTH position and rotation to stamp
+// each chunk's real voxels at the body's full transform so they tumble.
 struct BodyState {
     int   id = -1;
     float px = 0.0f, py = 0.0f, pz = 0.0f;
+    float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;  // orientation (identity)
 };
 
 // NVIDIA PhysX 5 wrapper: rigid bodies, articulations, vehicles, FEM soft
@@ -57,10 +59,44 @@ public:
     // or -1 in the stub build / on failure. Used to spawn carve debris.
     int AddBox(float x, float y, float z, float half, float vx, float vy, float vz);
 
-    // Append the current world pose of every live dynamic body to |out|
-    // (cleared first). Empty in the stub build. The renderer uses each body's
-    // position to stamp a voxel cube into the grid every frame.
+    // --- Object-pooled bodies (PASS 3: chunk debris at scale) --------------
+    //
+    // The carve/chunk path creates and destroys MANY short-lived rigid bodies.
+    // AcquireBox/ReleaseBox recycle a pre-allocated free-list of PxRigidDynamic
+    // actors so per-carve churn never hits PxPhysics::create*/release. Reserve()
+    // sizes the pool (== the live-debris cap); Acquire RESETS one parked actor
+    // (resizes its box shape to the requested half-extents, sets pose +
+    // linear/angular velocity, wakes it, adds it to the scene) and returns its
+    // stable id; Release PARKS the actor (removes it from the scene, puts it on
+    // the free list) WITHOUT releasing it. Ids are dense + stable for the
+    // acquire->release lifetime and reused on the next Acquire.
+
+    // Pre-allocate up to `count` pooled dynamic actors so later AcquireBox calls
+    // recycle instead of allocating. Safe to call repeatedly (grows the pool to
+    // `count`; never shrinks below the in-use high-water mark). No-op stub.
+    void ReservePool(int count);
+
+    // Acquire a pooled dynamic box with per-axis half-extents (hx,hy,hz) at
+    // (x,y,z), initial linear velocity (vx,vy,vz) and angular velocity
+    // (wx,wy,wz). Returns a stable body id, or -1 if the pool is exhausted /
+    // stub build. Pair every AcquireBox with a ReleaseBox.
+    int AcquireBox(float x, float y, float z, float hx, float hy, float hz,
+                   float vx, float vy, float vz, float wx, float wy, float wz);
+
+    // Park a pooled body (acquired via AcquireBox) back onto the free list.
+    // No-op for an unknown id or in the stub build. The id is invalid until a
+    // subsequent AcquireBox hands it back out.
+    void ReleaseBox(int id);
+
+    // Append the current world pose (position + orientation) of every live
+    // dynamic body to |out| (cleared first). Empty in the stub build. The
+    // chunk renderer uses each body's full transform to stamp its voxels.
     void EnumerateBodies(std::vector<BodyState>& out) const;
+
+    // Look up one body's pose by id (added/acquired). Returns false (leaving
+    // |out| untouched) for an unknown/parked id or in the stub build. Lets the
+    // chunk renderer fetch a single chunk's transform without scanning.
+    bool GetBodyState(int id, BodyState& out) const;
 
     // World-space Y of the body whose id is `id` (added via AddBox/AddDynamicBox),
     // or NaN if it is not a live id. Lets the caller cull debris that fell below
