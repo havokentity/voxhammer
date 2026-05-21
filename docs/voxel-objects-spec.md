@@ -114,9 +114,22 @@ route the existing fracture chunks through it (finally drawing them as true rigi
   across frames**; regions that lose their anchor path (or drop below the stability
   threshold for their span) **detach → become new `VoxelObject`s + PhysX bodies**;
   mass/inertia come basically free from the voxel count. *Nothing floats.*
+  - **Collision shape = a greedy BOX DECOMPOSITION of the object's solid voxels** — a
+    PhysX **compound of `PxBoxGeometry`** (oriented cuboids covering the filled voxels),
+    **NOT** per-voxel and **NOT** a convex hull. Confirmed from Teardown's physics-debug
+    view (yellow OBB/box wireframes): each object + fragment is simulated as a rigid body
+    with a box/cuboid compound, and **fracture re-decomposes** the new pieces into more
+    boxes. **Render stays voxels (ray-marched); physics is boxes** — the two are linked
+    only by the rigid-body transform. Cheap, PhysX-native, scales. (Our #4 already used one
+    box per chunk; this generalizes it to a box-compound per object, re-decomposed on break.)
 - **C — Material strength + fracture-point selection + re-fracture.** Per-material
   thresholds; the stability/stress picks **where** to break (an overloaded unsupported
   span resolves to its weakest point); detached objects are themselves re-breakable.
+  Breaks happen at **ANY point** — impact-driven, **not** pre-baked seams — and
+  re-fracture **recurses all the way down to individual voxel cubes (1×1×1)**: the box
+  decomposition simply bottoms out at one box per voxel, so the finest debris is single
+  voxels. (So the spectrum is: big object [coarse box compound] → fracture → smaller
+  objects [finer boxes] → … → loose 1-voxel cubes.)
 - **D — Hinge breaks (the "dangle / sag").** A break may leave a **PhysX hinge/revolute
   joint** at the fracture point so the segment **swings down inclined** instead of cleanly
   detaching — looks like bending, is actually break + rigid pivot. **No deformation / FEM /
