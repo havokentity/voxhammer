@@ -108,6 +108,12 @@ route the existing fracture chunks through it (finally drawing them as true rigi
 ---
 ## 4. Roadmap after A
 
+**Build phasing (user-set):** prove the **static-world → break → dynamic** loop first — an
+anchored `VoxelObject` (the world) that, once carved/severed, sheds detached islands as
+**dynamic** rigid bodies (A → B → C → D). Objects that **start life dynamic** (a bench, a prop,
+a vehicle, an inclined ladder) come **last** (E), reusing the exact same primitive. Teardown
+does the same: the world is static until you break it, then the freed pieces turn dynamic.
+
 - **B — Connectivity + integer stability.** Per-object voxel-neighbour graph; **BFS from
   ANCHORS** (ground/base contact); an **integer stability** value propagates from anchors
   (cheap, capped — *not* a force solve). On carve, **re-flood the dirty region, amortized
@@ -129,7 +135,13 @@ route the existing fracture chunks through it (finally drawing them as true rigi
     is exactly **why the collider is a box-COMPOUND, not a convex hull**: a hull would
     shrink-wrap and fill the concavities (wrong collisions), whereas a union of convex boxes
     preserves the true concave shape. Concavity is free: the render is voxels (any shape),
-    the physics is the concave-capable box-compound.
+    the physics is the concave-capable box-compound. **Same property ⇒ holes for free:** a
+    carve through the *middle* of a wall doesn't sever connectivity, so it stays **one** object
+    — just perforated. The ray-march shows daylight through the empty voxels, and the
+    box-compound tiles *around* the void (a convex hull would seal it shut), so a projectile
+    throws clean through the hole and still collides with its rim. A carve that severs → islands;
+    a carve that doesn't → one concave/perforated whole — same flood-fill, the only difference
+    is topology.
   - **Connected-component coalescing → one whole per island (re-synthesis):** the grid copy
     *and* the box-compound are built **per connected component**, never per voxel. After a
     carve, the dirty-region re-flood partitions the still-solid voxels into connected islands;
@@ -142,6 +154,13 @@ route the existing fracture chunks through it (finally drawing them as true rigi
     still-connected ⇒ coalesced whole (few big boxes); shattered ⇒ many small boxes ⇒ single
     voxel cubes only at the extreme. (Inverse of fracture: fracture *splits* one object into
     many; this *coalesces* a still-joined region back into one.)
+  - **Collision/fracture = object-LOCAL integer voxel checks (orientation-free):** a query is
+    transformed into the object's local grid by `invModel` and answered with cheap **integer**
+    voxel lookups, so an arbitrarily **rotated** object needs no world-aligned grid (same trick
+    as the render DDA). Only **surface/boundary** voxels take part in collision + fracture; deep
+    **interior** voxels fold into big boxes and are skipped, and the dirty-region re-flood only
+    touches the boundary a carve actually changed. (Teardown shows these per-voxel checks done
+    in the object's own space, identical across orientations.)
 - **C — Material strength + fracture-point selection + re-fracture.** Per-material
   thresholds; the stability/stress picks **where** to break (an overloaded unsupported
   span resolves to its weakest point); detached objects are themselves re-breakable.
