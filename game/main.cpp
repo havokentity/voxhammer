@@ -333,12 +333,15 @@ public:
     // per-chunk region build; uploads are serialized on the calling (main) thread.
     void Update(vox::voxel::VoxelWorld& world, vox::physics::PhysicsWorld& physics,
                 vox::render::Renderer& renderer, vox::jobs::JobScheduler& jobs, float dt) {
-        // 1) Cull chunks that fell below the kill plane or aged out. Build their
-        //    "clear previous footprint to terrain" work, then release the body.
+        // 1) Cull chunks below the kill plane (or aged out if voxel.debris.ttl > 0; default
+        //    0 = debris PERSIST where they land, only culled when they fall off the world).
+        //    Build their "clear previous footprint to terrain" work, then release the body.
+        const float ttl = Console::Get().FindCVar("voxel.debris.ttl")
+                               ? Console::Get().FindCVar("voxel.debris.ttl")->GetFloat() : 0.0f;
         for (auto it = live_.begin(); it != live_.end();) {
             it->age += dt;
             const float y = physics.BodyPosY(it->id);
-            const bool dead = !std::isfinite(y) || y < kKillY || it->age > kTtlSeconds;
+            const bool dead = !std::isfinite(y) || y < kKillY || (ttl > 0.0f && it->age > ttl);
             if (dead) {
                 if (it->dynHandle >= 0) renderer.RemoveDynObject(it->dynHandle);  // A3: free the OBB slot
                 else if (it->hasPrev) ClearBoxToTerrain(world, renderer, it->prev);
@@ -864,6 +867,7 @@ void RegisterCoreCvars() {
     reg("voxel.explode_force", "12.0", "Radial blast velocity (units/sec) for voxel.explode debris -- chunks fly outward from the blast center.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 64.0f, .range_step = 1.0f});
     reg("voxel.debris.max", "256", "Max live debris bodies (carve + explode). Spawning is skipped at the cap to bound physics/render cost.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 4096, .range_step = 16});
     reg("voxel.debris.scale", "1.0", "Debris chunk-size multiplier (dials chunkiness; 1 = stock 1..4-voxel cubes).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.25f, .range_max = 4.0f, .range_step = 0.25f});
+    reg("voxel.debris.ttl", "0", "Seconds before debris auto-cleans. 0 = PERSIST (debris stay where they land; only culled when they fall off the world). Higher live counts cost render+physics -- lower voxel.debris.max if it slows.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 300.0f, .range_step = 5.0f});
     reg("voxel.auto_settle", "0", "Structural settle (Milestone B1): after EVERY carve (voxel.break/explode), auto-detach any voxels no longer connected to the ground and drop them as debris. Default OFF = carve behavior unchanged; turn ON to make the world 'nothing floats'. (Full-grid flood per carve; use voxel.settle to run it manually.)", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("voxel.anchor_layers", "1", "Structural settle: number of bottom grid rows (y < N) treated as GROUND anchors. A solid voxel in these layers anchors its whole connected component; anything with no path down to them detaches. 1 = only the y==0 floor.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
     reg("audio.master_volume", "0.8", "Master output volume.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
