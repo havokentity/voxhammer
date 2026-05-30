@@ -1333,7 +1333,33 @@ function init() {
     }
     $("#search").oninput = (e) => { state.search = e.target.value; renderDeck(); };
     $("#reset-group").onclick = () => { for (const cv of visibleCvars()) if (!(cv.flags & F.READONLY)) setCvar(cv.name, cv.default); renderDeck(); };
-    $("#console-form").onsubmit = (e) => { e.preventDefault(); const v = $("#console-input").value.trim(); if (!v) return; pushLog("info", "❯ " + v, "echo"); bus.send({ type: "exec", line: v }); $("#console-input").value = ""; };
+    // Command input: submit runs the line + records history; Up/Down cycle history.
+    state.cmdHistory = state.cmdHistory || JSON.parse(ls("vox.cmdhist", "[]"));
+    let cmdHistIdx = state.cmdHistory.length;
+    const cmdIn = $("#console-input");
+    $("#console-form").onsubmit = (e) => {
+        e.preventDefault();
+        const v = cmdIn.value.trim(); if (!v) return;
+        pushLog("info", "❯ " + v, "echo"); bus.send({ type: "exec", line: v });
+        if (state.cmdHistory[state.cmdHistory.length - 1] !== v) state.cmdHistory.push(v);
+        if (state.cmdHistory.length > 100) state.cmdHistory.shift();
+        localStorage.setItem("vox.cmdhist", JSON.stringify(state.cmdHistory));
+        cmdHistIdx = state.cmdHistory.length;
+        cmdIn.value = "";
+    };
+    cmdIn.addEventListener("keydown", (e) => {
+        if (e.key === "ArrowUp") {
+            if (cmdHistIdx > 0) {
+                cmdHistIdx--; cmdIn.value = state.cmdHistory[cmdHistIdx] || "";
+                e.preventDefault();
+                const n = cmdIn.value.length; requestAnimationFrame(() => cmdIn.setSelectionRange(n, n));
+            }
+        } else if (e.key === "ArrowDown") {
+            if (cmdHistIdx < state.cmdHistory.length - 1) { cmdHistIdx++; cmdIn.value = state.cmdHistory[cmdHistIdx] || ""; }
+            else { cmdHistIdx = state.cmdHistory.length; cmdIn.value = ""; }
+            e.preventDefault();
+        }
+    });
     $("#link").onclick = () => pushLog("info", state.demo ? "DEMO: open the engine at https://localhost:27960/ for a live link" : "link active");
     wirePalette();
     wireFavoritesBtn();
