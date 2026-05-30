@@ -1369,9 +1369,31 @@ function init() {
             });
             const a = ac.children[acIdx]; if (a) a.scrollIntoView({ block: "nearest" });
         };
+        // VSCode-style fuzzy subsequence score: query chars must appear IN ORDER in the
+        // target; bonuses for consecutive runs and for matching at a segment boundary
+        // (string start or right after '.'/'_', so "rgb" -> "renderer.gi.bounces"). -1 = no match.
+        const fuzzy = (q, t) => {
+            q = q.toLowerCase(); t = t.toLowerCase();
+            if (!q) return 0;
+            let qi = 0, score = 0, prev = -2;
+            for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+                if (t[ti] === q[qi]) {
+                    let s = 1;
+                    if (ti === prev + 1) s += 5;                                       // consecutive run
+                    if (ti === 0 || t[ti - 1] === "." || t[ti - 1] === "_") s += 8;     // segment boundary
+                    score += s; prev = ti; qi++;
+                }
+            }
+            if (qi < q.length) return -1;                  // not all query chars matched, in order
+            if (t.startsWith(q)) score += 12;              // exact-prefix bonus
+            return score - t.length * 0.1;                 // mild shorter-is-better tiebreak
+        };
         const filterAC = () => {
-            const tok = (inp.value.trim().split(/\s+/)[0] || "").toLowerCase();
-            acItems = candidates().filter((c) => c.name.toLowerCase().includes(tok)).slice(0, 200);
+            const tok = inp.value.trim().split(/\s+/)[0] || "";
+            const scored = [];
+            for (const c of candidates()) { const s = fuzzy(tok, c.name); if (s >= 0) scored.push({ name: c.name, kind: c.kind, s }); }
+            scored.sort((a, b) => b.s - a.s || a.name.localeCompare(b.name));
+            acItems = scored.slice(0, 200);
             if (acIdx >= acItems.length) acIdx = Math.max(0, acItems.length - 1);
             renderAC();
         };
