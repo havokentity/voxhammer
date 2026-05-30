@@ -27,6 +27,7 @@ std::vector<KeyBinding> DefaultBindings() {
         {"G", MOD_NONE, "command voxel.explode"},
         {"F11", MOD_NONE, "cvar.toggle renderer.hdr.enabled"},
         {"PrintScreen", MOD_NONE, "command pix_capture_next_frame"},
+        {"Grave", MOD_NONE, "command console.open"},
     };
 }
 

@@ -31,6 +31,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <random>
 #include <string>
@@ -678,6 +679,14 @@ void RegisterCoreCommands(ConsoleServer& server, pf::Keybindings& kb) {
             ShellExecuteW(nullptr, L"open", widePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             o.Format("opened {}", pf::UserDataDir());
         });
+    c.RegisterCommand("console.open", "Open this web console in the default browser (bind to a key, e.g. Grave/backtick).",
+        [](std::span<const std::string_view>, Output& o) {
+            int port = 27960;
+            if (CVar* pw = Console::Get().FindCVar("remote.port_ws")) port = pw->GetInt();
+            const std::wstring url = L"https://127.0.0.1:" + std::to_wstring(port) + L"/";
+            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            o.Format("opened https://127.0.0.1:{}/", port);
+        });
 
     // --- keybindings management (the web editor drives these via `exec`) ---
     c.RegisterCommand("binds", "List keybindings as JSON.", [&kb](std::span<const std::string_view>, Output& o) {
@@ -833,7 +842,13 @@ int main(int argc, char** argv) {
             palettePtr = vs.palette.data();
             vox::log::Info("voxel: imported {} ({} voxels, {} chunks)", ip->value, vs.voxelCount, world.ResidentChunks());
         } else {
-            vox::log::Warn("voxel: failed to import {}", ip->value);
+            vox::log::Warn("voxel: failed to import '{}' -- falling back to the procedural demo scene", ip->value);
+            // The saved camera was framed for the now-missing .vox scene, so leaving it would
+            // strand the view in the demo scene's empty space (reads as a black screen). Snap
+            // the camera cvars back to the default establishing shot so the fallback is visible.
+            console.SetCVarOverride("camera.pos",   "32 40 -24");
+            console.SetCVarOverride("camera.yaw",   "0.0");
+            console.SetCVarOverride("camera.pitch", "-0.5");
         }
     }
     if (!haveVoxels) {
@@ -1133,7 +1148,27 @@ int main(int argc, char** argv) {
             voxLoaded = true;
             auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
             renderer.SetVoxels(grid, world.Palette().data());
-            vox::log::Info("voxel: dropped {} ({} voxels) at ({},{},{})", name, vs.voxelCount, cx, cy, cz);
+            // Cache the uploaded bytes to <userdata>/uploads/<name> and point
+            // voxel.import_path at it, so the web "Place" button (which re-stamps
+            // voxel.import_path) works for dropped files and a restart can reuse it.
+            std::error_code ec;
+            const std::filesystem::path dir = std::filesystem::path(vox::platform::UserDataDir()) / "uploads";
+            std::filesystem::create_directories(dir, ec);
+            std::string leaf = std::filesystem::path(name).filename().string();
+            if (leaf.empty()) leaf = "upload.vox";
+            const std::filesystem::path dst = dir / leaf;
+            if (std::ofstream of(dst, std::ios::binary); of) {
+                of.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            }
+            std::error_code exists_ec;
+            if (std::filesystem::exists(dst, exists_ec)) {
+                console.SetCVarOverride("voxel.import_path", dst.string());
+                vox::log::Info("voxel: dropped {} ({} voxels) at ({},{},{}); voxel.import_path -> {}",
+                               name, vs.voxelCount, cx, cy, cz, dst.string());
+            } else {
+                vox::log::Info("voxel: dropped {} ({} voxels) at ({},{},{}) (could not cache upload to disk)",
+                               name, vs.voxelCount, cx, cy, cz);
+            }
         } else {
             vox::log::Warn("voxel: bad .vox upload {}", name);
         }
