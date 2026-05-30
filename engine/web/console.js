@@ -1350,6 +1350,40 @@ function init() {
     function wireCmdInput(inp, form) {
         if (!inp || !form) return;
         let idx = state.cmdHistory.length;
+        // ---- autocomplete dropdown over cvar + command names ----
+        const ac = el("div", "cl-ac"); ac.hidden = true; form.appendChild(ac);
+        let acOpen = false, acItems = [], acIdx = 0;
+        const candidates = () => {
+            const out = [];
+            for (const n of state.cvars.keys()) out.push({ name: n, kind: "cvar" });
+            for (const c of (state.commands || [])) out.push({ name: c.name, kind: "cmd" });
+            return out.sort((a, b) => a.name.localeCompare(b.name));
+        };
+        const renderAC = () => {
+            ac.innerHTML = "";
+            acItems.forEach((it, i) => {
+                const row = el("div", "cl-ac-item" + (i === acIdx ? " active" : ""));
+                row.innerHTML = `<span class="acn">${escHtml(it.name)}</span><span class="act">${it.kind}</span>`;
+                row.onmousedown = (ev) => { ev.preventDefault(); acceptAC(i); };
+                ac.appendChild(row);
+            });
+            const a = ac.children[acIdx]; if (a) a.scrollIntoView({ block: "nearest" });
+        };
+        const filterAC = () => {
+            const tok = (inp.value.trim().split(/\s+/)[0] || "").toLowerCase();
+            acItems = candidates().filter((c) => c.name.toLowerCase().includes(tok)).slice(0, 200);
+            if (acIdx >= acItems.length) acIdx = Math.max(0, acItems.length - 1);
+            renderAC();
+        };
+        const openAC  = () => { acOpen = true; acIdx = 0; ac.hidden = false; filterAC(); };
+        const closeAC = () => { acOpen = false; ac.hidden = true; };
+        function acceptAC(i) {
+            const it = acItems[i]; if (!it) { closeAC(); return; }
+            const rest = inp.value.trim().split(/\s+/).slice(1).join(" ");
+            inp.value = it.name + (rest ? " " + rest : " ");   // keep typed args; trailing space ready for a value
+            closeAC(); inp.focus();
+            const n = inp.value.length; requestAnimationFrame(() => inp.setSelectionRange(n, n));
+        }
         form.onsubmit = (e) => {
             e.preventDefault();
             const v = inp.value.trim(); if (!v) return;
@@ -1357,9 +1391,22 @@ function init() {
             if (state.cmdHistory[state.cmdHistory.length - 1] !== v) state.cmdHistory.push(v);
             if (state.cmdHistory.length > 100) state.cmdHistory.shift();
             localStorage.setItem("vox.cmdhist", JSON.stringify(state.cmdHistory));
-            idx = state.cmdHistory.length; inp.value = "";
+            idx = state.cmdHistory.length; inp.value = ""; closeAC();
         };
+        inp.addEventListener("input", () => { if (acOpen) filterAC(); });
+        inp.addEventListener("blur", () => setTimeout(closeAC, 120));  // let a click-select land first
         inp.addEventListener("keydown", (e) => {
+            // Alt+Space / Ctrl+Space toggles the completion list (Alt+Space may hit the OS menu on Windows; Ctrl+Space is the safe fallback).
+            if ((e.altKey || e.ctrlKey) && (e.code === "Space" || e.key === " ")) { e.preventDefault(); acOpen ? closeAC() : openAC(); return; }
+            if (acOpen) {
+                // List OPEN: arrows navigate the list (NOT history); Tab accepts; Esc closes.
+                if (e.key === "ArrowDown") { e.preventDefault(); if (acIdx < acItems.length - 1) { acIdx++; renderAC(); } return; }
+                if (e.key === "ArrowUp")   { e.preventDefault(); if (acIdx > 0) { acIdx--; renderAC(); } return; }
+                if (e.key === "Tab")       { e.preventDefault(); acceptAC(acIdx); return; }
+                if (e.key === "Escape")    { e.preventDefault(); e.stopPropagation(); closeAC(); return; }  // don't also close the overlay
+                return;  // Enter falls through to submit; typing re-filters via the input handler
+            }
+            // List CLOSED: Up/Down cycle command history.
             if (e.key === "ArrowUp") {
                 if (idx > 0) { idx--; inp.value = state.cmdHistory[idx] || ""; e.preventDefault();
                     const n = inp.value.length; requestAnimationFrame(() => inp.setSelectionRange(n, n)); }

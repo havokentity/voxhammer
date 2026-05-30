@@ -66,9 +66,11 @@
     </div>
     <div class="log console-log" id="console-log"></div>
     <form class="console-line console-modal-line" id="console-modal-form" autocomplete="off">
-      <span class="cl-prompt">❯</span>
-      <input id="console-modal-input" type="text" spellcheck="false" placeholder="type a command — Enter runs, ↑/↓ history, Esc closes">
-      <button class="cl-send" type="submit">run</button>
+      <div class="cl-row">
+        <span class="cl-prompt">❯</span>
+        <input id="console-modal-input" type="text" spellcheck="false" placeholder="command — Enter runs · ↑/↓ history · Alt/Ctrl+Space complete">
+      </div>
+      <button class="cl-send cl-send-block" type="submit">run</button>
     </form>
   </div>
 </div>
