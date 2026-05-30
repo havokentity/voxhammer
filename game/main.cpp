@@ -42,6 +42,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // Windows Shell API for bluenoise.open_folder — included last to avoid macro
@@ -668,105 +669,187 @@ int RunStructuralSettle(vox::console::Console& cc,
 // settle) LAND on the visible terrain instead of falling through to the y=0
 // plane / kill plane.
 //
-// Approach (per the spec): a GREEDY BOX COVER of all solid voxels -> one
-// PxRigidStatic with a compound of PxBoxGeometry shapes. NOT per-voxel, NOT a
-// heightfield -- a flat floor becomes ~1 box, a wall a handful; concavity/holes
-// are preserved (union of boxes).
+// Approach (per the spec): a GREEDY BOX COVER of the solid voxels -> a compound
+// of PxBoxGeometry shapes. NOT per-voxel, NOT a heightfield -- a flat floor
+// becomes a handful of boxes, a wall a few; concavity/holes are preserved
+// (union of boxes). The cover is computed PER REGION (see below) so a carve only
+// rebuilds the few regions it touched, not the whole world.
 //
 // World == voxel grid coords (voxel size 1), matching how AcquireBox/debris use
 // world units, so a voxel at integer (x,y,z) occupies the world box
 // [x..x+1] x [y..y+1] x [z..z+1]. box_decompose returns INCLUSIVE voxel AABBs
 // [mn..mx], so the world box is [mn .. mx+1].
 //
-// The full rebuild (bake -> decompose -> SetWorldCollider) is expensive (O(2M)
-// voxels -> a ~1s stutter), so it is both DEBOUNCED *and* ASYNC:
+// A whole-world rebuild (bake -> decompose 2M cells -> rebuild one giant PhysX
+// compound) is expensive (~1s stutter), AND even with the decompose pushed
+// off-thread the PhysX APPLY of every box is still O(world) on the main thread.
+// So the collider is partitioned into a fixed grid of cubic REGIONS and we only
+// re-decompose + re-apply the regions a carve/settle actually TOUCHED:
 //
-//   * DEBOUNCE: callers mark the collider dirty; the main loop only kicks the
-//     rebuild ONCE carving has paused (a few quiet frames), not per carve.
-//   * ASYNC pipeline (so the rebuild never stutters the main thread):
-//       1. main thread BAKEs the live world into a uint8 solidity snapshot
-//          (bake must be main-thread to avoid racing a carve) and launches a
-//          worker thread; marks the job "in flight". Does NOT block.
-//       2. the worker runs labelComponents-equivalent (single cover id) +
-//          decomposeComponent over the snapshot into a ColliderBox result,
-//          then sets the atomic `ready` flag. NO PhysX calls in the worker.
-//       3. the main loop polls `ready`; when set it joins the worker and applies
-//          the result via SetWorldCollider (PhysX -> main thread only), then
-//          clears in-flight/ready.
-//       4. COALESCE: if the collider goes dirty again while a job is in flight we
-//          do NOT launch a second worker -- we finish the current one, and if
-//          still dirty kick another, so it always converges to the latest world
-//          without piling up jobs.
-//
-// (Dirty-region incremental rebuild around the carved AABB is the next opt.)
-static bool g_colliderDirty = false;
-static int  g_colliderQuietFrames = 0;
+//   * REGION GRID: kRegionSize-voxel cubes; kWorldDim % kRegionSize == 0 so the
+//     world is exactly kRegionGrid^3 regions. Each region owns its own static
+//     box-compound PxRigidStatic (PhysicsWorld::SetColliderRegion). A long floor
+//     becomes a few region-local boxes instead of one -- acceptable; boxes never
+//     span a region boundary so a per-region rebuild stays independent.
+//   * DIRTY SET: a file-scope std::vector<bool> over the region grid. A carve
+//     sphere marks every region overlapping its AABB [h-r-1 .. h+r+1]; a settle
+//     marks ALL regions (it can detach anywhere). Coordinate convention is
+//     unchanged: voxel x -> world box [x..x+1]; region (rx,ry,rz) covers voxels
+//     [r*kRegionSize .. (r+1)*kRegionSize); its sub-grid is decomposed locally
+//     then offset by the region world origin.
+//   * DEBOUNCE: the main loop kicks a rebuild only once carving has paused a few
+//     quiet frames, not per carve.
+//   * ASYNC, batched per region (so the rebuild never stutters the main thread):
+//       1. MAIN: snapshot the dirty regions' sub-grids out of the live world
+//          (bake must be main-thread to avoid racing a carve) into one job and
+//          launch a worker; mark "in flight". Does NOT block. The dirty bits for
+//          the snapshotted regions are cleared now (any region re-dirtied while
+//          the job runs stays dirty -> processed next round).
+//       2. WORKER: for EACH region in the batch, decomposeComponent over its
+//          local sub-grid -> world-unit ColliderBoxes offset by the region
+//          origin. NO PhysX. Sets the atomic `ready` flag last.
+//       3. MAIN: poll `ready`; when set, join + apply each region's boxes via
+//          SetColliderRegion (PhysX -> main-thread only), then clear in-flight.
+//       4. COALESCE: only one batch is ever in flight; regions dirtied meanwhile
+//          are picked up by the next batch, so it converges without piling up.
+constexpr int kRegionSize = 32;  // kWorldDim(128) % 32 == 0 -> 4x4x4 = 64 regions
+constexpr int kRegionGrid = static_cast<int>(vox::voxel::kWorldDim) / kRegionSize;
+constexpr int kRegionCount = kRegionGrid * kRegionGrid * kRegionGrid;
 
-// --- async-rebuild state (file-scope; all the buffers outlive the worker since
-// they are static and we gate re-launch on g_colliderJobInFlight) ---
-static bool                                g_colliderJobInFlight = false;  // main-thread only
-static std::atomic<bool>                   g_colliderJobReady{false};      // worker -> main
-static std::thread                         g_colliderThread;               // one worker at a time
-static std::vector<std::uint8_t>           g_colliderSnapshot;             // main writes, worker reads
-static glm::ivec3                          g_colliderDims{0};              // snapshot dims (worker reads)
-static bool                                g_colliderSnapshotAnySolid = false;  // main writes, worker reads
-static std::vector<vox::physics::ColliderBox> g_colliderResult;           // worker writes, main reads
-
-void RebuildWorldCollider(vox::voxel::VoxelWorld&, vox::physics::PhysicsWorld&) {
-    g_colliderDirty = true; g_colliderQuietFrames = 0;   // mark dirty; the main loop drives the async rebuild
+// Dense region index (matches the row-major idx convention z*Y*X + y*X + x).
+static inline int RegionIndex(int rx, int ry, int rz) {
+    return (rz * kRegionGrid + ry) * kRegionGrid + rx;
 }
 
-// Pure-CPU worker body: snapshot (uint8 solidity) -> single-id ComponentField ->
-// decomposeComponent -> world-unit ColliderBox result. Touches ONLY the static
-// snapshot/result buffers + dims (no live world, no PhysX). Sets `ready` last.
+static int  g_colliderQuietFrames = 0;
+// Dirty bit per region; any true bit drives a rebuild once carving pauses.
+static std::vector<bool> g_colliderRegionDirty(kRegionCount, false);
+static bool AnyRegionDirty() {
+    for (bool d : g_colliderRegionDirty) if (d) return true;
+    return false;
+}
+
+// One region's snapshot handed to the worker: its dense index, world origin and
+// a kRegionSize^3 uint8 solidity sub-grid (row-major, region-local coords).
+struct ColliderRegionJobItem {
+    int index = 0;
+    int ox = 0, oy = 0, oz = 0;  // region world origin (voxel coords)
+    bool anySolid = false;
+    std::vector<std::uint8_t> grid;                       // region-local solidity
+    std::vector<vox::physics::ColliderBox> boxes;         // worker writes (world units)
+};
+
+// --- async-rebuild state (file-scope; the batch outlives the worker since it is
+// static and we gate re-launch on g_colliderJobInFlight) ---
+static bool                          g_colliderJobInFlight = false;  // main-thread only
+static std::atomic<bool>             g_colliderJobReady{false};      // worker -> main
+static std::thread                   g_colliderThread;               // one worker at a time
+static std::vector<ColliderRegionJobItem> g_colliderBatch;          // main writes, worker reads/writes
+
+// Mark every region overlapping the carve sphere's AABB [h-r-1 .. h+r+1] dirty.
+static void MarkCarveRegionsDirty(int hx, int hy, int hz, int radius) {
+    const int G = static_cast<int>(vox::voxel::kWorldDim);
+    const int pad = radius + 1;  // +1 covers the [x..x+1] world-box of edge voxels
+    const int x0 = std::max(0, hx - pad), x1 = std::min(G - 1, hx + pad);
+    const int y0 = std::max(0, hy - pad), y1 = std::min(G - 1, hy + pad);
+    const int z0 = std::max(0, hz - pad), z1 = std::min(G - 1, hz + pad);
+    if (x1 < x0 || y1 < y0 || z1 < z0) return;  // AABB entirely outside the world
+    const int rx0 = x0 / kRegionSize, rx1 = x1 / kRegionSize;
+    const int ry0 = y0 / kRegionSize, ry1 = y1 / kRegionSize;
+    const int rz0 = z0 / kRegionSize, rz1 = z1 / kRegionSize;
+    for (int rz = rz0; rz <= rz1; ++rz)
+        for (int ry = ry0; ry <= ry1; ++ry)
+            for (int rx = rx0; rx <= rx1; ++rx)
+                g_colliderRegionDirty[RegionIndex(rx, ry, rz)] = true;
+    g_colliderQuietFrames = 0;
+}
+
+// Mark EVERY region dirty (initial build + settle, which can detach anywhere).
+static void MarkAllRegionsDirty() {
+    g_colliderRegionDirty.assign(kRegionCount, true);
+    g_colliderQuietFrames = 0;
+}
+
+// Compatibility shim kept for the (rare) call sites that want a full rebuild:
+// equivalent to MarkAllRegionsDirty(). The main loop drives the async rebuild.
+void RebuildWorldCollider(vox::voxel::VoxelWorld&, vox::physics::PhysicsWorld&) {
+    MarkAllRegionsDirty();
+}
+
+// Pure-CPU worker body: for each region in the batch, single-id ComponentField
+// over its local sub-grid -> decomposeComponent -> world-unit ColliderBoxes
+// (offset by the region origin). Touches ONLY g_colliderBatch (no live world, no
+// PhysX). Sets `ready` last.
 static void ColliderDecomposeJob() {
-    g_colliderResult.clear();
-    if (g_colliderSnapshotAnySolid) {
-        // Every solid voxel is one cover component (id 1). decomposeComponent
-        // tiles the entire solid set with non-overlapping concave-respecting
-        // boxes; a single id over all solids is enough + cheapest for a static
-        // cover (no per-component labelling needed).
+    const glm::ivec3 rdims(kRegionSize, kRegionSize, kRegionSize);
+    for (ColliderRegionJobItem& item : g_colliderBatch) {
+        item.boxes.clear();
+        if (!item.anySolid) continue;  // empty region -> SetColliderRegion clears it
         vox::destruction::ComponentField cf;
-        cf.ids.resize(g_colliderSnapshot.size());
-        for (std::size_t i = 0; i < g_colliderSnapshot.size(); ++i)
-            cf.ids[i] = g_colliderSnapshot[i] ? std::uint16_t{1} : std::uint16_t{0};
+        cf.ids.resize(item.grid.size());
+        for (std::size_t i = 0; i < item.grid.size(); ++i)
+            cf.ids[i] = item.grid[i] ? std::uint16_t{1} : std::uint16_t{0};
         cf.anchoredCount = 1;
         cf.totalCount = 1;
 
         const std::vector<vox::destruction::Box> boxes =
-            vox::destruction::decomposeComponent(cf, g_colliderDims, 1);
+            vox::destruction::decomposeComponent(cf, rdims, 1);
 
-        // Convert inclusive voxel AABBs -> world-unit ColliderBoxes ([mn .. mx+1]).
-        g_colliderResult.reserve(boxes.size());
+        // Inclusive region-local voxel AABB -> world-unit box [mn .. mx+1], then
+        // offset by the region world origin.
+        item.boxes.reserve(boxes.size());
         for (const auto& b : boxes) {
             vox::physics::ColliderBox cb;
-            cb.minX = static_cast<float>(b.mn.x);
-            cb.minY = static_cast<float>(b.mn.y);
-            cb.minZ = static_cast<float>(b.mn.z);
-            cb.maxX = static_cast<float>(b.mx.x + 1);
-            cb.maxY = static_cast<float>(b.mx.y + 1);
-            cb.maxZ = static_cast<float>(b.mx.z + 1);
-            g_colliderResult.push_back(cb);
+            cb.minX = static_cast<float>(item.ox + b.mn.x);
+            cb.minY = static_cast<float>(item.oy + b.mn.y);
+            cb.minZ = static_cast<float>(item.oz + b.mn.z);
+            cb.maxX = static_cast<float>(item.ox + b.mx.x + 1);
+            cb.maxY = static_cast<float>(item.oy + b.mx.y + 1);
+            cb.maxZ = static_cast<float>(item.oz + b.mx.z + 1);
+            item.boxes.push_back(cb);
         }
     }
     g_colliderJobReady.store(true, std::memory_order_release);  // publish (must be last)
 }
 
-// MAIN THREAD: bake the live world into the snapshot and launch the worker.
-// Caller must guarantee no job is in flight (coalescing is handled by the loop).
+// MAIN THREAD: snapshot every currently-dirty region's sub-grid out of the live
+// world into one batch and launch the worker. Clears the snapshotted regions'
+// dirty bits (a region re-dirtied while the job runs stays dirty -> next round).
+// Caller must guarantee no job is in flight (coalescing handled by the loop).
 static void LaunchColliderJob(vox::voxel::VoxelWorld& world) {
-    const int dim = static_cast<int>(vox::voxel::kWorldDim);
-    const std::vector<std::uint32_t> grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
+    g_colliderBatch.clear();
+    for (int rz = 0; rz < kRegionGrid; ++rz) {
+        for (int ry = 0; ry < kRegionGrid; ++ry) {
+            for (int rx = 0; rx < kRegionGrid; ++rx) {
+                const int idx = RegionIndex(rx, ry, rz);
+                if (!g_colliderRegionDirty[idx]) continue;
+                g_colliderRegionDirty[idx] = false;  // snapshotting now
 
-    g_colliderSnapshot.resize(grid.size());
-    bool anySolid = false;
-    for (std::size_t i = 0; i < grid.size(); ++i) {
-        const bool solid = grid[i] != 0u;
-        g_colliderSnapshot[i] = solid ? std::uint8_t{1} : std::uint8_t{0};
-        anySolid = anySolid || solid;
+                ColliderRegionJobItem item;
+                item.index = idx;
+                item.ox = rx * kRegionSize;
+                item.oy = ry * kRegionSize;
+                item.oz = rz * kRegionSize;
+                item.grid.assign(static_cast<std::size_t>(kRegionSize) * kRegionSize * kRegionSize, 0u);
+                bool anySolid = false;
+                for (int lz = 0; lz < kRegionSize; ++lz) {
+                    for (int ly = 0; ly < kRegionSize; ++ly) {
+                        for (int lx = 0; lx < kRegionSize; ++lx) {
+                            if (world.GetVoxel(item.ox + lx, item.oy + ly, item.oz + lz) != 0) {
+                                const std::size_t li =
+                                    (static_cast<std::size_t>(lz) * kRegionSize + ly) * kRegionSize + lx;
+                                item.grid[li] = 1u;
+                                anySolid = true;
+                            }
+                        }
+                    }
+                }
+                item.anySolid = anySolid;
+                g_colliderBatch.push_back(std::move(item));
+            }
+        }
     }
-    g_colliderSnapshotAnySolid = anySolid;
-    g_colliderDims = glm::ivec3(dim, dim, dim);
+    if (g_colliderBatch.empty()) return;  // nothing to do (shouldn't happen: gated on AnyRegionDirty)
 
     g_colliderJobReady.store(false, std::memory_order_relaxed);
     g_colliderJobInFlight = true;
@@ -774,8 +857,8 @@ static void LaunchColliderJob(vox::voxel::VoxelWorld& world) {
 }
 
 // MAIN THREAD: poll the in-flight worker; when it has published a result, join
-// it and apply via PhysX (main-thread only), then clear in-flight. Returns true
-// if a result was applied this call.
+// it and apply each region's boxes via PhysX (main-thread only), then clear
+// in-flight. Returns true if a result was applied this call.
 static bool PollColliderJob(vox::physics::PhysicsWorld& physics) {
     if (!g_colliderJobInFlight) return false;
     if (!g_colliderJobReady.load(std::memory_order_acquire)) return false;
@@ -783,11 +866,14 @@ static bool PollColliderJob(vox::physics::PhysicsWorld& physics) {
     if (g_colliderThread.joinable()) g_colliderThread.join();
     g_colliderJobInFlight = false;
 
-    if (g_colliderResult.empty())
-        physics.ClearWorldCollider();
-    else
-        physics.SetWorldCollider(g_colliderResult);
-    vox::log::Trace("physics: world collider rebuilt ({} boxes, async)", g_colliderResult.size());
+    std::size_t totalBoxes = 0;
+    for (const ColliderRegionJobItem& item : g_colliderBatch) {
+        physics.SetColliderRegion(item.index, kRegionCount, item.boxes);  // empty -> clears region
+        totalBoxes += item.boxes.size();
+    }
+    vox::log::Trace("physics: world collider rebuilt ({} region(s), {} boxes, async)",
+                    g_colliderBatch.size(), totalBoxes);
+    g_colliderBatch.clear();
     return true;
 }
 
@@ -1342,21 +1428,27 @@ int main(int argc, char** argv) {
                 // Milestone B1: opt-in structural settle right after the carve.
                 // Default OFF (voxel.auto_settle=0) so carve behavior is
                 // unchanged; ON makes the now-unsupported region detach + fall.
+                bool settled = false;
                 if (cc.FindCVar("voxel.auto_settle") && cc.FindCVar("voxel.auto_settle")->GetBool()) {
 #if defined(VOX_HAVE_PHYSX)
                     const int detached = RunStructuralSettle(cc, world, renderer, physics, debris);
 #else
                     const int detached = RunStructuralSettle(cc, world, renderer);
 #endif
-                    if (detached > 0) o.Format("voxel.break: auto-settle detached {} voxel(s)", detached);
+                    if (detached > 0) {
+                        o.Format("voxel.break: auto-settle detached {} voxel(s)", detached);
+                        settled = true;
+                    }
                 }
 #if defined(VOX_HAVE_PHYSX)
-                // Milestone C: rebuild the static world collider so debris +
-                // detached islands land on the freshly-carved terrain (not the
-                // y=0 plane). FULL rebuild for v1; dirty-region is the future
-                // optimization. Gated OFF by default -> no-op when disabled.
+                // Milestone C: mark only the regions this carve touched dirty so
+                // the async rebuild re-decomposes + re-applies just those (not the
+                // whole world). If auto-settle detached anything it may have
+                // removed voxels anywhere -> mark ALL regions. Gated OFF by
+                // default -> no-op when disabled.
                 if (cc.FindCVar("physics.world_collider") && cc.FindCVar("physics.world_collider")->GetBool()) {
-                    RebuildWorldCollider(world, physics);
+                    if (settled) MarkAllRegionsDirty();
+                    else         MarkCarveRegionsDirty(hx, hy, hz, radius);
                 }
 #endif
             });
@@ -1422,19 +1514,26 @@ int main(int argc, char** argv) {
                 // Milestone B1: opt-in structural settle right after the blast
                 // (default OFF). ON => any region the crater left unsupported
                 // detaches + falls instead of floating over the new void.
+                bool settled = false;
                 if (cc.FindCVar("voxel.auto_settle") && cc.FindCVar("voxel.auto_settle")->GetBool()) {
 #if defined(VOX_HAVE_PHYSX)
                     const int detached = RunStructuralSettle(cc, world, renderer, physics, debris);
 #else
                     const int detached = RunStructuralSettle(cc, world, renderer);
 #endif
-                    if (detached > 0) o.Format("voxel.explode: auto-settle detached {} voxel(s)", detached);
+                    if (detached > 0) {
+                        o.Format("voxel.explode: auto-settle detached {} voxel(s)", detached);
+                        settled = true;
+                    }
                 }
 #if defined(VOX_HAVE_PHYSX)
-                // Milestone C: rebuild the static world collider after the crater
-                // (+ any settle) so debris/islands land on the new terrain.
+                // Milestone C: mark only the regions the crater touched dirty so
+                // the async rebuild re-decomposes + re-applies just those. If
+                // auto-settle detached anything (can remove voxels anywhere) mark
+                // ALL regions. Gated OFF by default -> no-op when disabled.
                 if (cc.FindCVar("physics.world_collider") && cc.FindCVar("physics.world_collider")->GetBool()) {
-                    RebuildWorldCollider(world, physics);
+                    if (settled) MarkAllRegionsDirty();
+                    else         MarkCarveRegionsDirty(hx, hy, hz, radius);
                 }
 #endif
             });
@@ -1548,16 +1647,16 @@ int main(int argc, char** argv) {
         keybindings.CheckHotReload();
         console.Drain();
         if (server.UnbindRequested() && server.IsRunning()) server.Stop();
-        // Debounced + ASYNC world-collider rebuild: the expensive bake+decompose runs on
-        // a worker thread so it never stutters the main loop. Poll a finished worker first
-        // (apply its result via PhysX on this main thread), then -- once carving has paused
-        // a few frames AND no worker is in flight -- bake a snapshot and kick a new worker.
-        // Coalescing: while a worker is in flight we never launch a second one; the dirty
-        // flag simply stays set so we re-bake from the latest world once the current job lands.
+        // Debounced + ASYNC dirty-REGION world-collider rebuild: only the regions a
+        // carve/settle touched are re-decomposed (worker) + re-applied (this main thread),
+        // never the whole world. Poll a finished worker first (apply each region's boxes via
+        // PhysX here), then -- once carving has paused a few frames AND no worker is in
+        // flight -- snapshot the dirty regions and kick a new worker. Coalescing: only one
+        // batch is in flight; regions re-dirtied meanwhile are picked up by the next batch.
         PollColliderJob(physics);
-        if (g_colliderDirty && !g_colliderJobInFlight && ++g_colliderQuietFrames > 10) {
-            LaunchColliderJob(world);
-            g_colliderDirty = false; g_colliderQuietFrames = 0;
+        if (AnyRegionDirty() && !g_colliderJobInFlight && ++g_colliderQuietFrames > 10) {
+            LaunchColliderJob(world);   // snapshots + clears the dirty regions it batches
+            g_colliderQuietFrames = 0;
         }
 
         auto now = clk::now();

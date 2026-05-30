@@ -40,10 +40,17 @@ struct PhysicsWorld::Impl {
     PxScene* scene = nullptr;
     PxMaterial* material = nullptr;
 
-    // Milestone C: single static box-compound collider matching the voxel
-    // terrain. Owned by us (not the dynamics list); rebuilt wholesale on each
-    // carve/settle via SetWorldCollider, released here on Shutdown.
+    // Milestone C: single (legacy) static box-compound collider matching the
+    // voxel terrain. Owned by us (not the dynamics list); rebuilt wholesale via
+    // SetWorldCollider, released here on Shutdown.
     PxRigidStatic* worldCollider = nullptr;
+
+    // Dirty-region collider: one static box-compound actor PER REGION of the
+    // partitioned world. Index == the caller's dense region-grid index; a null
+    // slot means that region currently has no solids (cleared). Rebuilt one
+    // region at a time via SetColliderRegion so a carve only re-applies the few
+    // regions it touched. Released (all slots) on Shutdown / ClearWorldCollider.
+    std::vector<PxRigidStatic*> regionColliders;
 
     // Dense list of dynamic bodies in creation order; index == AddDynamicBox() /
     // AddBox() / AcquireBox() return value (the id). Bodies are owned by the
@@ -138,13 +145,21 @@ void PhysicsWorld::Shutdown() {
     }
     impl_->dynamics.clear();
     impl_->freeList.clear();
-    // Release the world collider before the scene (releasing the scene would
-    // free it too, but null our pointer explicitly so nothing dangles).
+    // Release the world collider(s) before the scene (releasing the scene would
+    // free them too, but null our pointers explicitly so nothing dangles).
     if (impl_->worldCollider) {
         if (impl_->scene) impl_->scene->removeActor(*impl_->worldCollider);
         impl_->worldCollider->release();
         impl_->worldCollider = nullptr;
     }
+    for (PxRigidStatic*& region : impl_->regionColliders) {
+        if (region) {
+            if (impl_->scene) impl_->scene->removeActor(*region);
+            region->release();
+            region = nullptr;
+        }
+    }
+    impl_->regionColliders.clear();
     if (impl_->scene) {
         impl_->scene->release();
         impl_->scene = nullptr;
@@ -220,34 +235,23 @@ void PhysicsWorld::AddGroundPlane() {
     }
 }
 
-void PhysicsWorld::ClearWorldCollider() {
-    if (!impl_ || !impl_->worldCollider) {
-        return;
-    }
-    if (impl_->scene) {
-        impl_->scene->removeActor(*impl_->worldCollider);
-    }
-    impl_->worldCollider->release();  // also frees the attached shapes
-    impl_->worldCollider = nullptr;
-}
-
-void PhysicsWorld::SetWorldCollider(const std::vector<ColliderBox>& boxes) {
-    if (!impl_ || !impl_->scene || !impl_->physics || !impl_->material) {
-        return;
-    }
-    // Full rebuild: drop the previous static actor (no leak) and build a fresh
-    // one. A dirty-region / incremental rebuild is the future optimization;
-    // correctness-first here -- one PxRigidStatic with a compound of box shapes.
-    ClearWorldCollider();
+namespace {
+// Build a fresh PxRigidStatic carrying one PxBoxGeometry shape per `boxes`
+// entry (boxes in WORLD units), add it to the scene and return it. Returns
+// nullptr if `boxes` is empty / has no non-degenerate box (so the caller treats
+// it as "cleared"). Shared by SetWorldCollider + SetColliderRegion.
+PxRigidStatic* BuildBoxCompound(PxPhysics* physics, PxScene* scene,
+                                PxMaterial* material,
+                                const std::vector<ColliderBox>& boxes) {
     if (boxes.empty()) {
-        return;  // nothing solid -> no collider (ground plane still present)
+        return nullptr;
     }
-
-    PxRigidStatic* actor = impl_->physics->createRigidStatic(PxTransform(PxIdentity));
+    PxRigidStatic* actor = physics->createRigidStatic(PxTransform(PxIdentity));
     if (!actor) {
         vox::log::Error("physics: createRigidStatic (world collider) failed");
-        return;
+        return nullptr;
     }
+    int attached = 0;
     for (const ColliderBox& b : boxes) {
         const float hx = 0.5f * (b.maxX - b.minX);
         const float hy = 0.5f * (b.maxY - b.minY);
@@ -257,16 +261,76 @@ void PhysicsWorld::SetWorldCollider(const std::vector<ColliderBox>& boxes) {
         }
         const PxVec3 center(0.5f * (b.minX + b.maxX), 0.5f * (b.minY + b.maxY),
                             0.5f * (b.minZ + b.maxZ));
-        PxShape* shape =
-            impl_->physics->createShape(PxBoxGeometry(hx, hy, hz), *impl_->material);
+        PxShape* shape = physics->createShape(PxBoxGeometry(hx, hy, hz), *material);
         if (shape) {
             shape->setLocalPose(PxTransform(center));
             actor->attachShape(*shape);
             shape->release();  // actor retains a reference
+            ++attached;
         }
     }
-    impl_->scene->addActor(*actor);
-    impl_->worldCollider = actor;
+    if (attached == 0) {
+        actor->release();  // all boxes were degenerate -> nothing to collide
+        return nullptr;
+    }
+    scene->addActor(*actor);
+    return actor;
+}
+}  // namespace
+
+void PhysicsWorld::ClearWorldCollider() {
+    if (!impl_) {
+        return;
+    }
+    if (impl_->worldCollider) {
+        if (impl_->scene) impl_->scene->removeActor(*impl_->worldCollider);
+        impl_->worldCollider->release();  // also frees the attached shapes
+        impl_->worldCollider = nullptr;
+    }
+    for (PxRigidStatic*& region : impl_->regionColliders) {
+        if (region) {
+            if (impl_->scene) impl_->scene->removeActor(*region);
+            region->release();
+            region = nullptr;
+        }
+    }
+}
+
+void PhysicsWorld::SetWorldCollider(const std::vector<ColliderBox>& boxes) {
+    if (!impl_ || !impl_->scene || !impl_->physics || !impl_->material) {
+        return;
+    }
+    // Full rebuild of the single legacy actor: drop the previous one (no leak,
+    // but leave any region actors alone) and build a fresh one.
+    if (impl_->worldCollider) {
+        impl_->scene->removeActor(*impl_->worldCollider);
+        impl_->worldCollider->release();
+        impl_->worldCollider = nullptr;
+    }
+    impl_->worldCollider =
+        BuildBoxCompound(impl_->physics, impl_->scene, impl_->material, boxes);
+}
+
+void PhysicsWorld::SetColliderRegion(int regionIndex, int regionCount,
+                                     const std::vector<ColliderBox>& boxes) {
+    if (!impl_ || !impl_->scene || !impl_->physics || !impl_->material) {
+        return;
+    }
+    if (regionIndex < 0 || regionCount <= 0 || regionIndex >= regionCount) {
+        return;  // bad index -> ignore (caller owns the region<->index math)
+    }
+    if (static_cast<int>(impl_->regionColliders.size()) != regionCount) {
+        impl_->regionColliders.resize(static_cast<std::size_t>(regionCount), nullptr);
+    }
+    PxRigidStatic*& slot = impl_->regionColliders[static_cast<std::size_t>(regionIndex)];
+    // Release the old region actor FIRST so a per-region rebuild never leaks /
+    // double-collides, then build + store the replacement (null if empty).
+    if (slot) {
+        impl_->scene->removeActor(*slot);
+        slot->release();
+        slot = nullptr;
+    }
+    slot = BuildBoxCompound(impl_->physics, impl_->scene, impl_->material, boxes);
 }
 
 int PhysicsWorld::AddDynamicBox(float x, float y, float z) {
@@ -555,6 +619,10 @@ void PhysicsWorld::Step(float dt) { (void)dt; }
 unsigned PhysicsWorld::ActiveIslands() const { return 0; }
 void PhysicsWorld::AddGroundPlane() {}
 void PhysicsWorld::SetWorldCollider(const std::vector<ColliderBox>& boxes) { (void)boxes; }
+void PhysicsWorld::SetColliderRegion(int regionIndex, int regionCount,
+                                     const std::vector<ColliderBox>& boxes) {
+    (void)regionIndex; (void)regionCount; (void)boxes;
+}
 void PhysicsWorld::ClearWorldCollider() {}
 int PhysicsWorld::AddDynamicBox(float x, float y, float z) {
     (void)x;

@@ -60,15 +60,36 @@ public:
     // voxel terrain so debris + detached islands LAND on it instead of falling
     // through to the y=0 plane / kill plane. -----------------------------------
 
-    // Replace the world-collider static actor with a fresh PxRigidStatic carrying
-    // ONE PxBoxGeometry shape per `boxes` entry (boxes in WORLD units; see
-    // ColliderBox). Releases any previous world-collider actor first (so repeated
-    // rebuilds after each carve do not leak). Additive to the y=0 ground plane.
-    // Empty `boxes` clears the collider (same as ClearWorldCollider). No-op stub
-    // when PhysX is off.
+    // Replace the (single, legacy) world-collider static actor with a fresh
+    // PxRigidStatic carrying ONE PxBoxGeometry shape per `boxes` entry (boxes in
+    // WORLD units; see ColliderBox). Releases any previous single-actor collider
+    // first (so repeated rebuilds after each carve do not leak). Additive to the
+    // y=0 ground plane. Empty `boxes` clears it. No-op stub when PhysX is off.
+    //
+    // NOTE: the dirty-region rebuild path uses SetColliderRegion() instead -- it
+    // partitions the world into a fixed REGION grid and rebuilds only the regions
+    // a carve/settle touched. SetWorldCollider remains for callers that want a
+    // single monolithic actor (it lives in its own slot, independent of the
+    // region grid; ClearWorldCollider clears both).
     void SetWorldCollider(const std::vector<ColliderBox>& boxes);
 
-    // Release the world-collider static actor (if any). No-op stub when off.
+    // --- Dirty-region world collider (only re-decompose + rebuild the carved
+    // area, not the whole 128^3 world) -----------------------------------------
+    //
+    // The world is partitioned into a fixed grid of cubic REGIONS; each region
+    // owns its OWN static box-compound PxRigidStatic. SetColliderRegion releases
+    // that region's previous actor (no leak) and builds a fresh one from `boxes`
+    // (already in WORLD units, offset by the region origin caller-side). An empty
+    // `boxes` clears just that region's actor. `regionIndex` is the dense region
+    // grid index (rz*RY*RX + ry*RX + rx); the caller owns the region<->index math
+    // and the grid dimensions, so this stays free of any voxel/glm dependency.
+    // `regionCount` is the total number of regions (sizes the actor array on
+    // first use). Out-of-range indices are ignored. No-op stub when PhysX is off.
+    void SetColliderRegion(int regionIndex, int regionCount,
+                           const std::vector<ColliderBox>& boxes);
+
+    // Release the world-collider actors: the single legacy actor (SetWorldCollider)
+    // AND every per-region actor (SetColliderRegion). No-op stub when off.
     void ClearWorldCollider();
 
     // Add a 1m dynamic box (0.5 half-extent) at (x, y, z). Returns a dense
