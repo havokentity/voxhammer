@@ -38,6 +38,7 @@ target_link_libraries(vox_engine INTERFACE
     vox_ecs
     vox_ispc
     vox_voxel
+    vox_destruction
     vox_physics
     vox_render
     vox_audio
