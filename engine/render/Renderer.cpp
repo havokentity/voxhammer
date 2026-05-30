@@ -1297,7 +1297,7 @@ struct Renderer::Impl {
     // slot (MakeUpload), reused across acquire/release so the pool stays bounded. The
     // model/invModel in obbCB are rebuilt per frame from the body pose; the b0 Camera CB
     // copies the world camera each frame (only gridDim differs). INERT until AddDynObject.
-    static constexpr int  kMaxDynObjects = 64;   // pool slot count (live-chunk render cap)
+    static constexpr int  kMaxDynObjects = 256;  // pool slot count == voxel.debris.max default, so live chunks never fall back to the re-stamp
     static constexpr UINT kMaxDynDim     = 32;   // per-axis voxel cap; bigger grids are clamped
     struct DynObject {
         bool                   used = false;     // slot allocated to a live object

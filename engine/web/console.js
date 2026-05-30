@@ -1415,11 +1415,11 @@ function init() {
             localStorage.setItem("vox.cmdhist", JSON.stringify(state.cmdHistory));
             idx = state.cmdHistory.length; inp.value = ""; closeAC();
         };
-        inp.addEventListener("input", () => { if (acOpen) filterAC(); });
+        inp.addEventListener("input", () => { if (acOpen) filterAC(); else if (inp.value.length === 1) openAC(); });  // auto-open on the first char typed from empty
         inp.addEventListener("blur", () => setTimeout(closeAC, 120));  // let a click-select land first
         inp.addEventListener("keydown", (e) => {
             // Alt+Space / Ctrl+Space toggles the completion list (Alt+Space may hit the OS menu on Windows; Ctrl+Space is the safe fallback).
-            if ((e.altKey || e.ctrlKey) && (e.code === "Space" || e.key === " ")) { e.preventDefault(); acOpen ? closeAC() : openAC(); return; }
+            if ((e.altKey || e.ctrlKey) && (e.code === "Space" || e.key === " ")) { e.preventDefault(); openAC(); return; }  // open only; Esc closes
             if (acOpen) {
                 // List OPEN: arrows navigate the list (NOT history); Tab accepts; Esc closes.
                 if (e.key === "ArrowDown") { e.preventDefault(); if (acIdx < acItems.length - 1) { acIdx++; renderAC(); } return; }
