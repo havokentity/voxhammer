@@ -318,12 +318,13 @@ public:
         // islands doesn't sit in a perfectly balanced column), gentle spin so
         // it topples naturally as it falls.
         const float vx = Frand(-0.5f, 0.5f), vy = 0.0f, vz = Frand(-0.5f, 0.5f);
-        const float wx = Frand(-1.0f, 1.0f), wy = Frand(-1.0f, 1.0f), wz = Frand(-1.0f, 1.0f);
+        const float wx = Frand(-2.5f, 2.5f), wy = Frand(-2.5f, 2.5f), wz = Frand(-2.5f, 2.5f);
 
         const int id = physics.AcquireBox(scx, scy, scz, c.localCx, c.localCy, c.localCz,
                                           vx, vy, vz, wx, wy, wz);
         if (id < 0) return;  // pool exhausted
         c.id = id;
+        if (UseObb()) RegisterDynObject(renderer, world, c);   // A3: tumble as an OBB rigid body (else re-stamp = no smooth rotation)
         live_.push_back(std::move(c));
     }
 
@@ -674,11 +675,17 @@ int RunStructuralSettle(vox::console::Console& cc,
 // [x..x+1] x [y..y+1] x [z..z+1]. box_decompose returns INCLUSIVE voxel AABBs
 // [mn..mx], so the world box is [mn .. mx+1].
 //
-// v1 does a FULL rebuild on every change (bake -> downcast -> decompose ->
-// SetWorldCollider). The future optimization is a dirty-region incremental
-// rebuild around the carved AABB; correctness first.
-void RebuildWorldCollider(vox::voxel::VoxelWorld& world,
-                          vox::physics::PhysicsWorld& physics) {
+// The full rebuild (bake -> downcast -> decompose -> SetWorldCollider) is expensive, so it
+// is DEBOUNCED: callers mark the collider dirty and the main loop runs the real rebuild ONCE
+// carving has paused (a few quiet frames), instead of synchronously per carve. (Dirty-region
+// incremental rebuild around the carved AABB is the next optimization.)
+static bool g_colliderDirty = false;
+static int  g_colliderQuietFrames = 0;
+void RebuildWorldCollider(vox::voxel::VoxelWorld&, vox::physics::PhysicsWorld&) {
+    g_colliderDirty = true; g_colliderQuietFrames = 0;   // mark dirty; RebuildWorldColliderNow does the work (main loop)
+}
+void RebuildWorldColliderNow(vox::voxel::VoxelWorld& world,
+                             vox::physics::PhysicsWorld& physics) {
     const int dim = static_cast<int>(vox::voxel::kWorldDim);
     const std::vector<std::uint32_t> grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
 
@@ -1473,6 +1480,12 @@ int main(int argc, char** argv) {
         keybindings.CheckHotReload();
         console.Drain();
         if (server.UnbindRequested() && server.IsRunning()) server.Stop();
+        // Debounced world-collider rebuild: run the (expensive) full rebuild only after
+        // carving has paused for a few frames, not synchronously on every carve.
+        if (g_colliderDirty && ++g_colliderQuietFrames > 10) {
+            RebuildWorldColliderNow(world, physics);
+            g_colliderDirty = false; g_colliderQuietFrames = 0;
+        }
 
         auto now = clk::now();
         float dt = std::chrono::duration<float>(now - prev).count();
