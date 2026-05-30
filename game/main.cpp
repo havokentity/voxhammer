@@ -1314,6 +1314,7 @@ int main(int argc, char** argv) {
     using clk = std::chrono::steady_clock;
     auto prev = clk::now();
     auto lastTele = prev;
+    float simTime = 0.0f;  // accumulated wall-clock seconds for time-based animation (e.g. the A2 test cube's spin)
     while (g_running.load()) {
         if (hasWindow) {
             window.PollEvents();
@@ -1326,6 +1327,7 @@ int main(int argc, char** argv) {
         auto now = clk::now();
         float dt = std::chrono::duration<float>(now - prev).count();
         prev = now;
+        simTime += dt;
 
         // Fly-cam: hold LEFT-MOUSE + WASD/QE to move, mouse to look, Shift=fast.
         // Writes the camera.* cvars (so the web console reflects it live).
@@ -1409,6 +1411,7 @@ int main(int argc, char** argv) {
             fp.gi_denoiser = (giDn == "SVGF") ? 2 : (giDn == "ATROUS") ? 1 : 0;
             fp.gbuffer_obb = console.FindCVar("renderer.gbuffer.obb")->GetBool() ? 1 : 0;  // A1 OBB-raster gate (default OFF -> proven A0 path)
             fp.test_object = console.FindCVar("renderer.test_object")->GetBool() ? 1 : 0;  // A2 rotating test cube (default OFF)
+            fp.time_sec = simTime;  // wall-clock seconds -> time-based animation (A2 cube spin; was never wired -> stuck at 0)
             fp.gi_atrous_iters = console.FindCVar("renderer.gi.atrous_iters")->GetInt();
             fp.gi_denoise_phi_normal = console.FindCVar("renderer.gi.denoise_phi_normal")->GetFloat();
             fp.gi_denoise_phi_depth = console.FindCVar("renderer.gi.denoise_phi_depth")->GetFloat();
