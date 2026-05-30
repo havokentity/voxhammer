@@ -40,6 +40,11 @@ struct PhysicsWorld::Impl {
     PxScene* scene = nullptr;
     PxMaterial* material = nullptr;
 
+    // Milestone C: single static box-compound collider matching the voxel
+    // terrain. Owned by us (not the dynamics list); rebuilt wholesale on each
+    // carve/settle via SetWorldCollider, released here on Shutdown.
+    PxRigidStatic* worldCollider = nullptr;
+
     // Dense list of dynamic bodies in creation order; index == AddDynamicBox() /
     // AddBox() / AcquireBox() return value (the id). Bodies are owned by the
     // scene (or, for pooled+parked actors, by us); we keep raw pointers to read
@@ -133,6 +138,13 @@ void PhysicsWorld::Shutdown() {
     }
     impl_->dynamics.clear();
     impl_->freeList.clear();
+    // Release the world collider before the scene (releasing the scene would
+    // free it too, but null our pointer explicitly so nothing dangles).
+    if (impl_->worldCollider) {
+        if (impl_->scene) impl_->scene->removeActor(*impl_->worldCollider);
+        impl_->worldCollider->release();
+        impl_->worldCollider = nullptr;
+    }
     if (impl_->scene) {
         impl_->scene->release();
         impl_->scene = nullptr;
@@ -206,6 +218,55 @@ void PhysicsWorld::AddGroundPlane() {
     if (ground) {
         impl_->scene->addActor(*ground);
     }
+}
+
+void PhysicsWorld::ClearWorldCollider() {
+    if (!impl_ || !impl_->worldCollider) {
+        return;
+    }
+    if (impl_->scene) {
+        impl_->scene->removeActor(*impl_->worldCollider);
+    }
+    impl_->worldCollider->release();  // also frees the attached shapes
+    impl_->worldCollider = nullptr;
+}
+
+void PhysicsWorld::SetWorldCollider(const std::vector<ColliderBox>& boxes) {
+    if (!impl_ || !impl_->scene || !impl_->physics || !impl_->material) {
+        return;
+    }
+    // Full rebuild: drop the previous static actor (no leak) and build a fresh
+    // one. A dirty-region / incremental rebuild is the future optimization;
+    // correctness-first here -- one PxRigidStatic with a compound of box shapes.
+    ClearWorldCollider();
+    if (boxes.empty()) {
+        return;  // nothing solid -> no collider (ground plane still present)
+    }
+
+    PxRigidStatic* actor = impl_->physics->createRigidStatic(PxTransform(PxIdentity));
+    if (!actor) {
+        vox::log::Error("physics: createRigidStatic (world collider) failed");
+        return;
+    }
+    for (const ColliderBox& b : boxes) {
+        const float hx = 0.5f * (b.maxX - b.minX);
+        const float hy = 0.5f * (b.maxY - b.minY);
+        const float hz = 0.5f * (b.maxZ - b.minZ);
+        if (hx <= 0.0f || hy <= 0.0f || hz <= 0.0f) {
+            continue;  // degenerate box -> skip (PxBoxGeometry needs +ve extents)
+        }
+        const PxVec3 center(0.5f * (b.minX + b.maxX), 0.5f * (b.minY + b.maxY),
+                            0.5f * (b.minZ + b.maxZ));
+        PxShape* shape =
+            impl_->physics->createShape(PxBoxGeometry(hx, hy, hz), *impl_->material);
+        if (shape) {
+            shape->setLocalPose(PxTransform(center));
+            actor->attachShape(*shape);
+            shape->release();  // actor retains a reference
+        }
+    }
+    impl_->scene->addActor(*actor);
+    impl_->worldCollider = actor;
 }
 
 int PhysicsWorld::AddDynamicBox(float x, float y, float z) {
@@ -493,6 +554,8 @@ void PhysicsWorld::Shutdown() {}
 void PhysicsWorld::Step(float dt) { (void)dt; }
 unsigned PhysicsWorld::ActiveIslands() const { return 0; }
 void PhysicsWorld::AddGroundPlane() {}
+void PhysicsWorld::SetWorldCollider(const std::vector<ColliderBox>& boxes) { (void)boxes; }
+void PhysicsWorld::ClearWorldCollider() {}
 int PhysicsWorld::AddDynamicBox(float x, float y, float z) {
     (void)x;
     (void)y;

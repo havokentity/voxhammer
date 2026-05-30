@@ -18,6 +18,19 @@ struct BodyState {
     float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;  // orientation (identity)
 };
 
+// One axis-aligned box of the STATIC world collider, in WORLD units (the same
+// space the dynamic debris bodies live in: world == voxel grid coords, voxel
+// size 1). [min..max] are the box's world-space corners; SetWorldCollider()
+// turns each into a PxBoxGeometry shape (half-extent = (max-min)/2, local pose
+// = box center) on a single shared PxRigidStatic. Passing the boxes already in
+// world units (decomposed caller-side) keeps the physics lib free of any voxel
+// / glm dependency. min < max per axis is assumed (a single voxel is a 1-unit
+// box, e.g. min={5,0,5} max={6,1,6}).
+struct ColliderBox {
+    float minX = 0.0f, minY = 0.0f, minZ = 0.0f;
+    float maxX = 0.0f, maxY = 0.0f, maxZ = 0.0f;
+};
+
 // NVIDIA PhysX 5 wrapper: rigid bodies, articulations, vehicles, FEM soft
 // bodies, cloth, fluids. GPU rigid bodies on NVIDIA (10K+ islands), CPU path
 // elsewhere. Dispatcher wired into the enkiTS job system.
@@ -42,6 +55,21 @@ public:
 
     // Add a static ground plane at y = 0 (normal +Y).
     void AddGroundPlane();
+
+    // --- World collider (Milestone C): a static box-compound that matches the
+    // voxel terrain so debris + detached islands LAND on it instead of falling
+    // through to the y=0 plane / kill plane. -----------------------------------
+
+    // Replace the world-collider static actor with a fresh PxRigidStatic carrying
+    // ONE PxBoxGeometry shape per `boxes` entry (boxes in WORLD units; see
+    // ColliderBox). Releases any previous world-collider actor first (so repeated
+    // rebuilds after each carve do not leak). Additive to the y=0 ground plane.
+    // Empty `boxes` clears the collider (same as ClearWorldCollider). No-op stub
+    // when PhysX is off.
+    void SetWorldCollider(const std::vector<ColliderBox>& boxes);
+
+    // Release the world-collider static actor (if any). No-op stub when off.
+    void ClearWorldCollider();
 
     // Add a 1m dynamic box (0.5 half-extent) at (x, y, z). Returns a dense
     // index used by BodyY(), or -1 if PhysX is not present / creation failed.

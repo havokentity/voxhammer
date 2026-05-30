@@ -22,6 +22,10 @@
 #include "voxel/StructuralSettle.h"
 #include "voxel/VoxImport.h"
 #include "voxel/VoxelWorld.h"
+#include "voxel/destruction/box_decompose.h"  // Milestone C: world box-compound collider
+#include "voxel/destruction/connectivity.h"
+
+#include <glm/glm.hpp>  // glm::ivec3 for the world-collider decompose
 
 #include <algorithm>
 #include <cstdint>
@@ -654,6 +658,72 @@ int RunStructuralSettle(vox::console::Console& cc,
     return res.detachedVoxels;
 }
 
+#if defined(VOX_HAVE_PHYSX)
+// Milestone C: (re)build the STATIC world box-compound collider from the live
+// voxel terrain so falling debris (A3 OBB chunks) and detached islands (B1
+// settle) LAND on the visible terrain instead of falling through to the y=0
+// plane / kill plane.
+//
+// Approach (per the spec): a GREEDY BOX COVER of all solid voxels -> one
+// PxRigidStatic with a compound of PxBoxGeometry shapes. NOT per-voxel, NOT a
+// heightfield -- a flat floor becomes ~1 box, a wall a handful; concavity/holes
+// are preserved (union of boxes).
+//
+// World == voxel grid coords (voxel size 1), matching how AcquireBox/debris use
+// world units, so a voxel at integer (x,y,z) occupies the world box
+// [x..x+1] x [y..y+1] x [z..z+1]. box_decompose returns INCLUSIVE voxel AABBs
+// [mn..mx], so the world box is [mn .. mx+1].
+//
+// v1 does a FULL rebuild on every change (bake -> downcast -> decompose ->
+// SetWorldCollider). The future optimization is a dirty-region incremental
+// rebuild around the carved AABB; correctness first.
+void RebuildWorldCollider(vox::voxel::VoxelWorld& world,
+                          vox::physics::PhysicsWorld& physics) {
+    const int dim = static_cast<int>(vox::voxel::kWorldDim);
+    const std::vector<std::uint32_t> grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
+
+    // Build a ComponentField where every solid voxel is one cover component
+    // (id 1). decomposeComponent then tiles the ENTIRE anchored solid set with
+    // non-overlapping boxes (concave-respecting). We don't need per-component
+    // labelling for a static cover -- a single id over all solids is enough and
+    // cheapest.
+    vox::destruction::ComponentField cf;
+    cf.ids.resize(grid.size());
+    bool anySolid = false;
+    for (std::size_t i = 0; i < grid.size(); ++i) {
+        const bool solid = grid[i] != 0u;
+        cf.ids[i] = solid ? std::uint16_t{1} : std::uint16_t{0};
+        anySolid = anySolid || solid;
+    }
+    cf.anchoredCount = anySolid ? 1 : 0;
+    cf.totalCount = cf.anchoredCount;
+
+    if (!anySolid) {
+        physics.ClearWorldCollider();
+        return;
+    }
+
+    const std::vector<vox::destruction::Box> boxes =
+        vox::destruction::decomposeComponent(cf, glm::ivec3(dim, dim, dim), 1);
+
+    // Convert inclusive voxel AABBs -> world-unit ColliderBoxes ([mn .. mx+1]).
+    std::vector<vox::physics::ColliderBox> cboxes;
+    cboxes.reserve(boxes.size());
+    for (const auto& b : boxes) {
+        vox::physics::ColliderBox cb;
+        cb.minX = static_cast<float>(b.mn.x);
+        cb.minY = static_cast<float>(b.mn.y);
+        cb.minZ = static_cast<float>(b.mn.z);
+        cb.maxX = static_cast<float>(b.mx.x + 1);
+        cb.maxY = static_cast<float>(b.mx.y + 1);
+        cb.maxZ = static_cast<float>(b.mx.z + 1);
+        cboxes.push_back(cb);
+    }
+    physics.SetWorldCollider(cboxes);
+    vox::log::Trace("physics: world collider rebuilt ({} boxes)", cboxes.size());
+}
+#endif  // VOX_HAVE_PHYSX
+
 void Usage() {
     vox::log::Info("Voxhammer {} -- standalone DX12 voxel-destruction engine", VOX_VERSION_STRING);
     vox::log::Info("Usage: voxhammer [flags]");
@@ -709,6 +779,7 @@ void RegisterCoreCvars() {
     reg("physics.gpu_rigids.enabled", "1", "GPU rigid bodies (NVIDIA).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("physics.gpu_rigids.max_islands", "10000", "Max active dynamic islands.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 256, .range_max = 16384, .range_step = 256});
     reg("physics.solver.position_iters", "8", "Solver position iterations.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
+    reg("physics.world_collider", "0", "Milestone C: build a STATIC box-compound collider matching the voxel terrain (greedy box cover -> one PxRigidStatic of PxBoxGeometry) so falling debris + B1 detached islands LAND on the terrain instead of dropping through to the y=0 plane. Default OFF = behavior unchanged. ON rebuilds the collider after each carve (voxel.break/explode) + after voxel.settle. Additive to the y=0 ground plane.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("sim.fluid.grid_resolution", "MED", "FLIP/Eulerian fluid grid resolution.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"LOW", "MED", "HIGH", "ULTRA"}});
     reg("sim.fire.combustion_rate", "1.0", "Combustion rate multiplier.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.1f, .range_max = 5.0f, .range_step = 0.1f});
     reg("voxel.streaming.horizon_meters", "256", "Voxel streaming horizon.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 64.0f, .range_max = 512.0f, .range_step = 8.0f});
@@ -1025,6 +1096,14 @@ int main(int argc, char** argv) {
     palettePtr = livePalette.data();  // renderer.Init copies this; debris color included
     DebrisField debris;
     debris.Init(debrisMat);
+
+    // Milestone C: build the static world box-compound collider once now that
+    // the terrain is generated/loaded, IF physics.world_collider is ON. Default
+    // OFF -> behavior unchanged (only the y=0 ground plane). It is rebuilt after
+    // each carve + settle below.
+    if (CVar* wc = console.FindCVar("physics.world_collider"); wc && wc->GetBool()) {
+        RebuildWorldCollider(world, physics);
+    }
 #endif
 
     // Window + DX12 + key dispatch.
@@ -1097,6 +1176,11 @@ int main(int argc, char** argv) {
                 voxLoaded = false;
                 auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
                 renderer.SetVoxels(grid, world.Palette().data());
+#if defined(VOX_HAVE_PHYSX)
+                // Milestone C: an empty world has no terrain -> drop the collider
+                // (the y=0 ground plane remains). No-op if it was never built.
+                physics.ClearWorldCollider();
+#endif
                 o.Print("voxel world cleared");
             });
 
@@ -1115,6 +1199,14 @@ int main(int argc, char** argv) {
 #endif
                 if (n == 0) o.Print("voxel.settle: nothing floats (all voxels reach the ground)");
                 else o.Format("voxel.settle: detached {} voxel(s) as falling debris", n);
+#if defined(VOX_HAVE_PHYSX)
+                // Milestone C: rebuild the static world collider so the dropped
+                // islands land on the settled terrain (collider gated OFF by default).
+                if (n > 0 && Console::Get().FindCVar("physics.world_collider") &&
+                    Console::Get().FindCVar("physics.world_collider")->GetBool()) {
+                    RebuildWorldCollider(world, physics);
+                }
+#endif
             });
 
         // voxel.break: ray-cast from the camera along its forward vector and carve
@@ -1183,6 +1275,15 @@ int main(int argc, char** argv) {
 #endif
                     if (detached > 0) o.Format("voxel.break: auto-settle detached {} voxel(s)", detached);
                 }
+#if defined(VOX_HAVE_PHYSX)
+                // Milestone C: rebuild the static world collider so debris +
+                // detached islands land on the freshly-carved terrain (not the
+                // y=0 plane). FULL rebuild for v1; dirty-region is the future
+                // optimization. Gated OFF by default -> no-op when disabled.
+                if (cc.FindCVar("physics.world_collider") && cc.FindCVar("physics.world_collider")->GetBool()) {
+                    RebuildWorldCollider(world, physics);
+                }
+#endif
             });
 
         // voxel.explode: like voxel.break but carves a LARGER crater
@@ -1254,6 +1355,13 @@ int main(int argc, char** argv) {
 #endif
                     if (detached > 0) o.Format("voxel.explode: auto-settle detached {} voxel(s)", detached);
                 }
+#if defined(VOX_HAVE_PHYSX)
+                // Milestone C: rebuild the static world collider after the crater
+                // (+ any settle) so debris/islands land on the new terrain.
+                if (cc.FindCVar("physics.world_collider") && cc.FindCVar("physics.world_collider")->GetBool()) {
+                    RebuildWorldCollider(world, physics);
+                }
+#endif
             });
     }
 
