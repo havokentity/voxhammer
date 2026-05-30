@@ -106,7 +106,7 @@ body {
 .search input { background: none; border: 0; color: var(--fg); font: inherit; width: 116px; outline: none; }
 .btn-ghost { height: 36px; padding: 0 14px; border-radius: 999px; background: var(--panel); border: 1px solid var(--edge); color: var(--dim); font: inherit; font-size: 12px; cursor: pointer; }
 .btn-ghost:hover { color: var(--accent); border-color: var(--accent); }
-.controls { flex: 1; overflow-y: auto; padding: var(--pad); display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: var(--gap); align-content: start; }
+.controls { flex: 1; overflow-y: auto; padding: var(--pad); display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: var(--gap); align-content: start; align-items: start; }
 
 /* control card */
 .ctrl { background: var(--panel); border: 1px solid var(--edge); border-radius: var(--r); padding: 12px 13px; display: flex; flex-direction: column; gap: 10px; min-width: 0; overflow: hidden; }
@@ -135,7 +135,7 @@ body {
 .icon-btn { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; background: transparent; border: 1px solid transparent; color: var(--faint); cursor: pointer; font-size: 13px; }
 .icon-btn:hover { color: var(--accent); border-color: var(--edge-hi); } .icon-btn.pinned { color: var(--accent); }
 .ctrl-desc { font-size: 11px; color: var(--dim); line-height: 1.4; white-space: normal; overflow-wrap: anywhere; }
-.ctrl-body { min-height: var(--ctrl-h); display: flex; align-items: center; min-width: 0; overflow: hidden; }
+.ctrl-body { min-height: var(--ctrl-h); display: flex; align-items: center; min-width: 0; overflow: visible; }
 
 /* toggle */
 .toggle { --w: 58px; width: var(--w); height: 32px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--edge-hi); position: relative; cursor: pointer; flex: none; }
@@ -410,7 +410,7 @@ body {
 .gfx-custom { display: none; font-size: 11px; color: var(--warn); letter-spacing: 1px; text-transform: uppercase; margin-left: 2px; }
 .gfx-custom.visible { display: inline; }
 /* Advanced subsection reuses the .controls grid layout */
-.gfx-advanced-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: var(--gap); align-content: start; }
+.gfx-advanced-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: var(--gap); align-content: start; align-items: start; }
 /* Separate the advanced section with a top-gap */
 .gfx-advanced-section { margin-top: 6px; }
 
