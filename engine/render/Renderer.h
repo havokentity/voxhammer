@@ -52,6 +52,10 @@ struct FrameParams {
     float gi_denoise_phi_normal= 64.0f;  // normal edge-stop exponent: higher = sharper preservation of normal discontinuities
     float gi_denoise_phi_depth = 1.0f;   // depth/position edge-stop scale: smaller = more sensitive to depth discontinuities
     float gi_denoise_phi_lum   = 4.0f;   // luminance edge-stop sigma (mode 1 fixed; mode 2 scaled by sqrt(variance))
+    // EXPERIMENTAL (Milestone A1, default OFF): the deferred G-buffer pass draws the world
+    // object's OBB-raster + fragment DDA instead of the proven full-screen PSShade. Gated so a
+    // saved denoiser (ATROUS/SVGF) keeps routing through the verified A0 path until A1 is signed off.
+    int   gbuffer_obb          = 0;      // 0 = full-screen PSShade (A0, default) / 1 = OBB raster (A1)
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen

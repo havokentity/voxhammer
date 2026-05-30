@@ -2450,11 +2450,21 @@ void Renderer::RenderFrame(const FrameParams& fp) {
             d.OffRtv(4),  // SV_Target3 gbuf
             d.OffRtv(5),  // SV_Target4 variance
         };
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv = d.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-        d.list->OMSetRenderTargets(5, shadeRtvs, FALSE, &dsv);
-        d.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        d.list->SetGraphicsRootSignature(d.obbRootSig.Get());
-        d.list->SetPipelineState(d.obbPso.Get());
+        // A1 OBB-raster is GATED behind renderer.gbuffer.obb (fp.gbuffer_obb, default OFF).
+        // OFF -> the PROVEN A0 full-screen PSShade G-buffer pass (shadePso is already bound by the
+        // Reset that opened this list; shadeRootSig; NO depth; full-screen triangle). ON -> A1's
+        // OBB cube raster with a depth buffer. Both write the identical 5 MRT G-buffer and share
+        // roots 0-12 below; only this head (RT/depth/rootsig/PSO) and the b1+draw tail differ.
+        if (fp.gbuffer_obb) {
+            D3D12_CPU_DESCRIPTOR_HANDLE dsv = d.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            d.list->OMSetRenderTargets(5, shadeRtvs, FALSE, &dsv);
+            d.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            d.list->SetGraphicsRootSignature(d.obbRootSig.Get());
+            d.list->SetPipelineState(d.obbPso.Get());
+        } else {
+            d.list->OMSetRenderTargets(5, shadeRtvs, FALSE, nullptr);   // no DSV
+            d.list->SetGraphicsRootSignature(d.shadeRootSig.Get());     // shadePso already bound via Reset()
+        }
         d.list->SetGraphicsRootConstantBufferView(0, d.camBuf->GetGPUVirtualAddress());
         d.list->SetGraphicsRootShaderResourceView(1, d.voxelBuf->GetGPUVirtualAddress());
         d.list->SetGraphicsRootUnorderedAccessView(2, d.accumBuf[curBuf]->GetGPUVirtualAddress());    // u0 Accum
@@ -2468,8 +2478,12 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         d.list->SetGraphicsRootUnorderedAccessView(10, d.momentBuf[prevBuf]->GetGPUVirtualAddress()); // u5 PrevMoments
         d.list->SetGraphicsRootUnorderedAccessView(11, d.directAccumBuf[curBuf]->GetGPUVirtualAddress());  // u6 DirectAccum (current, write)
         d.list->SetGraphicsRootUnorderedAccessView(12, d.directAccumBuf[prevBuf]->GetGPUVirtualAddress()); // u7 PrevDirectAccum (previous, read)
-        d.list->SetGraphicsRootConstantBufferView(13, d.obbBuf->GetGPUVirtualAddress());              // b1 ObbObject (model/invModel/dims/skyOnMiss)
-        d.list->DrawInstanced(36, 1, 0, 0);   // 36 verts = the unit cube (generated in VSObb)
+        if (fp.gbuffer_obb) {
+            d.list->SetGraphicsRootConstantBufferView(13, d.obbBuf->GetGPUVirtualAddress());          // b1 ObbObject (model/invModel/dims/skyOnMiss)
+            d.list->DrawInstanced(36, 1, 0, 0);   // A1: 36 verts = the unit cube (generated in VSObb)
+        } else {
+            d.list->DrawInstanced(3, 1, 0, 0);    // A0: full-screen triangle (PSShade)
+        }
 
         // ---- 2) DEFERRED LIGHTING (a-trous): edge-aware wavelet over the G-buffer's
         //        demodulated indirect, ping-pong indirect[src]->indirect[dst] ----

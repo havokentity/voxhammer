@@ -567,6 +567,7 @@ void RegisterCoreCvars() {
     reg("renderer.gi.denoise_phi_normal", "64.0", "Denoiser (ATROUS/SVGF): normal edge-stop exponent; higher preserves normal/voxel-face edges more sharply.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 1.0f, .range_max = 256.0f, .range_step = 1.0f});
     reg("renderer.gi.denoise_phi_depth", "1.0", "Denoiser (ATROUS/SVGF): depth/position edge-stop scale; smaller = more sensitive to depth silhouettes (less bleed across them).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.05f, .range_max = 8.0f, .range_step = 0.05f});
     reg("renderer.gi.denoise_phi_lum", "4.0", "Denoiser (ATROUS/SVGF): luminance edge-stop sigma (grain<->detail balance; SVGF scales it by sqrt(variance)).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.1f, .range_max = 32.0f, .range_step = 0.1f});
+    reg("renderer.gbuffer.obb", "0", "EXPERIMENTAL (Milestone A1): draw the deferred G-buffer pass by OBB-rasterizing the world object + fragment DDA instead of the proven full-screen PSShade. OFF (default) = the verified A0 path; ON = the A1 path (under verification). Only affects QUALITY + a denoiser (ATROUS/SVGF).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("renderer.empty_space_skip", "1", "Skip empty bricks in the voxel raymarch (faster; visually identical). Off = per-voxel DDA.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("renderer.gi.debug", "0", "QUALITY debug: show ONLY the indirect GI bounce (no direct/albedo) to confirm GI is contributing.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("physics.gpu_rigids.enabled", "1", "GPU rigid bodies (NVIDIA).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
@@ -1237,6 +1238,7 @@ int main(int argc, char** argv) {
             fp.gi_reproject_history = console.FindCVar("renderer.gi.reproject_history")->GetInt();
             const std::string& giDn = console.FindCVar("renderer.gi.denoiser")->value;
             fp.gi_denoiser = (giDn == "SVGF") ? 2 : (giDn == "ATROUS") ? 1 : 0;
+            fp.gbuffer_obb = console.FindCVar("renderer.gbuffer.obb")->GetBool() ? 1 : 0;  // A1 OBB-raster gate (default OFF -> proven A0 path)
             fp.gi_atrous_iters = console.FindCVar("renderer.gi.atrous_iters")->GetInt();
             fp.gi_denoise_phi_normal = console.FindCVar("renderer.gi.denoise_phi_normal")->GetFloat();
             fp.gi_denoise_phi_depth = console.FindCVar("renderer.gi.denoise_phi_depth")->GetFloat();
