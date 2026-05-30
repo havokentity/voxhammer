@@ -185,10 +185,11 @@ body {
    specificity beats .console-line's flex:1 / pill / max-width from the bottom strip). */
 .controls.console-page .console-page-line { flex: none; flex-direction: column; align-items: stretch; gap: 8px; margin-left: 0; max-width: none; height: auto; border: 0; border-top: 1px solid var(--edge); border-radius: 0; background: none; padding: 12px 14px; }
 .console-log { overflow-y: auto; }
-.cl-row { display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 14px; background: var(--panel-2); border: 1px solid var(--edge); border-radius: 999px; }
+.cl-row { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 6px 0 14px; background: var(--panel-2); border: 1px solid var(--edge); border-radius: 999px; }
 .cl-row:focus-within { border-color: var(--accent); }
 .cl-row input { flex: 1; min-width: 0; background: none; border: 0; color: var(--fg); font: inherit; outline: none; }
 .cl-send-block { width: 100%; height: 42px; border-radius: 10px; font-size: 14px; }
+.cl-send-inrow { flex: none; height: 30px; padding: 0 14px; font-size: 11px; }   /* compact run button INSIDE the input pill */
 [data-skin="tactical"] .controls.console-page .console-page-line { border-radius: 0; }
 /* autocomplete dropdown (cvar/command completion), popped ABOVE the input */
 .cl-ac { position: absolute; left: 12px; right: 12px; bottom: calc(100% + 4px); max-height: 240px; overflow-y: auto; background: var(--panel); border: 1px solid var(--edge-hi); border-radius: var(--r-sm); box-shadow: 0 -10px 34px rgba(0,0,0,.55); z-index: 70; }

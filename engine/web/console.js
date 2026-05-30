@@ -837,9 +837,9 @@ function renderConsoleDeck() {
     const prompt = el("span", "cl-prompt", "❯");
     const inp = el("input"); inp.id = "console-page-input"; inp.type = "text"; inp.spellcheck = false;
     inp.placeholder = "command — Enter runs · ↑/↓ history · Alt/Ctrl+Space complete";
-    row.append(prompt, inp);
-    const run = el("button", "cl-send cl-send-block"); run.type = "submit"; run.textContent = "run";
-    form.append(row, run);
+    const run = el("button", "cl-send cl-send-inrow"); run.type = "submit"; run.textContent = "run";
+    row.append(prompt, inp, run);   // run inline inside the input pill (compact, right-aligned)
+    form.append(row);
     host.appendChild(form);
 
     // Reuse the exact shared command-input behavior (submit/run, history, autocomplete).
