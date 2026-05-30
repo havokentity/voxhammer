@@ -19,6 +19,7 @@
 #include "physics/PhysicsWorld.h"
 #include "render/Renderer.h"
 #include "script/ScriptHost.h"
+#include "voxel/StructuralSettle.h"
 #include "voxel/VoxImport.h"
 #include "voxel/VoxelWorld.h"
 
@@ -274,6 +275,50 @@ public:
         }
     }
 
+    // Spawn a single STRUCTURALLY-DETACHED island (Milestone B1) as one falling
+    // rigid-body chunk. `mats` is a tight local material grid of dims
+    // (dx,dy,dz) (row-major idx = z*dx*dy + y*dx + lx; 0 = empty -> concave
+    // shape preserved); `ox/oy/oz` is the voxel offset of its (0,0,0) corner in
+    // the world grid. The island detaches in place (no blast), then gravity
+    // drops it -- "nothing floats". MUST be called AFTER the island's voxels
+    // have been cleared from `world` (StructuralSettle already did that), so
+    // the per-frame re-stamp does not fight the now-empty terrain cells.
+    void SpawnIsland(vox::physics::PhysicsWorld& physics,
+                     const std::vector<std::uint8_t>& mats, int dx, int dy, int dz,
+                     int ox, int oy, int oz) {
+        if (maxLive_ <= 0 || dx <= 0 || dy <= 0 || dz <= 0) return;
+        if (static_cast<int>(live_.size()) >= maxLive_) return;  // cap reached
+        if (mats.size() != static_cast<std::size_t>(dx) * dy * dz) return;
+
+        Chunk c;
+        c.dx = dx; c.dy = dy; c.dz = dz;
+        c.mats = mats;  // copy the tight island grid verbatim (already 0=empty)
+        c.solidCount = 0;
+        for (std::uint8_t m : c.mats) if (m) ++c.solidCount;
+        if (c.solidCount == 0) return;
+
+        // Body local center == geometric center of the local box; spawn so the
+        // island's voxels initially coincide with the world cells it came from.
+        c.localCx = 0.5f * static_cast<float>(c.dx);
+        c.localCy = 0.5f * static_cast<float>(c.dy);
+        c.localCz = 0.5f * static_cast<float>(c.dz);
+        const float scx = static_cast<float>(ox) + c.localCx;
+        const float scy = static_cast<float>(oy) + c.localCy;
+        const float scz = static_cast<float>(oz) + c.localCz;
+
+        // Detach-in-place: zero linear velocity (a tiny jitter so a stack of
+        // islands doesn't sit in a perfectly balanced column), gentle spin so
+        // it topples naturally as it falls.
+        const float vx = Frand(-0.5f, 0.5f), vy = 0.0f, vz = Frand(-0.5f, 0.5f);
+        const float wx = Frand(-1.0f, 1.0f), wy = Frand(-1.0f, 1.0f), wz = Frand(-1.0f, 1.0f);
+
+        const int id = physics.AcquireBox(scx, scy, scz, c.localCx, c.localCy, c.localCz,
+                                          vx, vy, vz, wx, wy, wz);
+        if (id < 0) return;  // pool exhausted
+        c.id = id;
+        live_.push_back(std::move(c));
+    }
+
     // Per-frame: cull dead chunks (clearing their last footprint), then re-stamp
     // each live chunk at its body's full transform. `jobs` parallelizes the
     // per-chunk region build; uploads are serialized on the calling (main) thread.
@@ -521,6 +566,53 @@ private:
 };
 #endif  // VOX_HAVE_PHYSX
 
+// ---------------------------------------------------------------------------
+// Milestone B1: structural settle. Detach + drop any voxels no longer connected
+// to the ground, reusing the B0 connectivity/island-extract algorithms
+// (engine/voxel/StructuralSettle) and the existing DebrisField rigid-body spawn.
+//
+// 1) vox::voxel::SettleWorld() bakes the world, floods from the ground anchors,
+//    finds the UNANCHORED islands, CLEARS their voxels from the live world and
+//    returns each island's tight local grid + world origin.
+// 2) For each detached island we spawn a falling debris body (PhysX builds);
+//    in the stub build the voxels are simply removed (no rigid body).
+// 3) If anything detached we re-bake + renderer.SetVoxels so the world updates.
+//
+// Returns the number of voxels detached this pass (0 = nothing floated).
+int RunStructuralSettle(vox::console::Console& cc,
+                        vox::voxel::VoxelWorld& world,
+                        vox::render::Renderer& renderer
+#if defined(VOX_HAVE_PHYSX)
+                        , vox::physics::PhysicsWorld& physics,
+                        DebrisField& debris
+#endif
+) {
+    const int anchorLayers = cc.FindCVar("voxel.anchor_layers")
+                                 ? cc.FindCVar("voxel.anchor_layers")->GetInt() : 1;
+    vox::voxel::SettleResult res =
+        vox::voxel::SettleWorld(world, vox::voxel::kWorldDim, anchorLayers);
+    if (res.detachedVoxels == 0) return 0;  // nothing floats; world untouched
+
+#if defined(VOX_HAVE_PHYSX)
+    // Spawn each detached island as a falling rigid body (its voxels are
+    // already cleared from the world by SettleWorld). Pool is sized to
+    // voxel.debris.max as elsewhere.
+    debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
+    debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
+    debris.ReservePool(physics);
+    for (const auto& isl : res.islands) {
+        debris.SpawnIsland(physics, isl.data, isl.dims.x, isl.dims.y, isl.dims.z,
+                           isl.origin.x, isl.origin.y, isl.origin.z);
+    }
+#endif
+
+    // Re-upload the (now lighter) world to the GPU. A full re-bake is fine here:
+    // settle is a manual command or an opt-in per-carve hook, not a hot path.
+    auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
+    renderer.SetVoxels(grid, world.Palette().data());
+    return res.detachedVoxels;
+}
+
 void Usage() {
     vox::log::Info("Voxhammer {} -- standalone DX12 voxel-destruction engine", VOX_VERSION_STRING);
     vox::log::Info("Usage: voxhammer [flags]");
@@ -587,6 +679,8 @@ void RegisterCoreCvars() {
     reg("voxel.explode_force", "12.0", "Radial blast velocity (units/sec) for voxel.explode debris -- chunks fly outward from the blast center.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 64.0f, .range_step = 1.0f});
     reg("voxel.debris.max", "256", "Max live debris bodies (carve + explode). Spawning is skipped at the cap to bound physics/render cost.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 0, .range_max = 4096, .range_step = 16});
     reg("voxel.debris.scale", "1.0", "Debris chunk-size multiplier (dials chunkiness; 1 = stock 1..4-voxel cubes).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.25f, .range_max = 4.0f, .range_step = 0.25f});
+    reg("voxel.auto_settle", "0", "Structural settle (Milestone B1): after EVERY carve (voxel.break/explode), auto-detach any voxels no longer connected to the ground and drop them as debris. Default OFF = carve behavior unchanged; turn ON to make the world 'nothing floats'. (Full-grid flood per carve; use voxel.settle to run it manually.)", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("voxel.anchor_layers", "1", "Structural settle: number of bottom grid rows (y < N) treated as GROUND anchors. A solid voxel in these layers anchors its whole connected component; anything with no path down to them detaches. 1 = only the y==0 floor.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
     reg("audio.master_volume", "0.8", "Master output volume.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
     reg("camera.pos", "32 40 -24", "Free-fly camera position (world units).", {.type = CVarType::Vec3, .flags = CVAR_ARCHIVE});
     reg("camera.yaw", "0.0", "Camera yaw (radians).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = -3.1416f, .range_max = 3.1416f, .range_step = 0.02f});
@@ -963,6 +1057,23 @@ int main(int argc, char** argv) {
                 o.Print("voxel world cleared");
             });
 
+        // voxel.settle (Milestone B1): detach + drop any voxels not connected to
+        // the ground. Runs the structural-settle pass once: connectivity flood
+        // from the y<voxel.anchor_layers ground anchors -> any unanchored island
+        // detaches, is cleared from the world and spawned as falling debris.
+        c.RegisterCommand("voxel.settle",
+            "Detach + drop any voxels not connected to the ground (structural settle).",
+#if defined(VOX_HAVE_PHYSX)
+            [&world, &renderer, &physics, &debris](std::span<const std::string_view>, Output& o) {
+                const int n = RunStructuralSettle(Console::Get(), world, renderer, physics, debris);
+#else
+            [&world, &renderer](std::span<const std::string_view>, Output& o) {
+                const int n = RunStructuralSettle(Console::Get(), world, renderer);
+#endif
+                if (n == 0) o.Print("voxel.settle: nothing floats (all voxels reach the ground)");
+                else o.Format("voxel.settle: detached {} voxel(s) as falling debris", n);
+            });
+
         // voxel.break: ray-cast from the camera along its forward vector and carve
         // a sphere (voxel.break_radius) out of the first solid voxel that's hit.
         c.RegisterCommand("voxel.break",
@@ -1018,6 +1129,17 @@ int main(int argc, char** argv) {
                 renderer.EditVoxels(x0, y0, z0, x1, y1, z1, region.data(), nullptr);  // palette unchanged by carve
                 o.Format("voxel.break: removed {} voxels around hit ({},{},{}) r={}",
                          removed, hx, hy, hz, radius);
+                // Milestone B1: opt-in structural settle right after the carve.
+                // Default OFF (voxel.auto_settle=0) so carve behavior is
+                // unchanged; ON makes the now-unsupported region detach + fall.
+                if (cc.FindCVar("voxel.auto_settle") && cc.FindCVar("voxel.auto_settle")->GetBool()) {
+#if defined(VOX_HAVE_PHYSX)
+                    const int detached = RunStructuralSettle(cc, world, renderer, physics, debris);
+#else
+                    const int detached = RunStructuralSettle(cc, world, renderer);
+#endif
+                    if (detached > 0) o.Format("voxel.break: auto-settle detached {} voxel(s)", detached);
+                }
             });
 
         // voxel.explode: like voxel.break but carves a LARGER crater
@@ -1078,6 +1200,17 @@ int main(int argc, char** argv) {
                 renderer.EditVoxels(x0, y0, z0, x1, y1, z1, region.data(), nullptr);  // palette unchanged by carve
                 o.Format("voxel.explode: removed {} voxels around hit ({},{},{}) r={}",
                          removed, hx, hy, hz, radius);
+                // Milestone B1: opt-in structural settle right after the blast
+                // (default OFF). ON => any region the crater left unsupported
+                // detaches + falls instead of floating over the new void.
+                if (cc.FindCVar("voxel.auto_settle") && cc.FindCVar("voxel.auto_settle")->GetBool()) {
+#if defined(VOX_HAVE_PHYSX)
+                    const int detached = RunStructuralSettle(cc, world, renderer, physics, debris);
+#else
+                    const int detached = RunStructuralSettle(cc, world, renderer);
+#endif
+                    if (detached > 0) o.Format("voxel.explode: auto-settle detached {} voxel(s)", detached);
+                }
             });
     }
 
