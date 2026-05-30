@@ -53,28 +53,6 @@
   </div>
 </div>
 
-<!-- Console Overlay (unified REPL: big log + input + history) -->
-<div class="console-overlay" id="console-overlay" hidden aria-modal="true" role="dialog" aria-label="Console">
-  <div class="console-backdrop" id="console-backdrop"></div>
-  <div class="console-card">
-    <div class="console-card-head">
-      <span class="cc-title">❯ console</span>
-      <span class="cc-tools">
-        <button class="cap-btn" id="console-modal-clear" title="clear log">⌫</button>
-        <button class="cap-btn" id="console-modal-close" title="close (Esc)">✕</button>
-      </span>
-    </div>
-    <div class="log console-log" id="console-log"></div>
-    <form class="console-line console-modal-line" id="console-modal-form" autocomplete="off">
-      <div class="cl-row">
-        <span class="cl-prompt">❯</span>
-        <input id="console-modal-input" type="text" spellcheck="false" placeholder="command — Enter runs · ↑/↓ history · Alt/Ctrl+Space complete">
-      </div>
-      <button class="cl-send cl-send-block" type="submit">run</button>
-    </form>
-  </div>
-</div>
-
 <div class="settings-pop" id="settings" hidden>
   <div class="set-row"><span class="set-k">preset</span><div class="seg" id="set-preset"></div></div>
   <div class="set-sep"></div>

@@ -480,9 +480,9 @@ function renderRail() {
     kb.onclick = () => { state.cat = "keybindings"; renderRail(); renderDeck(); updateFavBtn(); };
     rail.appendChild(kb);
     rail.appendChild(el("div", "rail-sep"));
-    const cons = el("button", "cat ghost");
+    const cons = el("button", "cat ghost" + (state.cat === "console" ? " active" : ""));
     cons.innerHTML = `<span class="cat-icon">❯</span><span>Console</span>`;
-    cons.onclick = openConsole;
+    cons.onclick = () => { state.cat = "console"; renderRail(); renderDeck(); updateFavBtn(); };
     rail.appendChild(cons);
 }
 
@@ -494,6 +494,9 @@ function visibleCvars() {
     return list.sort((a, b) => a.name.localeCompare(b.name));
 }
 function renderDeck() {
+    // Leaving the console page restores the cvar-card grid layout on #controls.
+    if (state.cat !== "console") $("#controls").classList.remove("console-page");
+    if (state.cat === "console") { renderConsoleDeck(); return; }
     if (state.cat === "keybindings") { renderBindingsDeck(); return; }
     if (state.cat === "graphics") { renderGraphicsDeck(); return; }
     const meta = CATS[state.cat] || { label: "Pinned", icon: "★" };
@@ -804,6 +807,145 @@ function renderGraphicsDeck() {
     host.appendChild(advSection);
 }
 
+// ---------- console page (first-class deck view: full-height log + full-width input) ----------
+// The log element (#console-log) is a persistent node fed by pushLog. renderConsoleDeck
+// relocates it INTO the page (one source of truth — no duplicate log streams), so the
+// page always shows the live stream regardless of which deck was last open.
+let consoleLogEl = null;       // the single, persistent log node pushLog writes to
+function getConsoleLogEl() {
+    if (!consoleLogEl) {
+        consoleLogEl = el("div", "log console-log"); consoleLogEl.id = "console-log";
+    }
+    return consoleLogEl;
+}
+function renderConsoleDeck() {
+    $("#deck-icon").textContent = "❯";
+    $("#deck-name").textContent = "Console";
+    $("#deck-count").textContent = "";
+    const host = $("#controls");
+    host.innerHTML = "";
+    host.classList.add("console-page");   // flips #controls from cvar-card grid to a flex column
+
+    // Tall scrolling log filling the deck — the same persistent node pushLog targets.
+    const log = getConsoleLogEl();
+    host.appendChild(log);
+    requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
+
+    // Full-width command input row (reuses .cl-row + .cl-ac autocomplete + run button).
+    const form = el("form", "console-line console-page-line"); form.id = "console-page-form"; form.autocomplete = "off";
+    const row = el("div", "cl-row");
+    const prompt = el("span", "cl-prompt", "❯");
+    const inp = el("input"); inp.id = "console-page-input"; inp.type = "text"; inp.spellcheck = false;
+    inp.placeholder = "command — Enter runs · ↑/↓ history · Alt/Ctrl+Space complete";
+    row.append(prompt, inp);
+    const run = el("button", "cl-send cl-send-block"); run.type = "submit"; run.textContent = "run";
+    form.append(row, run);
+    host.appendChild(form);
+
+    // Reuse the exact shared command-input behavior (submit/run, history, autocomplete).
+    wireCmdInput(inp, form);
+    requestAnimationFrame(() => inp.focus());
+}
+
+// ---------- shared command input (bottom strip + console page) ----------
+// Submit/run, persisted Up/Down history (when the autocomplete list is closed), and a
+// fuzzy autocomplete dropdown (Alt/Ctrl+Space opens, arrows navigate, Tab accepts, Esc
+// closes, auto-open on the first char). Hoisted to module scope so renderConsoleDeck can
+// reuse it verbatim. Behavior must remain identical for every input it wires.
+function wireCmdInput(inp, form) {
+    if (!inp || !form) return;
+    state.cmdHistory = state.cmdHistory || JSON.parse(ls("vox.cmdhist", "[]"));
+    let idx = state.cmdHistory.length;
+    // ---- autocomplete dropdown over cvar + command names ----
+    const ac = el("div", "cl-ac"); ac.hidden = true; form.appendChild(ac);
+    let acOpen = false, acItems = [], acIdx = 0;
+    const candidates = () => {
+        const out = [];
+        for (const n of state.cvars.keys()) out.push({ name: n, kind: "cvar" });
+        for (const c of (state.commands || [])) out.push({ name: c.name, kind: "cmd" });
+        return out.sort((a, b) => a.name.localeCompare(b.name));
+    };
+    const renderAC = () => {
+        ac.innerHTML = "";
+        acItems.forEach((it, i) => {
+            const row = el("div", "cl-ac-item" + (i === acIdx ? " active" : ""));
+            row.innerHTML = `<span class="acn">${escHtml(it.name)}</span><span class="act">${it.kind}</span>`;
+            row.onmousedown = (ev) => { ev.preventDefault(); acceptAC(i); };
+            ac.appendChild(row);
+        });
+        const a = ac.children[acIdx]; if (a) a.scrollIntoView({ block: "nearest" });
+    };
+    // VSCode-style fuzzy subsequence score: query chars must appear IN ORDER in the
+    // target; bonuses for consecutive runs and for matching at a segment boundary
+    // (string start or right after '.'/'_', so "rgb" -> "renderer.gi.bounces"). -1 = no match.
+    const fuzzy = (q, t) => {
+        q = q.toLowerCase(); t = t.toLowerCase();
+        if (!q) return 0;
+        let qi = 0, score = 0, prev = -2;
+        for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+            if (t[ti] === q[qi]) {
+                let s = 1;
+                if (ti === prev + 1) s += 5;                                       // consecutive run
+                if (ti === 0 || t[ti - 1] === "." || t[ti - 1] === "_") s += 8;     // segment boundary
+                score += s; prev = ti; qi++;
+            }
+        }
+        if (qi < q.length) return -1;                  // not all query chars matched, in order
+        if (t.startsWith(q)) score += 12;              // exact-prefix bonus
+        return score - t.length * 0.1;                 // mild shorter-is-better tiebreak
+    };
+    const filterAC = () => {
+        const tok = inp.value.trim().split(/\s+/)[0] || "";
+        const scored = [];
+        for (const c of candidates()) { const s = fuzzy(tok, c.name); if (s >= 0) scored.push({ name: c.name, kind: c.kind, s }); }
+        scored.sort((a, b) => b.s - a.s || a.name.localeCompare(b.name));
+        acItems = scored.slice(0, 200);
+        if (acIdx >= acItems.length) acIdx = Math.max(0, acItems.length - 1);
+        renderAC();
+    };
+    const openAC  = () => { acOpen = true; acIdx = 0; ac.hidden = false; filterAC(); };
+    const closeAC = () => { acOpen = false; ac.hidden = true; };
+    function acceptAC(i) {
+        const it = acItems[i]; if (!it) { closeAC(); return; }
+        const rest = inp.value.trim().split(/\s+/).slice(1).join(" ");
+        inp.value = it.name + (rest ? " " + rest : " ");   // keep typed args; trailing space ready for a value
+        closeAC(); inp.focus();
+        const n = inp.value.length; requestAnimationFrame(() => inp.setSelectionRange(n, n));
+    }
+    form.onsubmit = (e) => {
+        e.preventDefault();
+        const v = inp.value.trim(); if (!v) return;
+        pushLog("info", "❯ " + v, "echo"); bus.send({ type: "exec", line: v });
+        if (state.cmdHistory[state.cmdHistory.length - 1] !== v) state.cmdHistory.push(v);
+        if (state.cmdHistory.length > 100) state.cmdHistory.shift();
+        localStorage.setItem("vox.cmdhist", JSON.stringify(state.cmdHistory));
+        idx = state.cmdHistory.length; inp.value = ""; closeAC();
+    };
+    inp.addEventListener("input", () => { if (acOpen) filterAC(); else if (inp.value.length === 1) openAC(); });  // auto-open on the first char typed from empty
+    inp.addEventListener("blur", () => setTimeout(closeAC, 120));  // let a click-select land first
+    inp.addEventListener("keydown", (e) => {
+        // Alt+Space / Ctrl+Space toggles the completion list (Alt+Space may hit the OS menu on Windows; Ctrl+Space is the safe fallback).
+        if ((e.altKey || e.ctrlKey) && (e.code === "Space" || e.key === " ")) { e.preventDefault(); openAC(); return; }  // open only; Esc closes
+        if (acOpen) {
+            // List OPEN: arrows navigate the list (NOT history); Tab accepts; Esc closes.
+            if (e.key === "ArrowDown") { e.preventDefault(); if (acIdx < acItems.length - 1) { acIdx++; renderAC(); } return; }
+            if (e.key === "ArrowUp")   { e.preventDefault(); if (acIdx > 0) { acIdx--; renderAC(); } return; }
+            if (e.key === "Tab")       { e.preventDefault(); acceptAC(acIdx); return; }
+            if (e.key === "Escape")    { e.preventDefault(); e.stopPropagation(); closeAC(); return; }  // don't also close the overlay
+            return;  // Enter falls through to submit; typing re-filters via the input handler
+        }
+        // List CLOSED: Up/Down cycle command history.
+        if (e.key === "ArrowUp") {
+            if (idx > 0) { idx--; inp.value = state.cmdHistory[idx] || ""; e.preventDefault();
+                const n = inp.value.length; requestAnimationFrame(() => inp.setSelectionRange(n, n)); }
+        } else if (e.key === "ArrowDown") {
+            if (idx < state.cmdHistory.length - 1) { idx++; inp.value = state.cmdHistory[idx] || ""; }
+            else { idx = state.cmdHistory.length; inp.value = ""; }
+            e.preventDefault();
+        }
+    });
+}
+
 // ---------- vox drop / upload card (injected at the top of the World deck) ----------
 function buildVoxCard() {
     const card = el("div", "ctrl vox-upload-card");
@@ -990,8 +1132,10 @@ function updateViewport() {
 
 // ---------- log ----------
 function pushLog(level, msg, cls) {
-    // Mirror every line into BOTH the intel log and the console-overlay log.
-    for (const log of [$("#log"), document.getElementById("console-log")]) {
+    // Mirror every line into BOTH the intel log and the console-page log. The page log
+    // is a single persistent node (consoleLogEl) — one source of truth, whether or not
+    // it's currently attached to the console deck.
+    for (const log of [$("#log"), getConsoleLogEl()]) {
         if (!log) continue;
         const near = log.scrollTop + log.clientHeight > log.scrollHeight - 30;
         const ln = el("div", "ln " + (cls || level)); ln.innerHTML = `<span class="t">${new Date().toLocaleTimeString("en-GB")}</span><span class="m"></span>`;
@@ -1001,14 +1145,6 @@ function pushLog(level, msg, cls) {
     }
 }
 function applyLogFilter(ln) { const lvl = ln.dataset.lvl; if (lvl in state.logFilters) ln.style.display = state.logFilters[lvl] ? "" : "none"; }
-// Console overlay (unified REPL) open/close.
-function openConsole() {
-    const o = $("#console-overlay"); if (!o) return;
-    o.hidden = false;
-    const cl = $("#console-log"); if (cl) cl.scrollTop = cl.scrollHeight;
-    const ci = $("#console-modal-input"); if (ci) ci.focus();
-}
-function closeConsole() { const o = $("#console-overlay"); if (o) o.hidden = true; }
 function wireLogFilters() {
     for (const chip of document.querySelectorAll(".chip[data-lvl]")) {
         chip.classList.toggle("on", state.logFilters[chip.dataset.lvl]);
@@ -1345,107 +1481,9 @@ function init() {
     }
     $("#search").oninput = (e) => { state.search = e.target.value; renderDeck(); };
     $("#reset-group").onclick = () => { for (const cv of visibleCvars()) if (!(cv.flags & F.READONLY)) setCvar(cv.name, cv.default); renderDeck(); };
-    // Command inputs (bottom strip + console overlay) share persisted history.
+    // Command inputs (bottom strip + console page) share persisted history.
     state.cmdHistory = state.cmdHistory || JSON.parse(ls("vox.cmdhist", "[]"));
-    function wireCmdInput(inp, form) {
-        if (!inp || !form) return;
-        let idx = state.cmdHistory.length;
-        // ---- autocomplete dropdown over cvar + command names ----
-        const ac = el("div", "cl-ac"); ac.hidden = true; form.appendChild(ac);
-        let acOpen = false, acItems = [], acIdx = 0;
-        const candidates = () => {
-            const out = [];
-            for (const n of state.cvars.keys()) out.push({ name: n, kind: "cvar" });
-            for (const c of (state.commands || [])) out.push({ name: c.name, kind: "cmd" });
-            return out.sort((a, b) => a.name.localeCompare(b.name));
-        };
-        const renderAC = () => {
-            ac.innerHTML = "";
-            acItems.forEach((it, i) => {
-                const row = el("div", "cl-ac-item" + (i === acIdx ? " active" : ""));
-                row.innerHTML = `<span class="acn">${escHtml(it.name)}</span><span class="act">${it.kind}</span>`;
-                row.onmousedown = (ev) => { ev.preventDefault(); acceptAC(i); };
-                ac.appendChild(row);
-            });
-            const a = ac.children[acIdx]; if (a) a.scrollIntoView({ block: "nearest" });
-        };
-        // VSCode-style fuzzy subsequence score: query chars must appear IN ORDER in the
-        // target; bonuses for consecutive runs and for matching at a segment boundary
-        // (string start or right after '.'/'_', so "rgb" -> "renderer.gi.bounces"). -1 = no match.
-        const fuzzy = (q, t) => {
-            q = q.toLowerCase(); t = t.toLowerCase();
-            if (!q) return 0;
-            let qi = 0, score = 0, prev = -2;
-            for (let ti = 0; ti < t.length && qi < q.length; ti++) {
-                if (t[ti] === q[qi]) {
-                    let s = 1;
-                    if (ti === prev + 1) s += 5;                                       // consecutive run
-                    if (ti === 0 || t[ti - 1] === "." || t[ti - 1] === "_") s += 8;     // segment boundary
-                    score += s; prev = ti; qi++;
-                }
-            }
-            if (qi < q.length) return -1;                  // not all query chars matched, in order
-            if (t.startsWith(q)) score += 12;              // exact-prefix bonus
-            return score - t.length * 0.1;                 // mild shorter-is-better tiebreak
-        };
-        const filterAC = () => {
-            const tok = inp.value.trim().split(/\s+/)[0] || "";
-            const scored = [];
-            for (const c of candidates()) { const s = fuzzy(tok, c.name); if (s >= 0) scored.push({ name: c.name, kind: c.kind, s }); }
-            scored.sort((a, b) => b.s - a.s || a.name.localeCompare(b.name));
-            acItems = scored.slice(0, 200);
-            if (acIdx >= acItems.length) acIdx = Math.max(0, acItems.length - 1);
-            renderAC();
-        };
-        const openAC  = () => { acOpen = true; acIdx = 0; ac.hidden = false; filterAC(); };
-        const closeAC = () => { acOpen = false; ac.hidden = true; };
-        function acceptAC(i) {
-            const it = acItems[i]; if (!it) { closeAC(); return; }
-            const rest = inp.value.trim().split(/\s+/).slice(1).join(" ");
-            inp.value = it.name + (rest ? " " + rest : " ");   // keep typed args; trailing space ready for a value
-            closeAC(); inp.focus();
-            const n = inp.value.length; requestAnimationFrame(() => inp.setSelectionRange(n, n));
-        }
-        form.onsubmit = (e) => {
-            e.preventDefault();
-            const v = inp.value.trim(); if (!v) return;
-            pushLog("info", "❯ " + v, "echo"); bus.send({ type: "exec", line: v });
-            if (state.cmdHistory[state.cmdHistory.length - 1] !== v) state.cmdHistory.push(v);
-            if (state.cmdHistory.length > 100) state.cmdHistory.shift();
-            localStorage.setItem("vox.cmdhist", JSON.stringify(state.cmdHistory));
-            idx = state.cmdHistory.length; inp.value = ""; closeAC();
-        };
-        inp.addEventListener("input", () => { if (acOpen) filterAC(); else if (inp.value.length === 1) openAC(); });  // auto-open on the first char typed from empty
-        inp.addEventListener("blur", () => setTimeout(closeAC, 120));  // let a click-select land first
-        inp.addEventListener("keydown", (e) => {
-            // Alt+Space / Ctrl+Space toggles the completion list (Alt+Space may hit the OS menu on Windows; Ctrl+Space is the safe fallback).
-            if ((e.altKey || e.ctrlKey) && (e.code === "Space" || e.key === " ")) { e.preventDefault(); openAC(); return; }  // open only; Esc closes
-            if (acOpen) {
-                // List OPEN: arrows navigate the list (NOT history); Tab accepts; Esc closes.
-                if (e.key === "ArrowDown") { e.preventDefault(); if (acIdx < acItems.length - 1) { acIdx++; renderAC(); } return; }
-                if (e.key === "ArrowUp")   { e.preventDefault(); if (acIdx > 0) { acIdx--; renderAC(); } return; }
-                if (e.key === "Tab")       { e.preventDefault(); acceptAC(acIdx); return; }
-                if (e.key === "Escape")    { e.preventDefault(); e.stopPropagation(); closeAC(); return; }  // don't also close the overlay
-                return;  // Enter falls through to submit; typing re-filters via the input handler
-            }
-            // List CLOSED: Up/Down cycle command history.
-            if (e.key === "ArrowUp") {
-                if (idx > 0) { idx--; inp.value = state.cmdHistory[idx] || ""; e.preventDefault();
-                    const n = inp.value.length; requestAnimationFrame(() => inp.setSelectionRange(n, n)); }
-            } else if (e.key === "ArrowDown") {
-                if (idx < state.cmdHistory.length - 1) { idx++; inp.value = state.cmdHistory[idx] || ""; }
-                else { idx = state.cmdHistory.length; inp.value = ""; }
-                e.preventDefault();
-            }
-        });
-    }
     wireCmdInput($("#console-input"), $("#console-form"));
-    wireCmdInput($("#console-modal-input"), $("#console-modal-form"));
-    // Console overlay controls.
-    $("#console-backdrop").onclick = closeConsole;
-    $("#console-modal-close").onclick = closeConsole;
-    $("#console-modal-clear").onclick = () => { const cl = $("#console-log"); if (cl) cl.innerHTML = ""; };
-    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("#console-overlay").hidden) closeConsole(); });
     $("#link").onclick = () => pushLog("info", state.demo ? "DEMO: open the engine at https://localhost:27960/ for a live link" : "link active");
     wirePalette();
     wireFavoritesBtn();
