@@ -335,7 +335,8 @@ public:
             const float y = physics.BodyPosY(it->id);
             const bool dead = !std::isfinite(y) || y < kKillY || it->age > kTtlSeconds;
             if (dead) {
-                if (it->hasPrev) ClearBoxToTerrain(world, renderer, it->prev);
+                if (it->dynHandle >= 0) renderer.RemoveDynObject(it->dynHandle);  // A3: free the OBB slot
+                else if (it->hasPrev) ClearBoxToTerrain(world, renderer, it->prev);
                 physics.ReleaseBox(it->id);
                 it = live_.erase(it);
             } else {
@@ -353,6 +354,16 @@ public:
             vox::physics::BodyState st;
             if (!FindState(states_, t.id, st)) continue;  // not live this frame
             t.pose = st;
+            if (t.dynHandle >= 0) {
+                // A3 OBB path: hand the live rigid-body transform to the renderer (it
+                // draws the chunk as an independent voxel object) and SKIP the grid
+                // re-stamp entirely -- so the chunk rotates smoothly, not grid-snapped.
+                const float pos[3]  = { st.px, st.py, st.pz };
+                const float quat[4] = { st.qx, st.qy, st.qz, st.qw };
+                const float ctr[3]  = { t.localCx, t.localCy, t.localCz };
+                renderer.SetDynObjectTransform(t.dynHandle, pos, quat, ctr);
+                continue;
+            }
             t.cur = WorldAabb(t, st);
             jobItems_.push_back(&t);
         }
@@ -390,6 +401,7 @@ public:
                   vox::render::Renderer& renderer) {
         for (auto& t : live_)
             if (t.hasPrev) ClearBoxToTerrain(world, renderer, t.prev);
+        renderer.ClearDynObjects();      // A3: free all OBB dynamic-object slots
         physics.ClearDynamics();  // parks pooled bodies (keeps the pool)
         live_.clear();
     }
