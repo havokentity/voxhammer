@@ -675,59 +675,123 @@ int RunStructuralSettle(vox::console::Console& cc,
 // [x..x+1] x [y..y+1] x [z..z+1]. box_decompose returns INCLUSIVE voxel AABBs
 // [mn..mx], so the world box is [mn .. mx+1].
 //
-// The full rebuild (bake -> downcast -> decompose -> SetWorldCollider) is expensive, so it
-// is DEBOUNCED: callers mark the collider dirty and the main loop runs the real rebuild ONCE
-// carving has paused (a few quiet frames), instead of synchronously per carve. (Dirty-region
-// incremental rebuild around the carved AABB is the next optimization.)
+// The full rebuild (bake -> decompose -> SetWorldCollider) is expensive (O(2M)
+// voxels -> a ~1s stutter), so it is both DEBOUNCED *and* ASYNC:
+//
+//   * DEBOUNCE: callers mark the collider dirty; the main loop only kicks the
+//     rebuild ONCE carving has paused (a few quiet frames), not per carve.
+//   * ASYNC pipeline (so the rebuild never stutters the main thread):
+//       1. main thread BAKEs the live world into a uint8 solidity snapshot
+//          (bake must be main-thread to avoid racing a carve) and launches a
+//          worker thread; marks the job "in flight". Does NOT block.
+//       2. the worker runs labelComponents-equivalent (single cover id) +
+//          decomposeComponent over the snapshot into a ColliderBox result,
+//          then sets the atomic `ready` flag. NO PhysX calls in the worker.
+//       3. the main loop polls `ready`; when set it joins the worker and applies
+//          the result via SetWorldCollider (PhysX -> main thread only), then
+//          clears in-flight/ready.
+//       4. COALESCE: if the collider goes dirty again while a job is in flight we
+//          do NOT launch a second worker -- we finish the current one, and if
+//          still dirty kick another, so it always converges to the latest world
+//          without piling up jobs.
+//
+// (Dirty-region incremental rebuild around the carved AABB is the next opt.)
 static bool g_colliderDirty = false;
 static int  g_colliderQuietFrames = 0;
+
+// --- async-rebuild state (file-scope; all the buffers outlive the worker since
+// they are static and we gate re-launch on g_colliderJobInFlight) ---
+static bool                                g_colliderJobInFlight = false;  // main-thread only
+static std::atomic<bool>                   g_colliderJobReady{false};      // worker -> main
+static std::thread                         g_colliderThread;               // one worker at a time
+static std::vector<std::uint8_t>           g_colliderSnapshot;             // main writes, worker reads
+static glm::ivec3                          g_colliderDims{0};              // snapshot dims (worker reads)
+static bool                                g_colliderSnapshotAnySolid = false;  // main writes, worker reads
+static std::vector<vox::physics::ColliderBox> g_colliderResult;           // worker writes, main reads
+
 void RebuildWorldCollider(vox::voxel::VoxelWorld&, vox::physics::PhysicsWorld&) {
-    g_colliderDirty = true; g_colliderQuietFrames = 0;   // mark dirty; RebuildWorldColliderNow does the work (main loop)
+    g_colliderDirty = true; g_colliderQuietFrames = 0;   // mark dirty; the main loop drives the async rebuild
 }
-void RebuildWorldColliderNow(vox::voxel::VoxelWorld& world,
-                             vox::physics::PhysicsWorld& physics) {
+
+// Pure-CPU worker body: snapshot (uint8 solidity) -> single-id ComponentField ->
+// decomposeComponent -> world-unit ColliderBox result. Touches ONLY the static
+// snapshot/result buffers + dims (no live world, no PhysX). Sets `ready` last.
+static void ColliderDecomposeJob() {
+    g_colliderResult.clear();
+    if (g_colliderSnapshotAnySolid) {
+        // Every solid voxel is one cover component (id 1). decomposeComponent
+        // tiles the entire solid set with non-overlapping concave-respecting
+        // boxes; a single id over all solids is enough + cheapest for a static
+        // cover (no per-component labelling needed).
+        vox::destruction::ComponentField cf;
+        cf.ids.resize(g_colliderSnapshot.size());
+        for (std::size_t i = 0; i < g_colliderSnapshot.size(); ++i)
+            cf.ids[i] = g_colliderSnapshot[i] ? std::uint16_t{1} : std::uint16_t{0};
+        cf.anchoredCount = 1;
+        cf.totalCount = 1;
+
+        const std::vector<vox::destruction::Box> boxes =
+            vox::destruction::decomposeComponent(cf, g_colliderDims, 1);
+
+        // Convert inclusive voxel AABBs -> world-unit ColliderBoxes ([mn .. mx+1]).
+        g_colliderResult.reserve(boxes.size());
+        for (const auto& b : boxes) {
+            vox::physics::ColliderBox cb;
+            cb.minX = static_cast<float>(b.mn.x);
+            cb.minY = static_cast<float>(b.mn.y);
+            cb.minZ = static_cast<float>(b.mn.z);
+            cb.maxX = static_cast<float>(b.mx.x + 1);
+            cb.maxY = static_cast<float>(b.mx.y + 1);
+            cb.maxZ = static_cast<float>(b.mx.z + 1);
+            g_colliderResult.push_back(cb);
+        }
+    }
+    g_colliderJobReady.store(true, std::memory_order_release);  // publish (must be last)
+}
+
+// MAIN THREAD: bake the live world into the snapshot and launch the worker.
+// Caller must guarantee no job is in flight (coalescing is handled by the loop).
+static void LaunchColliderJob(vox::voxel::VoxelWorld& world) {
     const int dim = static_cast<int>(vox::voxel::kWorldDim);
     const std::vector<std::uint32_t> grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
 
-    // Build a ComponentField where every solid voxel is one cover component
-    // (id 1). decomposeComponent then tiles the ENTIRE anchored solid set with
-    // non-overlapping boxes (concave-respecting). We don't need per-component
-    // labelling for a static cover -- a single id over all solids is enough and
-    // cheapest.
-    vox::destruction::ComponentField cf;
-    cf.ids.resize(grid.size());
+    g_colliderSnapshot.resize(grid.size());
     bool anySolid = false;
     for (std::size_t i = 0; i < grid.size(); ++i) {
         const bool solid = grid[i] != 0u;
-        cf.ids[i] = solid ? std::uint16_t{1} : std::uint16_t{0};
+        g_colliderSnapshot[i] = solid ? std::uint8_t{1} : std::uint8_t{0};
         anySolid = anySolid || solid;
     }
-    cf.anchoredCount = anySolid ? 1 : 0;
-    cf.totalCount = cf.anchoredCount;
+    g_colliderSnapshotAnySolid = anySolid;
+    g_colliderDims = glm::ivec3(dim, dim, dim);
 
-    if (!anySolid) {
+    g_colliderJobReady.store(false, std::memory_order_relaxed);
+    g_colliderJobInFlight = true;
+    g_colliderThread = std::thread(&ColliderDecomposeJob);  // joined when ready (or on shutdown)
+}
+
+// MAIN THREAD: poll the in-flight worker; when it has published a result, join
+// it and apply via PhysX (main-thread only), then clear in-flight. Returns true
+// if a result was applied this call.
+static bool PollColliderJob(vox::physics::PhysicsWorld& physics) {
+    if (!g_colliderJobInFlight) return false;
+    if (!g_colliderJobReady.load(std::memory_order_acquire)) return false;
+
+    if (g_colliderThread.joinable()) g_colliderThread.join();
+    g_colliderJobInFlight = false;
+
+    if (g_colliderResult.empty())
         physics.ClearWorldCollider();
-        return;
-    }
+    else
+        physics.SetWorldCollider(g_colliderResult);
+    vox::log::Trace("physics: world collider rebuilt ({} boxes, async)", g_colliderResult.size());
+    return true;
+}
 
-    const std::vector<vox::destruction::Box> boxes =
-        vox::destruction::decomposeComponent(cf, glm::ivec3(dim, dim, dim), 1);
-
-    // Convert inclusive voxel AABBs -> world-unit ColliderBoxes ([mn .. mx+1]).
-    std::vector<vox::physics::ColliderBox> cboxes;
-    cboxes.reserve(boxes.size());
-    for (const auto& b : boxes) {
-        vox::physics::ColliderBox cb;
-        cb.minX = static_cast<float>(b.mn.x);
-        cb.minY = static_cast<float>(b.mn.y);
-        cb.minZ = static_cast<float>(b.mn.z);
-        cb.maxX = static_cast<float>(b.mx.x + 1);
-        cb.maxY = static_cast<float>(b.mx.y + 1);
-        cb.maxZ = static_cast<float>(b.mx.z + 1);
-        cboxes.push_back(cb);
-    }
-    physics.SetWorldCollider(cboxes);
-    vox::log::Trace("physics: world collider rebuilt ({} boxes)", cboxes.size());
+// Shutdown: join any in-flight worker so it doesn't outlive the static buffers.
+static void JoinColliderJob() {
+    if (g_colliderThread.joinable()) g_colliderThread.join();
+    g_colliderJobInFlight = false;
 }
 #endif  // VOX_HAVE_PHYSX
 
@@ -1480,10 +1544,15 @@ int main(int argc, char** argv) {
         keybindings.CheckHotReload();
         console.Drain();
         if (server.UnbindRequested() && server.IsRunning()) server.Stop();
-        // Debounced world-collider rebuild: run the (expensive) full rebuild only after
-        // carving has paused for a few frames, not synchronously on every carve.
-        if (g_colliderDirty && ++g_colliderQuietFrames > 10) {
-            RebuildWorldColliderNow(world, physics);
+        // Debounced + ASYNC world-collider rebuild: the expensive bake+decompose runs on
+        // a worker thread so it never stutters the main loop. Poll a finished worker first
+        // (apply its result via PhysX on this main thread), then -- once carving has paused
+        // a few frames AND no worker is in flight -- bake a snapshot and kick a new worker.
+        // Coalescing: while a worker is in flight we never launch a second one; the dirty
+        // flag simply stays set so we re-bake from the latest world once the current job lands.
+        PollColliderJob(physics);
+        if (g_colliderDirty && !g_colliderJobInFlight && ++g_colliderQuietFrames > 10) {
+            LaunchColliderJob(world);
             g_colliderDirty = false; g_colliderQuietFrames = 0;
         }
 
@@ -1602,6 +1671,9 @@ int main(int argc, char** argv) {
     }
 
     vox::log::Info("shutting down");
+#if defined(VOX_HAVE_PHYSX)
+    JoinColliderJob();   // wait out any in-flight async collider worker before tearing down
+#endif
     renderer.Shutdown();
     if (hasWindow) window.Destroy();
     scripts.Shutdown();
