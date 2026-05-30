@@ -167,8 +167,10 @@ public:
     // by force); otherwise a gentle outward+upward scatter. MUST be called
     // before world.CarveSphere so world.GetVoxel still returns the solids.
     void SpawnFromCarve(vox::voxel::VoxelWorld& world, vox::physics::PhysicsWorld& physics,
+                        vox::render::Renderer& renderer,
                         int hx, int hy, int hz, int radius, float force, bool radial) {
         if (maxLive_ <= 0 || radius <= 0) return;
+        const bool useObb = UseObb();
         const int G = static_cast<int>(vox::voxel::kWorldDim);
         const int x0 = std::max(0, hx - radius), y0 = std::max(0, hy - radius), z0 = std::max(0, hz - radius);
         const int x1 = std::min(G, hx + radius + 1), y1 = std::min(G, hy + radius + 1), z1 = std::min(G, hz + radius + 1);
@@ -271,6 +273,7 @@ public:
                                               vx, vy, vz, wx, wy, wz);
             if (id < 0) return;  // pool exhausted
             c.id = id;
+            if (useObb) RegisterDynObject(renderer, world, c);   // A3: draw as an OBB rigid body
             live_.push_back(std::move(c));
         }
     }
@@ -283,7 +286,8 @@ public:
     // drops it -- "nothing floats". MUST be called AFTER the island's voxels
     // have been cleared from `world` (StructuralSettle already did that), so
     // the per-frame re-stamp does not fight the now-empty terrain cells.
-    void SpawnIsland(vox::physics::PhysicsWorld& physics,
+    void SpawnIsland(vox::physics::PhysicsWorld& physics, vox::render::Renderer& renderer,
+                     const vox::voxel::VoxelWorld& world,
                      const std::vector<std::uint8_t>& mats, int dx, int dy, int dz,
                      int ox, int oy, int oz) {
         if (maxLive_ <= 0 || dx <= 0 || dy <= 0 || dz <= 0) return;
@@ -414,6 +418,11 @@ private:
         Aabb cur{};                                  // this frame's AABB
         vox::physics::BodyState pose{};              // this frame's transform
         std::vector<std::uint32_t> region;           // built in parallel
+        // Milestone A3 (renderer.debris_obb): when the OBB path is on, this chunk is a
+        // renderer dynamic VoxelObject (-1 = none / re-stamp path). On spawn we
+        // AddDynObject(its local grid); each frame SetDynObjectTransform from the body;
+        // on death RemoveDynObject. The re-stamp (EditVoxels) is skipped while this is set.
+        int dynHandle = -1;
     };
 
     std::uint8_t debrisMat_ = 0;
@@ -429,9 +438,29 @@ private:
         return d(rng_);
     }
 
+    // Milestone A3 gate: render debris as independent OBB VoxelObjects (smooth rigid
+    // rotation) instead of re-stamping them into the world grid. Read live so a runtime
+    // toggle takes effect; default OFF => the proven re-stamp path, byte-for-byte.
+    static bool UseObb() {
+        CVar* cv = Console::Get().FindCVar("renderer.debris_obb");
+        return cv && cv->GetBool();
+    }
+
     static std::size_t Idx(const Chunk& c, int lx, int ly, int lz) {
         return static_cast<std::size_t>(lz) * c.dx * c.dy
              + static_cast<std::size_t>(ly) * c.dx + static_cast<std::size_t>(lx);
+    }
+
+    // Milestone A3: register chunk `c` as a renderer dynamic VoxelObject. Widens the
+    // chunk's uint8 local mats grid (idx z*dx*dy + y*dx + x, 0 = empty) to uint32 and
+    // uploads it + the world palette (debris materials are world material indices) into
+    // a pooled slot. Sets c.dynHandle (-1 if the pool is full -> that chunk silently
+    // falls back to nothing rendered; physics still simulates it). Caller gates on UseObb().
+    void RegisterDynObject(vox::render::Renderer& renderer, const vox::voxel::VoxelWorld& world, Chunk& c) {
+        if (c.dx <= 0 || c.dy <= 0 || c.dz <= 0) return;
+        std::vector<std::uint32_t> grid(c.mats.size());
+        for (std::size_t i = 0; i < c.mats.size(); ++i) grid[i] = static_cast<std::uint32_t>(c.mats[i]);
+        c.dynHandle = renderer.AddDynObject(grid.data(), c.dx, c.dy, c.dz, world.Palette().data());
     }
 
     static bool FindState(const std::vector<vox::physics::BodyState>& v, int id,
@@ -601,7 +630,7 @@ int RunStructuralSettle(vox::console::Console& cc,
     debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
     debris.ReservePool(physics);
     for (const auto& isl : res.islands) {
-        debris.SpawnIsland(physics, isl.data, isl.dims.x, isl.dims.y, isl.dims.z,
+        debris.SpawnIsland(physics, renderer, world, isl.data, isl.dims.x, isl.dims.y, isl.dims.z,
                            isl.origin.x, isl.origin.y, isl.origin.z);
     }
 #endif
@@ -662,6 +691,7 @@ void RegisterCoreCvars() {
     reg("renderer.gi.denoise_phi_lum", "4.0", "Denoiser (ATROUS/SVGF): luminance edge-stop sigma (grain<->detail balance; SVGF scales it by sqrt(variance)).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.1f, .range_max = 32.0f, .range_step = 0.1f});
     reg("renderer.gbuffer.obb", "0", "EXPERIMENTAL (Milestone A1): draw the deferred G-buffer pass by OBB-rasterizing the world object + fragment DDA instead of the proven full-screen PSShade. OFF (default) = the verified A0 path; ON = the A1 path (under verification). Only affects QUALITY + a denoiser (ATROUS/SVGF).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("renderer.test_object", "0", "EXPERIMENTAL (Milestone A2): spawn a rotating test voxel cube near world center, drawn through the OBB-raster path + depth-composited with the world (proves multi-object rendering). Needs renderer.gbuffer.obb 1 + QUALITY + a denoiser (ATROUS/SVGF).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("renderer.debris_obb", "0", "EXPERIMENTAL (Milestone A3): render fracture debris as independent OBB voxel rigid bodies (smooth rotation) instead of re-stamping them into the world grid. Needs renderer.gbuffer.obb 1 + QUALITY + a denoiser. OFF (default) = the proven re-stamp path.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("renderer.empty_space_skip", "1", "Skip empty bricks in the voxel raymarch (faster; visually identical). Off = per-voxel DDA.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("renderer.gi.debug", "0", "QUALITY debug: show ONLY the indirect GI bounce (no direct/albedo) to confirm GI is contributing.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("physics.gpu_rigids.enabled", "1", "GPU rigid bodies (NVIDIA).", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
@@ -1112,7 +1142,7 @@ int main(int argc, char** argv) {
                 debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
                 debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
                 debris.ReservePool(physics);
-                debris.SpawnFromCarve(world, physics, hx, hy, hz, radius,
+                debris.SpawnFromCarve(world, physics, renderer, hx, hy, hz, radius,
                                       /*force=*/0.0f, /*radial=*/false);
 #endif
                 const int removed = world.CarveSphere(hx, hy, hz, radius);
@@ -1184,7 +1214,7 @@ int main(int argc, char** argv) {
                 debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
                 debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
                 debris.ReservePool(physics);
-                debris.SpawnFromCarve(world, physics, hx, hy, hz, radius, /*force=*/force, /*radial=*/true);
+                debris.SpawnFromCarve(world, physics, renderer, hx, hy, hz, radius, /*force=*/force, /*radial=*/true);
 #endif
                 const int removed = world.CarveSphere(hx, hy, hz, radius);
                 // Push ONLY the carved region to the GPU (incremental, same path

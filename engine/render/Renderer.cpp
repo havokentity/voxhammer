@@ -14,6 +14,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -1286,6 +1287,34 @@ struct Renderer::Impl {
     ComPtr<ID3D12DescriptorHeap>      dsvHeap;                   // single DSV
     ComPtr<ID3D12RootSignature>       obbRootSig;                // SHADE root sig + the b1 OBB CBV
     ComPtr<ID3D12PipelineState>       obbPso;                    // VSObb + PSObb, front-cull, depth+5 MRT
+    // Milestone A3 (Renderer::AddDynObject..., gated by game's renderer.debris_obb): a
+    // bounded pool of dynamic VoxelObjects (fracture debris) drawn through the SAME OBB
+    // path as the A2 test cube, but N of them in a loop and at live PhysX transforms.
+    // Each slot owns a CUBIC D^3 voxel grid buffer (D <= kMaxDynDim; non-cubic chunks
+    // are stored in the corner of a D^3 cube so PSObb's cubic DDA can march them), a
+    // 256-entry palette buffer, a persistently-mapped ObbObject (b1) CB, and a Camera
+    // (b0) CB whose gridDim = D + emptySkip = 0. All allocated lazily on first use of a
+    // slot (MakeUpload), reused across acquire/release so the pool stays bounded. The
+    // model/invModel in obbCB are rebuilt per frame from the body pose; the b0 Camera CB
+    // copies the world camera each frame (only gridDim differs). INERT until AddDynObject.
+    static constexpr int  kMaxDynObjects = 64;   // pool slot count (live-chunk render cap)
+    static constexpr UINT kMaxDynDim     = 32;   // per-axis voxel cap; bigger grids are clamped
+    struct DynObject {
+        bool                   used = false;     // slot allocated to a live object
+        UINT                   dim  = 0;         // cubic grid dimension D this slot is sized for
+        bool                   haveXform = false;// SetDynObjectTransform was called this lifetime
+        ComPtr<ID3D12Resource> voxelBuf;         // D^3 uint material grid (rebinds t0)
+        std::uint32_t*         voxelPtr = nullptr;
+        ComPtr<ID3D12Resource> paletteBuf;       // 256 RGBA8 palette (rebinds t2)
+        std::uint32_t*         palettePtr = nullptr;
+        ComPtr<ID3D12Resource> obbBuf;           // b1 ObbObject CB (model/invModel/dims/skyOnMiss=0)
+        std::uint8_t*          obbPtr = nullptr;
+        ComPtr<ID3D12Resource> camBuf;           // b0 Camera CB (gridDim=D, emptySkip=0)
+        std::uint8_t*          camPtr = nullptr;
+        float                  model[16] = {};   // object-local -> world (row-major)
+        float                  invModel[16] = {};// world -> object-local (row-major)
+    };
+    DynObject                         dynObjects[kMaxDynObjects];
     // GI temporal accumulation -- PING-PONG pair (swapped each frame): one set is
     // CURRENT (written this frame: u0 accum / u1 hitpos), the other is PREVIOUS
     // (read this frame for reprojection: u2 accum / u3 hitpos). accumPair selects
@@ -2405,6 +2434,23 @@ void Renderer::RenderFrame(const FrameParams& fp) {
                 std::memcpy(d.testObbPtr, &tb, sizeof(tb));
                 // The test object's 2nd Camera CB (b0) is uploaded LATER, once cb has its
                 // accumFrame/giHistMax/emptySkip/etc. populated -- see after d.camPtr write.
+
+                // --- A3: per-object ObbObject (b1) CB for every live DYNAMIC object ---
+                // Same worldClip + mul4 as the A2 cube, but the model matrix comes from the
+                // PhysX body pose (SetDynObjectTransform already stored model/invModel). The
+                // object's voxel grid is the CUBIC D^3 it was stored in, so dims = D on all
+                // axes and the OBB cube/AABB stay cubic to match PSObb's cubic DDA. Built only
+                // for used + transformed slots; consumed by the draw loop when gbuffer_obb is on.
+                for (int oi = 0; oi < Impl::kMaxDynObjects; ++oi) {
+                    Impl::DynObject& dob = d.dynObjects[oi];
+                    if (!dob.used || !dob.haveXform || dob.dim == 0) continue;
+                    ObbCB db{};
+                    mul4(worldClip, dob.model, db.mvp);                 // obbMVP = worldClip * model
+                    std::memcpy(db.invModel, dob.invModel, sizeof(db.invModel));
+                    db.dims[0] = db.dims[1] = db.dims[2] = static_cast<float>(dob.dim);
+                    db.skyOnMiss = 0;   // non-enclosing: DISCARD on a DDA miss so depth composites over the world
+                    std::memcpy(dob.obbPtr, &db, sizeof(db));
+                }
             }
         }
     }
@@ -2525,6 +2571,18 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         tc.gridDim   = static_cast<int>(Impl::kTestDim);
         tc.emptySkip = 0;
         std::memcpy(d.testCamPtr, &tc, sizeof(tc));
+    }
+
+    // A3: each live DYNAMIC object's Camera CB (b0) -- same full copy of the frame camera,
+    // gridDim = that object's cubic dimension D and empty-skip OFF (the slot has no brick
+    // grid). t0/t2 rebind to the slot's voxel grid + palette in the draw loop.
+    for (int oi = 0; oi < Impl::kMaxDynObjects; ++oi) {
+        Impl::DynObject& dob = d.dynObjects[oi];
+        if (!dob.used || !dob.haveXform || dob.dim == 0 || !dob.camPtr) continue;
+        CamCB dc = cb;
+        dc.gridDim   = static_cast<int>(dob.dim);
+        dc.emptySkip = 0;
+        std::memcpy(dob.camPtr, &dc, sizeof(dc));
     }
 
     // Ping-pong selection: this frame WRITES the "cur" Accum/HitPos (u0/u1) and
@@ -2692,6 +2750,35 @@ void Renderer::RenderFrame(const FrameParams& fp) {
                 d.list->SetGraphicsRootShaderResourceView(4, d.testPaletteBuf->GetGPUVirtualAddress());    // t2 test palette
                 d.list->SetGraphicsRootConstantBufferView(13, d.testObbBuf->GetGPUVirtualAddress());       // b1 rotating test ObbObject
                 d.list->DrawInstanced(36, 1, 0, 0);   // the test cube's 36-vertex OBB
+            }
+
+            // ---- A3: DYNAMIC objects (fracture debris), each depth-composited over the
+            //          world (and the A2 cube). Identical recipe to the A2 draw, looped over
+            //          the pool: rebind b0 (the slot's Camera CB, gridDim=D), t0 (its grid),
+            //          t2 (its palette), b1 (its ObbObject CB, skyOnMiss=0), with a UAV
+            //          barrier before each draw so the overlapping G-buffer UAV writes are
+            //          ordered. Reuses obbPso/obbRootSig/VSObb/PSObb verbatim. The world
+            //          bindings are re-established at the top of next frame's G-buffer pass.
+            //          Inert (zero iterations) unless the game called AddDynObject (the
+            //          renderer.debris_obb path); otherwise this is byte-for-byte the A1/A2 pass.
+            {
+                ID3D12Resource* uavs[4] = { d.accumBuf[curBuf].Get(), d.hitPosBuf[curBuf].Get(),
+                                            d.momentBuf[curBuf].Get(), d.directAccumBuf[curBuf].Get() };
+                D3D12_RESOURCE_BARRIER ubs[4]{};
+                for (int b = 0; b < 4; ++b) {
+                    ubs[b].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    ubs[b].UAV.pResource = uavs[b];
+                }
+                for (int oi = 0; oi < Impl::kMaxDynObjects; ++oi) {
+                    Impl::DynObject& dob = d.dynObjects[oi];
+                    if (!dob.used || !dob.haveXform || dob.dim == 0) continue;
+                    d.list->ResourceBarrier(4, ubs);   // order this object's UAV writes after the previous draw's
+                    d.list->SetGraphicsRootConstantBufferView(0, dob.camBuf->GetGPUVirtualAddress());     // b0 object camera (gridDim=D)
+                    d.list->SetGraphicsRootShaderResourceView(1, dob.voxelBuf->GetGPUVirtualAddress());   // t0 object grid
+                    d.list->SetGraphicsRootShaderResourceView(4, dob.paletteBuf->GetGPUVirtualAddress()); // t2 object palette
+                    d.list->SetGraphicsRootConstantBufferView(13, dob.obbBuf->GetGPUVirtualAddress());    // b1 object ObbObject
+                    d.list->DrawInstanced(36, 1, 0, 0);   // the object's 36-vertex OBB
+                }
             }
         } else {
             d.list->DrawInstanced(3, 1, 0, 0);    // A0: full-screen triangle (PSShade)
@@ -2946,6 +3033,144 @@ void Renderer::SetGiReproject(bool enabled) {
     // switch rather than blending the two regimes.
     d.accumFrame = 0;
     d.accHave    = false;
+}
+
+// ---- Milestone A3: dynamic-VoxelObject pool -------------------------------
+int Renderer::AddDynObject(const std::uint32_t* grid, int dx, int dy, int dz,
+                           const std::uint32_t* palette256) {
+    if (!impl_ || !grid || dx <= 0 || dy <= 0 || dz <= 0) return -1;
+    Impl& d = *impl_;
+    // Find a free slot.
+    int handle = -1;
+    for (int i = 0; i < Impl::kMaxDynObjects; ++i) {
+        if (!d.dynObjects[i].used) { handle = i; break; }
+    }
+    if (handle < 0) return -1;  // pool full
+    Impl::DynObject& o = d.dynObjects[handle];
+
+    // The shared PSObb DDA is CUBIC (single scalar gridDim, bounds [0,gridDim]^3), so a
+    // non-cubic chunk is stored in the corner of a cubic D^3 grid (D = max axis, clamped
+    // to kMaxDynDim). Voxels beyond the cap are dropped (the chunk is clamped, not failed).
+    const UINT D = std::min<UINT>(Impl::kMaxDynDim,
+                                  std::max({static_cast<UINT>(dx), static_cast<UINT>(dy), static_cast<UINT>(dz)}));
+
+    // (Re)allocate the slot's GPU buffers only when the cubic dimension changes (slot
+    // reuse across acquire/release keeps the pool bounded; same-size reuse skips realloc).
+    if (o.dim != D || !o.voxelBuf) {
+        D3D12_RANGE none{0, 0};
+        o.voxelBuf = d.MakeUpload(static_cast<UINT64>(D) * D * D * sizeof(std::uint32_t));
+        if (!o.voxelBuf) return -1;
+        o.voxelBuf->Map(0, &none, reinterpret_cast<void**>(&o.voxelPtr));
+        if (!o.paletteBuf) {
+            o.paletteBuf = d.MakeUpload(256 * sizeof(std::uint32_t));
+            if (!o.paletteBuf) return -1;
+            o.paletteBuf->Map(0, &none, reinterpret_cast<void**>(&o.palettePtr));
+        }
+        if (!o.obbBuf) {
+            o.obbBuf = d.MakeUpload(256);
+            if (!o.obbBuf) return -1;
+            o.obbBuf->Map(0, &none, reinterpret_cast<void**>(&o.obbPtr));
+        }
+        if (!o.camBuf) {
+            o.camBuf = d.MakeUpload(256);
+            if (!o.camBuf) return -1;
+            o.camBuf->Map(0, &none, reinterpret_cast<void**>(&o.camPtr));
+        }
+        o.dim = D;
+    }
+
+    // Copy the chunk's voxels into the corner of the cubic grid (clamped to D), zeroing
+    // the rest. Source index z*dx*dy + y*dx + x; dest index z*D*D + y*D + x (matches the
+    // shader's cell.z*gridDim*gridDim + cell.y*gridDim + cell.x with gridDim==D).
+    std::memset(o.voxelPtr, 0, static_cast<std::size_t>(D) * D * D * sizeof(std::uint32_t));
+    const UINT cx = std::min<UINT>(D, static_cast<UINT>(dx));
+    const UINT cy = std::min<UINT>(D, static_cast<UINT>(dy));
+    const UINT cz = std::min<UINT>(D, static_cast<UINT>(dz));
+    for (UINT z = 0; z < cz; ++z)
+        for (UINT y = 0; y < cy; ++y) {
+            const std::size_t srcRow = (static_cast<std::size_t>(z) * dy + y) * dx;
+            const std::size_t dstRow = (static_cast<std::size_t>(z) * D + y) * D;
+            for (UINT x = 0; x < cx; ++x) o.voxelPtr[dstRow + x] = grid[srcRow + x];
+        }
+
+    // Palette: copy the object's 256 RGBA8 entries (fall back to all-zero = nothing draws).
+    if (palette256) std::memcpy(o.palettePtr, palette256, 256 * sizeof(std::uint32_t));
+    else            std::memset(o.palettePtr, 0, 256 * sizeof(std::uint32_t));
+
+    // Identity transform until SetDynObjectTransform is called (haveXform gates the draw).
+    for (int i = 0; i < 16; ++i) o.model[i] = o.invModel[i] = 0.0f;
+    o.model[0] = o.model[5] = o.model[10] = o.model[15] = 1.0f;
+    o.invModel[0] = o.invModel[5] = o.invModel[10] = o.invModel[15] = 1.0f;
+    o.haveXform = false;
+    o.used = true;
+    return handle;
+}
+
+void Renderer::SetDynObjectTransform(int handle, const float pos[3], const float quat[4],
+                                     const float localCenter[3]) {
+    if (!impl_ || handle < 0 || handle >= Impl::kMaxDynObjects || !pos || !quat || !localCenter) return;
+    Impl& d = *impl_;
+    Impl::DynObject& o = d.dynObjects[handle];
+    if (!o.used) return;
+
+    // Rotation matrix R (row-major 3x3) from the quaternion (x,y,z,w). Same algebra as
+    // DebrisField::QuatRotate (q*v*conj(q)) so debris render exactly where the re-stamp
+    // inverse-sample would have placed them.
+    const float qx = quat[0], qy = quat[1], qz = quat[2], qw = quat[3];
+    const float xx = qx * qx, yy = qy * qy, zz = qz * qz;
+    const float xy = qx * qy, xz = qx * qz, yz = qy * qz;
+    const float wx = qw * qx, wy = qw * qy, wz = qw * qz;
+    const float R[9] = {
+        1.0f - 2.0f * (yy + zz), 2.0f * (xy - wz),       2.0f * (xz + wy),
+        2.0f * (xy + wz),        1.0f - 2.0f * (xx + zz), 2.0f * (yz - wx),
+        2.0f * (xz - wy),        2.0f * (yz + wx),        1.0f - 2.0f * (xx + yy),
+    };
+    const float* C = localCenter;  // object-local center of mass (= chunk geometric center)
+    // model: object-local -> world. model*p = R*(p - C) + pos  =>  linear = R, translation = pos - R*C.
+    const float RC[3] = {
+        R[0] * C[0] + R[1] * C[1] + R[2] * C[2],
+        R[3] * C[0] + R[4] * C[1] + R[5] * C[2],
+        R[6] * C[0] + R[7] * C[1] + R[8] * C[2],
+    };
+    const float M[16] = {
+        R[0], R[1], R[2], pos[0] - RC[0],
+        R[3], R[4], R[5], pos[1] - RC[1],
+        R[6], R[7], R[8], pos[2] - RC[2],
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    // invModel: world -> object-local. R is orthonormal so R^-1 = R^T; invM*p' = R^T*(p' - pos) + C.
+    // translation = C - R^T*pos.
+    const float RTp[3] = {
+        R[0] * pos[0] + R[3] * pos[1] + R[6] * pos[2],   // (R^T row 0) . pos
+        R[1] * pos[0] + R[4] * pos[1] + R[7] * pos[2],
+        R[2] * pos[0] + R[5] * pos[1] + R[8] * pos[2],
+    };
+    const float invM[16] = {
+        R[0], R[3], R[6], C[0] - RTp[0],
+        R[1], R[4], R[7], C[1] - RTp[1],
+        R[2], R[5], R[8], C[2] - RTp[2],
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    std::memcpy(o.model,    M,    sizeof(M));
+    std::memcpy(o.invModel, invM, sizeof(invM));
+    o.haveXform = true;
+}
+
+void Renderer::RemoveDynObject(int handle) {
+    if (!impl_ || handle < 0 || handle >= Impl::kMaxDynObjects) return;
+    Impl::DynObject& o = impl_->dynObjects[handle];
+    // Keep the GPU buffers + their persistent maps for reuse (bounded pool); just free
+    // the slot so the next AddDynObject can take it.
+    o.used = false;
+    o.haveXform = false;
+}
+
+void Renderer::ClearDynObjects() {
+    if (!impl_) return;
+    for (int i = 0; i < Impl::kMaxDynObjects; ++i) {
+        impl_->dynObjects[i].used = false;
+        impl_->dynObjects[i].haveXform = false;
+    }
 }
 
 bool Renderer::CaptureScreenshot(const std::string& path, bool png) {

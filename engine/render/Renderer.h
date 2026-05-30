@@ -139,6 +139,37 @@ public:
     void EditVoxels(int x0, int y0, int z0, int x1, int y1, int z1,
                     const std::uint32_t* region, const std::uint32_t* palette256);
 
+    // ---- Milestone A3: dynamic-VoxelObject pool (EXPERIMENTAL, default OFF) ----
+    // A small bounded pool of independent OBB VoxelObjects drawn through the SAME
+    // A1/A2 OBB-raster path (obbPso/obbRootSig/PSObb). Fracture debris route through
+    // this so each live chunk renders as a true rigid body (rotates smoothly) at its
+    // PhysX transform, instead of being re-stamped into the world grid. ONLY draws in
+    // the deferred OBB G-buffer pass (FrameParams::gbuffer_obb + QUALITY + a denoiser),
+    // exactly like the A2 test cube. With no AddDynObject calls the pool is inert.
+
+    // Upload an object's LOCAL voxel grid (captured once; chunks don't change shape
+    // after capture) + its 256-entry RGBA8 palette into a pooled GPU slot. |grid| is a
+    // flat dx*dy*dz uint32 material array indexed z*dx*dy + y*dx + x (0 = empty). The
+    // slot stores it in a CUBIC D^3 grid (D = max(dx,dy,dz)) so the shared cubic-DDA
+    // PSObb can march it; objects larger than kMaxDynDim per axis are CLAMPED (the
+    // overflow is dropped). Returns a handle (>=0) or -1 if the pool is full / invalid.
+    // The transform starts at identity; call SetDynObjectTransform before the first draw.
+    int  AddDynObject(const std::uint32_t* grid, int dx, int dy, int dz,
+                      const std::uint32_t* palette256);
+
+    // Update slot |handle|'s model/invModel from a PhysX body pose. |pos| is the body's
+    // center of mass in world units; |quat| is its orientation (x,y,z,w). |localCenter|
+    // is the object's local-space center of mass (the chunk's geometric center, so the
+    // grid lands exactly where the re-stamp would). No-op on a bad/free handle.
+    void SetDynObjectTransform(int handle, const float pos[3], const float quat[4],
+                               const float localCenter[3]);
+
+    // Free slot |handle| (call on chunk death). No-op on a bad/free handle.
+    void RemoveDynObject(int handle);
+
+    // Free every dynamic-object slot (e.g. on world clear). The pool returns to inert.
+    void ClearDynObjects();
+
     // Capture the current backbuffer and save it to |path|.
     // png=true -> PNG (stb_image_write); png=false -> BMP.
     // Returns false if DX12 is not initialised or the write fails.
