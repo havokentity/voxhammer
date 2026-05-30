@@ -693,10 +693,12 @@ struct ShadeOut {
 // return the five G-buffer MRT values. NO tonemap/dither here -- that is the composite
 // (deferred-lighting) pass's job. Identical math whether invoked by the full-screen
 // PSShade (A0) or the OBB-raster PSObb (A1), so the deferred output stays pixel-identical.
-ShadeOut shadeGBuffer(float3 ro, float3 rd, float2 screenPos) {
+ShadeOut shadeGBuffer(float3 ro, float3 rd, float2 screenPos, out float3 outHitLocal) {
     ShadeOut o;
     float3 hp, nrm; uint mat;
     bool primHit = traceVoxel(ro, rd, 768, hp, nrm, mat);
+    outHitLocal = hp;   // the primary-hit position in the SAME space the ray was given (object-local
+                        // for an OBB draw); used by PSObb to write per-voxel SV_Depth for compositing.
 
     float3 alb, direct, indirect;
     if (primHit) {
@@ -801,7 +803,8 @@ ShadeOut PSShade(VSOut i) {
     float tf = tan(fov * 0.5);
     float3 rd = normalize(camFwd + camRight * (ndc.x * tf * aspect) + camUp * (ndc.y * tf));
     float3 ro = camPos;
-    return shadeGBuffer(ro, rd, i.pos.xy);
+    float3 hitLocal;   // unused here (A0 full-screen has no depth buffer)
+    return shadeGBuffer(ro, rd, i.pos.xy, hitLocal);
 }
 )HLSL"
 // Adjacent raw-string literal #5 (C++ concatenates all chunks at compile time). Holds the
@@ -855,7 +858,21 @@ ObbVSOut VSObb(uint vid : SV_VertexID) {
 // the shared G-buffer shading core. On a DDA miss: the enclosing world object writes the
 // background sky (obbSkyOnMiss=1, pixel-identical to A0); a non-enclosing object discards
 // (obbSkyOnMiss=0) so the depth buffer reveals whatever is behind it (A2+).
-ShadeOut PSObb(ObbVSOut i) {
+// PSObb output = the 5 G-buffer MRT targets PLUS an explicit SV_Depth so the hardware
+// depth buffer records the PER-VOXEL hit depth (not the cube's far face). This is what
+// lets MULTIPLE objects depth-composite correctly: object #0's solid voxels write their
+// true depth, and a second object (A2) is occluded by / occludes them per-voxel. (For the
+// single A1 world object the depth value never affects the COLOR output -- nothing reads
+// it back and only one object draws -- so A1 stays pixel-identical to A0.)
+struct ObbPSOut {
+    float4 indirect : SV_Target0;
+    float4 direct   : SV_Target1;
+    float4 albedo   : SV_Target2;
+    float4 gbuffer  : SV_Target3;
+    float4 variance : SV_Target4;
+    float  depth    : SV_Depth;
+};
+ObbPSOut PSObb(ObbVSOut i) {
     float2 ndc = (i.pos.xy / viewport) * 2.0 - 1.0;
     ndc.y = -ndc.y;
     float tf = tan(fov * 0.5);
@@ -873,9 +890,28 @@ ShadeOut PSObb(ObbVSOut i) {
     // the full-screen A0 path. A non-enclosing object (obbSkyOnMiss=0, A2+) discards on a
     // miss so the depth buffer reveals what is behind it; shadeGBuffer flags a miss by
     // leaving gbuffer.w at the 1e6 far-sentinel and nrm at zero.
-    ShadeOut o = shadeGBuffer(roL, rdL, i.pos.xy);
-    [branch] if (obbSkyOnMiss == 0 && o.gbuffer.w >= 1e6) discard;
-    return o;
+    float3 hitLocal;
+    ShadeOut o = shadeGBuffer(roL, rdL, i.pos.xy, hitLocal);
+    bool miss = (o.gbuffer.w >= 1e6);
+    [branch] if (obbSkyOnMiss == 0 && miss) discard;
+
+    ObbPSOut po;
+    po.indirect = o.indirect;
+    po.direct   = o.direct;
+    po.albedo   = o.albedo;
+    po.gbuffer  = o.gbuffer;
+    po.variance = o.variance;
+    // PER-VOXEL depth: project the LOCAL hit position through obbMVP (= worldClip * model),
+    // which lands it in the SAME clip space VSObb used, then NDC-z = clip.z/clip.w. On a
+    // miss (sky, world object only) keep the rasterized far-face depth so sky stays at the
+    // back and a nearer object still composites in front of it.
+    [branch] if (miss) {
+        po.depth = i.pos.z;
+    } else {
+        float4 clip = mul(obbMVP, float4(hitLocal, 1.0));
+        po.depth = saturate(clip.z / max(clip.w, 1e-6));   // [0,1] hardware depth (LESS test)
+    }
+    return po;
 }
 )HLSL";
 
@@ -1149,6 +1185,26 @@ std::vector<std::uint32_t> GenerateScene(UINT g) {
     return v;
 }
 
+// Milestone A2: a small procedural TEST voxel cube (g^3, intended g=16). A fully
+// SOLID cube split into colored regions (material indices 1..4) so its arbitrary
+// rotation reads unmistakably: each axis-octant gets a distinct face/quadrant color,
+// proving multi-object + arbitrary transforms via the shared OBB-raster path. Indexed
+// z*g*g + y*g + x to match the shader's cell.z*gridDim*gridDim + cell.y*gridDim + cell.x.
+std::vector<std::uint32_t> GenerateTestCube(UINT g) {
+    std::vector<std::uint32_t> v(static_cast<size_t>(g) * g * g, 0);
+    const UINT half = g / 2;
+    for (UINT z = 0; z < g; ++z)
+        for (UINT y = 0; y < g; ++y)
+            for (UINT x = 0; x < g; ++x) {
+                // Solid cube; color by octant so rotation is obvious (1..4 cycle).
+                std::uint32_t m = 1u + (((x >= half) ? 1u : 0u) +
+                                        ((y >= half) ? 2u : 0u) +
+                                        ((z >= half) ? 1u : 0u)) % 4u;
+                v[size_t(z) * g * g + size_t(y) * g + x] = m;
+            }
+    return v;
+}
+
 // Build the coarse brick-occupancy grid from a dense flat voxel grid.
 // Each brick cell is 1 iff ANY voxel inside the BRICK_DIM^3 brick is nonzero,
 // so the structure is conservative (an empty brick is provably solid-free).
@@ -1213,6 +1269,19 @@ struct Renderer::Impl {
     // depth buffer + DSV. obbBuf is a persistently-mapped 256-byte CBV updated each frame.
     ComPtr<ID3D12Resource>            obbBuf;
     std::uint8_t*                     obbPtr = nullptr;          // persistent map into obbBuf
+    // Milestone A2 (FrameParams::test_object, default OFF): a SECOND VoxelObject -- a small
+    // procedural test cube drawn through the SAME A1 OBB-raster path at a Y-rotating transform,
+    // depth-composited against the world object. Its own little grid + palette + a second
+    // ObbObject (b1) CB + a second Camera (b0) CB (so the DDA's gridDim is the test-cube size
+    // and empty-skip is off). All persistently mapped; the test camera CB is rebuilt each frame
+    // to mirror the live camera. INERT unless test_object != 0 AND the deferred OBB path is on.
+    static constexpr UINT             kTestDim = 16;             // test cube voxel dimensions (16^3)
+    ComPtr<ID3D12Resource>            testVoxelBuf;              // 16^3 uint material grid (rebinds t0 for the test draw)
+    ComPtr<ID3D12Resource>            testPaletteBuf;            // test-cube RGBA8 palette (rebinds t2 for the test draw)
+    ComPtr<ID3D12Resource>            testObbBuf;                // 2nd ObbObject CB (b1): rotating model/invModel/dims/skyOnMiss=0
+    std::uint8_t*                     testObbPtr = nullptr;      // persistent map into testObbBuf
+    ComPtr<ID3D12Resource>            testCamBuf;                // 2nd Camera CB (b0): same view, gridDim=kTestDim, emptySkip=0
+    std::uint8_t*                     testCamPtr = nullptr;      // persistent map into testCamBuf
     ComPtr<ID3D12Resource>            depthTex;                  // full-res D32 depth for the OBB pass
     ComPtr<ID3D12DescriptorHeap>      dsvHeap;                   // single DSV
     ComPtr<ID3D12RootSignature>       obbRootSig;                // SHADE root sig + the b1 OBB CBV
@@ -1906,6 +1975,49 @@ bool Renderer::Init(void* hwndPtr, int width, int height, const std::vector<std:
     if (!d.obbBuf) return false;
     d.obbBuf->Map(0, &none, reinterpret_cast<void**>(&d.obbPtr));
 
+    // --- A2 TEST OBJECT: a small procedural voxel cube + its own palette + a 2nd
+    // ObbObject (b1) CB + a 2nd Camera (b0) CB. All built up front and INERT until
+    // FrameParams::test_object is set (and the deferred OBB path is active). The test
+    // voxel/palette buffers REBIND t0/t2 for the test draw; the 2nd camera CB carries
+    // gridDim = kTestDim and emptySkip = 0 so the shared DDA marches the 16^3 test grid
+    // (and never touches the world's brick-occupancy buffer left bound on t3). ---
+    {
+        std::vector<std::uint32_t> cube = GenerateTestCube(Impl::kTestDim);
+        d.testVoxelBuf = d.MakeUpload(cube.size() * sizeof(std::uint32_t));
+        if (!d.testVoxelBuf) return false;
+        void* tp = nullptr;
+        d.testVoxelBuf->Map(0, &none, &tp);
+        std::memcpy(tp, cube.data(), cube.size() * sizeof(std::uint32_t));
+        d.testVoxelBuf->Unmap(0, nullptr);  // static grid: no live edits needed
+
+        // Test-cube palette (256 RGBA8, linear-encoded like the world palette). Indices
+        // 1..4 are vivid primaries so the rotating cube's octants are clearly distinct.
+        auto packL = [](float r, float g, float b) -> std::uint32_t {
+            auto enc = [](float c) -> std::uint32_t {
+                float s = std::pow(std::max(0.0f, std::min(1.0f, c)), 1.0f / 2.2f);
+                return static_cast<std::uint32_t>(s * 255.0f + 0.5f) & 255u;
+            };
+            return enc(r) | (enc(g) << 8) | (enc(b) << 16);  // alpha 0 = non-emissive
+        };
+        std::uint32_t tpal[256] = {};
+        tpal[1] = packL(0.90f, 0.18f, 0.16f);  // red
+        tpal[2] = packL(0.16f, 0.75f, 0.25f);  // green
+        tpal[3] = packL(0.18f, 0.42f, 0.95f);  // blue
+        tpal[4] = packL(0.95f, 0.82f, 0.16f);  // yellow
+        d.testPaletteBuf = d.MakeUpload(256 * sizeof(std::uint32_t));
+        if (!d.testPaletteBuf) return false;
+        void* pp = nullptr;
+        d.testPaletteBuf->Map(0, &none, &pp);
+        std::memcpy(pp, tpal, sizeof(tpal));
+        d.testPaletteBuf->Unmap(0, nullptr);
+    }
+    d.testObbBuf = d.MakeUpload(256);
+    if (!d.testObbBuf) return false;
+    d.testObbBuf->Map(0, &none, reinterpret_cast<void**>(&d.testObbPtr));
+    d.testCamBuf = d.MakeUpload(256);
+    if (!d.testCamBuf) return false;
+    d.testCamBuf->Map(0, &none, reinterpret_cast<void**>(&d.testCamPtr));
+
     // --- GI temporal buffers: PING-PONG accumulation + hit-position (default-heap
     // UAVs, float4 per pixel each). Two of each so we can read the previous frame's
     // Accum/HitPos (for temporal reprojection) while writing the current frame's. ---
@@ -2236,6 +2348,64 @@ void Renderer::RenderFrame(const FrameParams& fp) {
             ob.dims[0] = ob.dims[1] = ob.dims[2] = static_cast<float>(kGrid);
             ob.skyOnMiss = 1;   // enclosing world object: a DDA miss writes the sky (pixel-identical to A0)
             std::memcpy(d.obbPtr, &ob, sizeof(ob));
+
+            // --- A2: SECOND object (rotating test cube) per-OBB constants ---------------
+            // Same world->clip rows as the world object (so the cube projects to exactly the
+            // screen positions PSObb reconstructs rays for + a real perspective-depth row),
+            // but with a NON-identity model: rotate about +Y by time_sec around the cube's
+            // own center, then place it in the world. The hardware depth buffer (written via
+            // obbMVP*localCube) composites it against the world object (skyOnMiss=0 => DISCARD
+            // on a DDA miss, so only the cube's solid voxels draw). Built every frame so the
+            // rotation animates; uploaded into testObbBuf. Consumed only when test_object is on.
+            {
+                const float worldClip[16] = {
+                    right[0] * invX, right[1] * invX, right[2] * invX, -dotR * invX,    // clip.x
+                    up[0]    * invY, up[1]    * invY, up[2]    * invY, -dotU * invY,    // clip.y
+                    A * fwd[0],      A * fwd[1],      A * fwd[2],       A * (-dotF) + B, // clip.z (perspective depth)
+                    fwd[0],          fwd[1],          fwd[2],          -dotF,           // clip.w (== zv)
+                };
+                const float td = static_cast<float>(Impl::kTestDim);   // cube spans local [0,td]^3
+                const float c  = td * 0.5f;                            // cube center (local)
+                const float th = fp.time_sec;                          // Y-rotation angle (rad)
+                const float ct = std::cos(th), st = std::sin(th);
+                // Place the cube center near the world center, floating clearly above terrain.
+                const float Px = static_cast<float>(kGrid) * 0.5f;
+                const float Py = static_cast<float>(kGrid) * 0.40f;
+                const float Pz = static_cast<float>(kGrid) * 0.5f;
+                // model M (row-major): linear = R_y(th); translation column = P - R_y*c.
+                //   M*p = R_y*(p - c) + P  (rotate about the cube's own center, then place)
+                const float M[16] = {
+                    ct,   0.0f, st,   Px - (ct * c + st * c),
+                    0.0f, 1.0f, 0.0f, Py - c,
+                   -st,   0.0f, ct,   Pz - (-st * c + ct * c),
+                    0.0f, 0.0f, 0.0f, 1.0f,
+                };
+                // invModel = M^-1 (row-major): R_y orthonormal => linear = R_y^T = R_y(-th);
+                //   translation column = c - R_y^T*P.  invM*p' = R_y^T*(p' - P) + c
+                const float invM[16] = {
+                    ct,   0.0f, -st,  c - ( ct * Px - st * Pz),
+                    0.0f, 1.0f, 0.0f, c - Py,
+                    st,   0.0f, ct,   c - ( st * Px + ct * Pz),
+                    0.0f, 0.0f, 0.0f, 1.0f,
+                };
+                // obbMVP = worldClip * M (row-major 4x4 multiply).
+                auto mul4 = [](const float a[16], const float b[16], float o[16]) {
+                    for (int r = 0; r < 4; ++r)
+                        for (int col = 0; col < 4; ++col)
+                            o[r * 4 + col] = a[r * 4 + 0] * b[0 * 4 + col] +
+                                             a[r * 4 + 1] * b[1 * 4 + col] +
+                                             a[r * 4 + 2] * b[2 * 4 + col] +
+                                             a[r * 4 + 3] * b[3 * 4 + col];
+                };
+                ObbCB tb{};
+                mul4(worldClip, M, tb.mvp);
+                std::memcpy(tb.invModel, invM, sizeof(invM));
+                tb.dims[0] = tb.dims[1] = tb.dims[2] = td;
+                tb.skyOnMiss = 0;   // non-enclosing: DISCARD on a DDA miss so depth composites it over the world
+                std::memcpy(d.testObbPtr, &tb, sizeof(tb));
+                // The test object's 2nd Camera CB (b0) is uploaded LATER, once cb has its
+                // accumFrame/giHistMax/emptySkip/etc. populated -- see after d.camPtr write.
+            }
         }
     }
 
@@ -2344,6 +2514,18 @@ void Renderer::RenderFrame(const FrameParams& fp) {
     cb.emptySkip  = d.emptySkip ? 1 : 0;
     cb.brickDim   = static_cast<int>(kBrickDim);
     std::memcpy(d.camPtr, &cb, sizeof(cb));
+
+    // A2 test object's 2nd Camera CB (b0): a full copy of the now-complete frame camera,
+    // but with gridDim = the test-cube size and empty-skip OFF, so the SHARED voxel DDA
+    // marches the rebound 16^3 test grid (t0/t2 rebound to the test buffers for the test
+    // draw) and never reads the world's brick-occupancy buffer (left bound on t3). All
+    // other fields (camera basis, lighting, accumFrame, prevVP, ...) match the world draw.
+    {
+        CamCB tc = cb;
+        tc.gridDim   = static_cast<int>(Impl::kTestDim);
+        tc.emptySkip = 0;
+        std::memcpy(d.testCamPtr, &tc, sizeof(tc));
+    }
 
     // Ping-pong selection: this frame WRITES the "cur" Accum/HitPos (u0/u1) and
     // READS last frame's "prev" Accum/HitPos (u2/u3). accumPair flips at the end so
@@ -2481,6 +2663,36 @@ void Renderer::RenderFrame(const FrameParams& fp) {
         if (fp.gbuffer_obb) {
             d.list->SetGraphicsRootConstantBufferView(13, d.obbBuf->GetGPUVirtualAddress());          // b1 ObbObject (model/invModel/dims/skyOnMiss)
             d.list->DrawInstanced(36, 1, 0, 0);   // A1: 36 verts = the unit cube (generated in VSObb)
+
+            // ---- A2: SECOND object (rotating test cube), depth-composited over the world ----
+            // Only when test_object is set (and we are in the deferred OBB path, the enclosing
+            // branch). Reuse obbPso/obbRootSig/VSObb/PSObb verbatim; the DSV is NOT cleared, so
+            // the cube's far-face depth test (LESS) composites it against the world object's
+            // depth -- it correctly occludes / is occluded by world geometry. Rebind only what
+            // differs from the world draw: b0 -> the test camera CB (gridDim=16, empty-skip off),
+            // t0 -> the test voxel grid, t2 -> the test palette, b1 -> the rotating test ObbObject
+            // CB (skyOnMiss=0 => DISCARD on a DDA miss so only the cube's solid voxels draw).
+            // The world bindings are re-established at the top of the next frame's G-buffer pass.
+            if (fp.test_object) {
+                // Order the test draw's G-buffer UAV writes (u0..u7) after the world draw's so
+                // overlapping pixels don't race. (On occluded pixels the cube's shader may still
+                // run and write history before failing the MRT depth test -- an accepted transient
+                // temporal artifact on this moving proof object; the composited image is correct
+                // via the hardware depth buffer.)
+                ID3D12Resource* uavs[4] = { d.accumBuf[curBuf].Get(), d.hitPosBuf[curBuf].Get(),
+                                            d.momentBuf[curBuf].Get(), d.directAccumBuf[curBuf].Get() };
+                D3D12_RESOURCE_BARRIER ubs[4]{};
+                for (int b = 0; b < 4; ++b) {
+                    ubs[b].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    ubs[b].UAV.pResource = uavs[b];
+                }
+                d.list->ResourceBarrier(4, ubs);   // accum/hitpos/moment/direct (the 4 G-buffer UAV buffers)
+                d.list->SetGraphicsRootConstantBufferView(0, d.testCamBuf->GetGPUVirtualAddress());        // b0 test camera (gridDim=16)
+                d.list->SetGraphicsRootShaderResourceView(1, d.testVoxelBuf->GetGPUVirtualAddress());      // t0 test grid
+                d.list->SetGraphicsRootShaderResourceView(4, d.testPaletteBuf->GetGPUVirtualAddress());    // t2 test palette
+                d.list->SetGraphicsRootConstantBufferView(13, d.testObbBuf->GetGPUVirtualAddress());       // b1 rotating test ObbObject
+                d.list->DrawInstanced(36, 1, 0, 0);   // the test cube's 36-vertex OBB
+            }
         } else {
             d.list->DrawInstanced(3, 1, 0, 0);    // A0: full-screen triangle (PSShade)
         }

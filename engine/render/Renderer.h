@@ -56,6 +56,12 @@ struct FrameParams {
     // object's OBB-raster + fragment DDA instead of the proven full-screen PSShade. Gated so a
     // saved denoiser (ATROUS/SVGF) keeps routing through the verified A0 path until A1 is signed off.
     int   gbuffer_obb          = 0;      // 0 = full-screen PSShade (A0, default) / 1 = OBB raster (A1)
+    // EXPERIMENTAL (Milestone A2, default OFF): draw a SECOND VoxelObject -- a small
+    // procedural test cube at a Y-rotating transform -- through the SAME A1 OBB-raster path,
+    // depth-composited against the world object. Proves multi-object + arbitrary transforms.
+    // INERT unless test_object != 0 AND the deferred OBB path is active (gbuffer_obb on,
+    // QUALITY lighting + a GI denoiser); otherwise nothing changes vs A1.
+    int   test_object          = 0;      // 0 = world object only (A1, default) / 1 = + rotating test cube (A2)
 };
 
 // DX12 presenter. M0+ slice: device + flip-discard swapchain + a full-screen
