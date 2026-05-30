@@ -482,7 +482,7 @@ function renderRail() {
     rail.appendChild(el("div", "rail-sep"));
     const cons = el("button", "cat ghost");
     cons.innerHTML = `<span class="cat-icon">❯</span><span>Console</span>`;
-    cons.onclick = () => { if (document.body.dataset.layout === "narrow") setView("tools"); $("#console-input").focus(); };
+    cons.onclick = openConsole;
     rail.appendChild(cons);
 }
 
@@ -990,13 +990,25 @@ function updateViewport() {
 
 // ---------- log ----------
 function pushLog(level, msg, cls) {
-    const log = $("#log"); const near = log.scrollTop + log.clientHeight > log.scrollHeight - 30;
-    const ln = el("div", "ln " + (cls || level)); ln.innerHTML = `<span class="t">${new Date().toLocaleTimeString("en-GB")}</span><span class="m"></span>`;
-    $(".m", ln).textContent = msg; ln.dataset.lvl = level; log.appendChild(ln); applyLogFilter(ln);
-    if (near) log.scrollTop = log.scrollHeight;
-    while (log.children.length > 500) log.removeChild(log.firstChild);
+    // Mirror every line into BOTH the intel log and the console-overlay log.
+    for (const log of [$("#log"), document.getElementById("console-log")]) {
+        if (!log) continue;
+        const near = log.scrollTop + log.clientHeight > log.scrollHeight - 30;
+        const ln = el("div", "ln " + (cls || level)); ln.innerHTML = `<span class="t">${new Date().toLocaleTimeString("en-GB")}</span><span class="m"></span>`;
+        $(".m", ln).textContent = msg; ln.dataset.lvl = level; log.appendChild(ln); applyLogFilter(ln);
+        if (near) log.scrollTop = log.scrollHeight;
+        while (log.children.length > 500) log.removeChild(log.firstChild);
+    }
 }
 function applyLogFilter(ln) { const lvl = ln.dataset.lvl; if (lvl in state.logFilters) ln.style.display = state.logFilters[lvl] ? "" : "none"; }
+// Console overlay (unified REPL) open/close.
+function openConsole() {
+    const o = $("#console-overlay"); if (!o) return;
+    o.hidden = false;
+    const cl = $("#console-log"); if (cl) cl.scrollTop = cl.scrollHeight;
+    const ci = $("#console-modal-input"); if (ci) ci.focus();
+}
+function closeConsole() { const o = $("#console-overlay"); if (o) o.hidden = true; }
 function wireLogFilters() {
     for (const chip of document.querySelectorAll(".chip[data-lvl]")) {
         chip.classList.toggle("on", state.logFilters[chip.dataset.lvl]);
@@ -1333,33 +1345,38 @@ function init() {
     }
     $("#search").oninput = (e) => { state.search = e.target.value; renderDeck(); };
     $("#reset-group").onclick = () => { for (const cv of visibleCvars()) if (!(cv.flags & F.READONLY)) setCvar(cv.name, cv.default); renderDeck(); };
-    // Command input: submit runs the line + records history; Up/Down cycle history.
+    // Command inputs (bottom strip + console overlay) share persisted history.
     state.cmdHistory = state.cmdHistory || JSON.parse(ls("vox.cmdhist", "[]"));
-    let cmdHistIdx = state.cmdHistory.length;
-    const cmdIn = $("#console-input");
-    $("#console-form").onsubmit = (e) => {
-        e.preventDefault();
-        const v = cmdIn.value.trim(); if (!v) return;
-        pushLog("info", "❯ " + v, "echo"); bus.send({ type: "exec", line: v });
-        if (state.cmdHistory[state.cmdHistory.length - 1] !== v) state.cmdHistory.push(v);
-        if (state.cmdHistory.length > 100) state.cmdHistory.shift();
-        localStorage.setItem("vox.cmdhist", JSON.stringify(state.cmdHistory));
-        cmdHistIdx = state.cmdHistory.length;
-        cmdIn.value = "";
-    };
-    cmdIn.addEventListener("keydown", (e) => {
-        if (e.key === "ArrowUp") {
-            if (cmdHistIdx > 0) {
-                cmdHistIdx--; cmdIn.value = state.cmdHistory[cmdHistIdx] || "";
-                e.preventDefault();
-                const n = cmdIn.value.length; requestAnimationFrame(() => cmdIn.setSelectionRange(n, n));
-            }
-        } else if (e.key === "ArrowDown") {
-            if (cmdHistIdx < state.cmdHistory.length - 1) { cmdHistIdx++; cmdIn.value = state.cmdHistory[cmdHistIdx] || ""; }
-            else { cmdHistIdx = state.cmdHistory.length; cmdIn.value = ""; }
+    function wireCmdInput(inp, form) {
+        if (!inp || !form) return;
+        let idx = state.cmdHistory.length;
+        form.onsubmit = (e) => {
             e.preventDefault();
-        }
-    });
+            const v = inp.value.trim(); if (!v) return;
+            pushLog("info", "❯ " + v, "echo"); bus.send({ type: "exec", line: v });
+            if (state.cmdHistory[state.cmdHistory.length - 1] !== v) state.cmdHistory.push(v);
+            if (state.cmdHistory.length > 100) state.cmdHistory.shift();
+            localStorage.setItem("vox.cmdhist", JSON.stringify(state.cmdHistory));
+            idx = state.cmdHistory.length; inp.value = "";
+        };
+        inp.addEventListener("keydown", (e) => {
+            if (e.key === "ArrowUp") {
+                if (idx > 0) { idx--; inp.value = state.cmdHistory[idx] || ""; e.preventDefault();
+                    const n = inp.value.length; requestAnimationFrame(() => inp.setSelectionRange(n, n)); }
+            } else if (e.key === "ArrowDown") {
+                if (idx < state.cmdHistory.length - 1) { idx++; inp.value = state.cmdHistory[idx] || ""; }
+                else { idx = state.cmdHistory.length; inp.value = ""; }
+                e.preventDefault();
+            }
+        });
+    }
+    wireCmdInput($("#console-input"), $("#console-form"));
+    wireCmdInput($("#console-modal-input"), $("#console-modal-form"));
+    // Console overlay controls.
+    $("#console-backdrop").onclick = closeConsole;
+    $("#console-modal-close").onclick = closeConsole;
+    $("#console-modal-clear").onclick = () => { const cl = $("#console-log"); if (cl) cl.innerHTML = ""; };
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("#console-overlay").hidden) closeConsole(); });
     $("#link").onclick = () => pushLog("info", state.demo ? "DEMO: open the engine at https://localhost:27960/ for a live link" : "link active");
     wirePalette();
     wireFavoritesBtn();

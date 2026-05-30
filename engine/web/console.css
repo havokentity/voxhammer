@@ -175,6 +175,17 @@ body {
 .str-in { width: 100%; height: var(--ctrl-h); background: var(--panel-2); border: 1px solid var(--edge); border-radius: 9px; color: var(--fg); font: inherit; padding: 0 11px; outline: none; }
 .str-in:focus { border-color: var(--accent); }
 
+/* console overlay (unified REPL) */
+.console-overlay { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; padding: 5vh 4vw; }
+.console-overlay[hidden] { display: none; }
+.console-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.55); backdrop-filter: blur(3px); }
+.console-card { position: relative; display: flex; flex-direction: column; width: min(960px, 96vw); height: min(72vh, 760px); background: var(--panel); border: 1px solid var(--edge-hi); border-radius: var(--r); box-shadow: 0 24px 70px rgba(0,0,0,.6); overflow: hidden; }
+.console-card-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--edge); }
+.cc-title { font-family: var(--mono); color: var(--accent); font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; }
+.cc-tools { display: flex; gap: 8px; }
+.console-log { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px; }
+.console-modal-line { border-top: 1px solid var(--edge); border-radius: 0; padding: 10px 14px; }
+
 /* vec3 (x/y/z number inputs) */
 .vec3 { display: flex; gap: 6px; width: 100%; }
 .vec3-field { display: flex; align-items: center; gap: 5px; flex: 1; min-width: 0; height: var(--ctrl-h); padding: 0 8px; background: var(--panel-2); border: 1px solid var(--edge); border-radius: 9px; }
