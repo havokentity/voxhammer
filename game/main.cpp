@@ -788,6 +788,16 @@ static void MarkAllRegionsDirty() {
     g_colliderQuietFrames = 0;
 }
 
+// --- Milestone B1 settle debounce ----------------------------------------
+// A carve with voxel.auto_settle ON used to run the full-grid connectivity
+// flood (RunStructuralSettle: O(2*kWorldDim^3)) SYNCHRONOUSLY inside the carve
+// command, hitching on every single carve. Instead the carve just arms
+// g_settlePending; the main loop runs ONE settle a few quiet frames after
+// carving stops -- coalescing a burst of carves into a single flood (mirrors
+// the dirty-region collider debounce above).
+static bool g_settlePending = false;
+static int  g_settleQuietFrames = 0;
+
 // Compatibility shim kept for the (rare) call sites that want a full rebuild:
 // equivalent to MarkAllRegionsDirty(). The main loop drives the async rebuild.
 void RebuildWorldCollider(vox::voxel::VoxelWorld&, vox::physics::PhysicsWorld&) {
@@ -1446,17 +1456,12 @@ int main(int argc, char** argv) {
                 // Milestone B1: opt-in structural settle right after the carve.
                 // Default OFF (voxel.auto_settle=0) so carve behavior is
                 // unchanged; ON makes the now-unsupported region detach + fall.
-                bool settled = false;
+                // Don't flood synchronously per carve (the full-grid connectivity
+                // pass hitches): just ARM the debounce. The main loop runs ONE
+                // settle once carving pauses, coalescing a burst into one flood.
                 if (cc.FindCVar("voxel.auto_settle") && cc.FindCVar("voxel.auto_settle")->GetBool()) {
-#if defined(VOX_HAVE_PHYSX)
-                    const int detached = RunStructuralSettle(cc, world, renderer, physics, debris);
-#else
-                    const int detached = RunStructuralSettle(cc, world, renderer);
-#endif
-                    if (detached > 0) {
-                        o.Format("voxel.break: auto-settle detached {} voxel(s)", detached);
-                        settled = true;
-                    }
+                    g_settlePending = true;
+                    g_settleQuietFrames = 0;
                 }
 #if defined(VOX_HAVE_PHYSX)
                 // Milestone C: mark only the regions this carve touched dirty so
@@ -1531,17 +1536,11 @@ int main(int argc, char** argv) {
                 // Milestone B1: opt-in structural settle right after the blast
                 // (default OFF). ON => any region the crater left unsupported
                 // detaches + falls instead of floating over the new void.
-                bool settled = false;
+                // Debounced like voxel.break: arm the settle, the main loop runs
+                // ONE flood once carving pauses (no per-blast full-grid hitch).
                 if (cc.FindCVar("voxel.auto_settle") && cc.FindCVar("voxel.auto_settle")->GetBool()) {
-#if defined(VOX_HAVE_PHYSX)
-                    const int detached = RunStructuralSettle(cc, world, renderer, physics, debris);
-#else
-                    const int detached = RunStructuralSettle(cc, world, renderer);
-#endif
-                    if (detached > 0) {
-                        o.Format("voxel.explode: auto-settle detached {} voxel(s)", detached);
-                        settled = true;
-                    }
+                    g_settlePending = true;
+                    g_settleQuietFrames = 0;
                 }
 #if defined(VOX_HAVE_PHYSX)
                 // Milestone C: mark only the regions the crater touched dirty so
@@ -1670,6 +1669,20 @@ int main(int argc, char** argv) {
         // flight -- snapshot the dirty regions and kick a new worker. Coalescing: only one
         // batch is in flight; regions re-dirtied meanwhile are picked up by the next batch.
         PollColliderJob(physics);
+        // Milestone B1: debounced structural settle. A carve with voxel.auto_settle
+        // ON arms g_settlePending; run ONE full-grid flood here once carving has
+        // paused a few frames (coalescing a burst into a single settle). Runs BEFORE
+        // the collider launch below so any islands it detaches dirty their regions in
+        // time for this frame's rebuild snapshot.
+        if (g_settlePending && ++g_settleQuietFrames > 10) {
+#if defined(VOX_HAVE_PHYSX)
+            RunStructuralSettle(Console::Get(), world, renderer, physics, debris);
+#else
+            RunStructuralSettle(Console::Get(), world, renderer);
+#endif
+            g_settlePending = false;
+            g_settleQuietFrames = 0;
+        }
         if (AnyRegionDirty() && !g_colliderJobInFlight && ++g_colliderQuietFrames > 10) {
             LaunchColliderJob(world);   // snapshots + clears the dirty regions it batches
             g_colliderQuietFrames = 0;
