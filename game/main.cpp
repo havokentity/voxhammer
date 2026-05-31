@@ -629,6 +629,7 @@ private:
 // 3) If anything detached we re-bake + renderer.SetVoxels so the world updates.
 //
 // Returns the number of voxels detached this pass (0 = nothing floated).
+static void MarkRegionsDirtyForAabb(int x0, int y0, int z0, int x1, int y1, int z1);  // fwd-decl (defined with the region markers below)
 int RunStructuralSettle(vox::console::Console& cc,
                         vox::voxel::VoxelWorld& world,
                         vox::render::Renderer& renderer
@@ -653,6 +654,9 @@ int RunStructuralSettle(vox::console::Console& cc,
     for (const auto& isl : res.islands) {
         debris.SpawnIsland(physics, renderer, world, isl.data, isl.dims.x, isl.dims.y, isl.dims.z,
                            isl.origin.x, isl.origin.y, isl.origin.z);
+        // Those world cells were just cleared -> rebuild ONLY the islands' regions (not all 64).
+        MarkRegionsDirtyForAabb(isl.origin.x, isl.origin.y, isl.origin.z,
+                                isl.origin.x + isl.dims.x, isl.origin.y + isl.dims.y, isl.origin.z + isl.dims.z);
     }
 #endif
 
@@ -764,7 +768,21 @@ static void MarkCarveRegionsDirty(int hx, int hy, int hz, int radius) {
     g_colliderQuietFrames = 0;
 }
 
-// Mark EVERY region dirty (initial build + settle, which can detach anywhere).
+// Mark every region overlapping a world-voxel AABB dirty (structural settle: only the
+// detached islands' cells changed, so only those regions need a collider rebuild).
+static void MarkRegionsDirtyForAabb(int x0, int y0, int z0, int x1, int y1, int z1) {
+    const int G = static_cast<int>(vox::voxel::kWorldDim);
+    x0 = std::max(0, x0); y0 = std::max(0, y0); z0 = std::max(0, z0);
+    x1 = std::min(G - 1, x1); y1 = std::min(G - 1, y1); z1 = std::min(G - 1, z1);
+    if (x1 < x0 || y1 < y0 || z1 < z0) return;
+    for (int rz = z0 / kRegionSize; rz <= z1 / kRegionSize; ++rz)
+        for (int ry = y0 / kRegionSize; ry <= y1 / kRegionSize; ++ry)
+            for (int rx = x0 / kRegionSize; rx <= x1 / kRegionSize; ++rx)
+                g_colliderRegionDirty[RegionIndex(rx, ry, rz)] = true;
+    g_colliderQuietFrames = 0;
+}
+
+// Mark EVERY region dirty (initial build).
 static void MarkAllRegionsDirty() {
     g_colliderRegionDirty.assign(kRegionCount, true);
     g_colliderQuietFrames = 0;
@@ -1447,8 +1465,7 @@ int main(int argc, char** argv) {
                 // removed voxels anywhere -> mark ALL regions. Gated OFF by
                 // default -> no-op when disabled.
                 if (cc.FindCVar("physics.world_collider") && cc.FindCVar("physics.world_collider")->GetBool()) {
-                    if (settled) MarkAllRegionsDirty();
-                    else         MarkCarveRegionsDirty(hx, hy, hz, radius);
+                    MarkCarveRegionsDirty(hx, hy, hz, radius);  // settle marks its own detached-island regions
                 }
 #endif
             });
@@ -1532,8 +1549,7 @@ int main(int argc, char** argv) {
                 // auto-settle detached anything (can remove voxels anywhere) mark
                 // ALL regions. Gated OFF by default -> no-op when disabled.
                 if (cc.FindCVar("physics.world_collider") && cc.FindCVar("physics.world_collider")->GetBool()) {
-                    if (settled) MarkAllRegionsDirty();
-                    else         MarkCarveRegionsDirty(hx, hy, hz, radius);
+                    MarkCarveRegionsDirty(hx, hy, hz, radius);  // settle marks its own detached-island regions
                 }
 #endif
             });
