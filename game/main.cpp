@@ -274,8 +274,7 @@ public:
             // A healthy random spin so chunks tumble visibly.
             const float wx = Frand(-4.0f, 4.0f), wy = Frand(-4.0f, 4.0f), wz = Frand(-4.0f, 4.0f);
 
-            const int id = physics.AcquireBox(scx, scy, scz, c.localCx, c.localCy, c.localCz,
-                                              vx, vy, vz, wx, wy, wz);
+            const int id = AcquireForChunk(physics, c, scx, scy, scz, vx, vy, vz, wx, wy, wz);
             if (id < 0) return;  // pool exhausted
             c.id = id;
             if (useObb) RegisterDynObject(renderer, world, c);   // A3: draw as an OBB rigid body
@@ -321,8 +320,7 @@ public:
         const float vx = Frand(-0.5f, 0.5f), vy = 0.0f, vz = Frand(-0.5f, 0.5f);
         const float wx = Frand(-2.5f, 2.5f), wy = Frand(-2.5f, 2.5f), wz = Frand(-2.5f, 2.5f);
 
-        const int id = physics.AcquireBox(scx, scy, scz, c.localCx, c.localCy, c.localCz,
-                                          vx, vy, vz, wx, wy, wz);
+        const int id = AcquireForChunk(physics, c, scx, scy, scz, vx, vy, vz, wx, wy, wz);
         if (id < 0) return;  // pool exhausted
         c.id = id;
         if (UseObb()) RegisterDynObject(renderer, world, c);   // A3: tumble as an OBB rigid body (else re-stamp = no smooth rotation)
@@ -482,6 +480,72 @@ private:
         std::vector<std::uint32_t> grid(c.mats.size());
         for (std::size_t i = 0; i < c.mats.size(); ++i) grid[i] = static_cast<std::uint32_t>(c.mats[i]);
         c.dynHandle = renderer.AddDynObject(grid.data(), c.dx, c.dy, c.dz, world.Palette().data());
+    }
+
+    // #2 gate: give each chunk a box-COMPOUND collider (greedy box-cover of its
+    // own voxels) instead of one oversized bounding box, so concave chunks fit
+    // through gaps. Read live; default ON. (Only matters once physics.world_collider
+    // is on -- against the flat ground plane a bounding box behaves the same.)
+    static bool UseCompound() {
+        CVar* cv = Console::Get().FindCVar("physics.debris_compound");
+        return cv && cv->GetBool();
+    }
+
+    // Above this box count the compound's PhysX cost outweighs the accuracy gain,
+    // so the chunk falls back to a single bounding box. Debris chunks are small,
+    // so a convex-ish chunk decomposes into only a handful of boxes; this caps the
+    // rare highly-concave outlier.
+    static constexpr std::size_t kMaxChunkBoxes = 48;
+
+    // Build a LOCAL-frame box-compound cover of chunk `c`'s solid voxels (reuse the
+    // B0 greedy decompose). A voxel grid box [v..v+1] maps to the body-local box
+    // [v - C .. v+1 - C] (C = local center), exactly matching the renderer's
+    // R*(p - C) + pos stamp, so collider shapes and rendered voxels stay locked.
+    // Returns false (caller uses a single bounding box) when: the chunk is a solid
+    // box (no concavity -> bounding box is already exact), the decompose is empty,
+    // or it needs more than kMaxChunkBoxes boxes (bounding box is cheaper).
+    bool BuildLocalBoxes(const Chunk& c, std::vector<vox::physics::ColliderBox>& out) const {
+        out.clear();
+        const std::size_t total = static_cast<std::size_t>(c.dx) * c.dy * c.dz;
+        if (total == 0 || c.mats.size() != total) return false;
+        if (c.solidCount == total) return false;  // fully solid -> single box is exact
+        vox::destruction::ComponentField cf;
+        cf.ids.assign(total, std::uint16_t{0});
+        for (std::size_t i = 0; i < total; ++i) cf.ids[i] = c.mats[i] ? std::uint16_t{1} : std::uint16_t{0};
+        cf.anchoredCount = 1;
+        cf.totalCount = 1;
+        const std::vector<vox::destruction::Box> boxes =
+            vox::destruction::decomposeComponent(cf, glm::ivec3(c.dx, c.dy, c.dz), 1);
+        if (boxes.empty() || boxes.size() > kMaxChunkBoxes) return false;
+        out.reserve(boxes.size());
+        for (const auto& b : boxes) {
+            vox::physics::ColliderBox cb;
+            cb.minX = static_cast<float>(b.mn.x)     - c.localCx;
+            cb.minY = static_cast<float>(b.mn.y)     - c.localCy;
+            cb.minZ = static_cast<float>(b.mn.z)     - c.localCz;
+            cb.maxX = static_cast<float>(b.mx.x + 1) - c.localCx;
+            cb.maxY = static_cast<float>(b.mx.y + 1) - c.localCy;
+            cb.maxZ = static_cast<float>(b.mx.z + 1) - c.localCz;
+            out.push_back(cb);
+        }
+        return true;
+    }
+
+    // Acquire a pooled body for chunk `c` at world center (scx,scy,scz) with the
+    // given linear/angular velocity. Uses a box-compound collider when UseCompound()
+    // and the cover is worthwhile; otherwise a single bounding box. Returns the
+    // body id (-1 = pool exhausted).
+    int AcquireForChunk(vox::physics::PhysicsWorld& physics, const Chunk& c,
+                        float scx, float scy, float scz,
+                        float vx, float vy, float vz, float wx, float wy, float wz) const {
+        if (UseCompound()) {
+            std::vector<vox::physics::ColliderBox> lboxes;
+            if (BuildLocalBoxes(c, lboxes)) {
+                const int id = physics.AcquireBoxCompound(scx, scy, scz, lboxes, vx, vy, vz, wx, wy, wz);
+                if (id >= 0) return id;  // fall through to single box only if the pool rejected it
+            }
+        }
+        return physics.AcquireBox(scx, scy, scz, c.localCx, c.localCy, c.localCz, vx, vy, vz, wx, wy, wz);
     }
 
     static bool FindState(const std::vector<vox::physics::BodyState>& v, int id,
@@ -968,6 +1032,7 @@ void RegisterCoreCvars() {
     reg("physics.gpu_rigids.max_islands", "10000", "Max active dynamic islands.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 256, .range_max = 16384, .range_step = 256});
     reg("physics.solver.position_iters", "8", "Solver position iterations.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
     reg("physics.world_collider", "0", "Milestone C: build a STATIC box-compound collider matching the voxel terrain (greedy box cover -> one PxRigidStatic of PxBoxGeometry) so falling debris + B1 detached islands LAND on the terrain instead of dropping through to the y=0 plane. Default OFF = behavior unchanged. ON rebuilds the collider after each carve (voxel.break/explode) + after voxel.settle. Additive to the y=0 ground plane.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("physics.debris_compound", "1", "#2 of Teardown ladder: give each debris/island chunk a box-COMPOUND collider (greedy box cover of ITS OWN voxels, B0 decompose) instead of one oversized bounding box, so a CONCAVE chunk collides as its real shape and can fall THROUGH a gap a bounding box would wedge in (fixes 'a chunk hit an invisible box in a gap'). Solid (convex) chunks keep a single box; chunks needing >48 boxes fall back to one box (cost). Default ON; matters once physics.world_collider is on.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("sim.fluid.grid_resolution", "MED", "FLIP/Eulerian fluid grid resolution.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"LOW", "MED", "HIGH", "ULTRA"}});
     reg("sim.fire.combustion_rate", "1.0", "Combustion rate multiplier.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.1f, .range_max = 5.0f, .range_step = 0.1f});
     reg("voxel.streaming.horizon_meters", "256", "Voxel streaming horizon.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 64.0f, .range_max = 512.0f, .range_step = 8.0f});

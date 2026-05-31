@@ -132,6 +132,24 @@ public:
     int AcquireBox(float x, float y, float z, float hx, float hy, float hz,
                    float vx, float vy, float vz, float wx, float wy, float wz);
 
+    // Acquire a pooled dynamic body whose collision shape is a COMPOUND of boxes
+    // (Milestone C / #2): one PxBoxGeometry per `localBoxes` entry instead of a
+    // single bounding box, so a CONCAVE chunk (e.g. an L-shape, or a slab with a
+    // gap) collides as its real shape and can fall THROUGH a gap a bounding box
+    // would wedge in. `localBoxes` are in the body's LOCAL frame -- the same
+    // frame the renderer uses to stamp the chunk's voxels (R*(p - C) + pos, where
+    // C is the chunk's local center), so collider shapes and rendered voxels stay
+    // locked together regardless of where PhysX places the recomputed center of
+    // mass. The body is spawned with its actor-frame origin at (x,y,z), initial
+    // linear velocity (vx,vy,vz), angular velocity (wx,wy,wz). Returns a stable
+    // body id, or -1 (pool exhausted / empty boxes / stub build). Pair with
+    // ReleaseBox like AcquireBox. A recycled body is reset to a single box by the
+    // next plain AcquireBox.
+    int AcquireBoxCompound(float x, float y, float z,
+                           const std::vector<ColliderBox>& localBoxes,
+                           float vx, float vy, float vz,
+                           float wx, float wy, float wz);
+
     // Park a pooled body (acquired via AcquireBox) back onto the free list.
     // No-op for an unknown id or in the stub build. The id is invalid until a
     // subsequent AcquireBox hands it back out.

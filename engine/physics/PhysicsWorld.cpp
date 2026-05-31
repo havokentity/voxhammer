@@ -82,7 +82,12 @@ struct PhysicsWorld::Impl {
     // and append it to `dynamics`. Returns the new slot index, or -1 on failure.
     int CreatePooledActor();
     // Resize an existing dynamic body's single box shape to half-extents (hx,hy,hz).
+    // Also strips any extra shapes (so a body recycled from a compound acquire is
+    // reset to a single centered box) and re-centers the surviving shape.
     static void ResizeBox(PxRigidDynamic* body, float hx, float hy, float hz);
+    // Replace a body's shapes with a COMPOUND: one PxBoxGeometry per `localBoxes`
+    // entry (boxes in the body's LOCAL frame). Detaches all current shapes first.
+    void SetBoxShapes(PxRigidDynamic* body, const std::vector<ColliderBox>& localBoxes) const;
 };
 
 void PhysicsWorld::Init() {
@@ -406,10 +411,66 @@ void PhysicsWorld::Impl::ResizeBox(PxRigidDynamic* body, float hx, float hy,
     if (!body || body->getNbShapes() == 0) {
         return;
     }
+    // A body recycled from AcquireBoxCompound carries N>1 shapes; detach all but
+    // the first so the single-box path doesn't inherit stale compound shapes.
+    while (body->getNbShapes() > 1) {
+        PxShape* extra = nullptr;
+        body->getShapes(&extra, 1, body->getNbShapes() - 1);  // last shape
+        if (!extra) break;
+        body->detachShape(*extra);
+    }
     PxShape* shape = nullptr;
     body->getShapes(&shape, 1);
     if (shape) {
         shape->setGeometry(PxBoxGeometry(hx, hy, hz));
+        shape->setLocalPose(PxTransform(PxIdentity));  // re-center (compound left it offset)
+    }
+}
+
+// Compound: one PxBoxGeometry per local box (boxes in the body's LOCAL frame).
+// Detaches all current shapes first, then attaches the cover. Guarantees at
+// least one shape so the actor stays valid (degenerate input -> unit box).
+void PhysicsWorld::Impl::SetBoxShapes(PxRigidDynamic* body,
+                                      const std::vector<ColliderBox>& localBoxes) const {
+    if (!body || !physics || !material) {
+        return;
+    }
+    // Detach every existing shape (single or a prior compound).
+    const PxU32 n = body->getNbShapes();
+    std::vector<PxShape*> shapes(n);
+    if (n) {
+        body->getShapes(shapes.data(), n);
+    }
+    for (PxU32 i = 0; i < n; ++i) {
+        if (shapes[i]) body->detachShape(*shapes[i]);
+    }
+    // Attach one box per local AABB.
+    int attached = 0;
+    for (const ColliderBox& b : localBoxes) {
+        const float hx = 0.5f * (b.maxX - b.minX);
+        const float hy = 0.5f * (b.maxY - b.minY);
+        const float hz = 0.5f * (b.maxZ - b.minZ);
+        if (hx <= 0.0f || hy <= 0.0f || hz <= 0.0f) {
+            continue;  // PxBoxGeometry needs +ve extents
+        }
+        const PxVec3 center(0.5f * (b.minX + b.maxX), 0.5f * (b.minY + b.maxY),
+                            0.5f * (b.minZ + b.maxZ));
+        PxShape* shape = physics->createShape(PxBoxGeometry(hx, hy, hz), *material);
+        if (shape) {
+            shape->setLocalPose(PxTransform(center));
+            body->attachShape(*shape);
+            shape->release();  // body retains a reference
+            ++attached;
+        }
+    }
+    if (attached == 0) {
+        // All boxes degenerate -> keep a valid actor with a unit box at origin.
+        PxShape* shape =
+            physics->createShape(PxBoxGeometry(kBoxHalfExtent, kBoxHalfExtent, kBoxHalfExtent), *material);
+        if (shape) {
+            body->attachShape(*shape);
+            shape->release();
+        }
     }
 }
 
@@ -480,6 +541,48 @@ int PhysicsWorld::AcquireBox(float x, float y, float z, float hx, float hy, floa
     // Use the largest half-extent as the renderer's nominal "half" (debris cube
     // sizing path); the chunk renderer reads the real per-axis box separately.
     b.half = std::max(hx, std::max(hy, hz));
+    impl_->scene->addActor(*body);
+    body->wakeUp();
+    b.inScene = true;
+    return idx;
+}
+
+int PhysicsWorld::AcquireBoxCompound(float x, float y, float z,
+                                     const std::vector<ColliderBox>& localBoxes,
+                                     float vx, float vy, float vz,
+                                     float wx, float wy, float wz) {
+    if (!impl_ || !impl_->scene || !impl_->physics || !impl_->material) {
+        return -1;
+    }
+    if (localBoxes.empty()) {
+        return -1;  // caller falls back to AcquireBox
+    }
+    // Grow the pool by one if the free list is empty, then pop a parked slot.
+    if (impl_->freeList.empty()) {
+        if (impl_->CreatePooledActor() < 0) return -1;
+    }
+    const int idx = impl_->freeList.back();
+    impl_->freeList.pop_back();
+
+    Impl::Body& b = impl_->dynamics[static_cast<std::size_t>(idx)];
+    PxRigidDynamic* body = b.actor;
+    if (!body) {
+        return -1;
+    }
+    impl_->SetBoxShapes(body, localBoxes);                 // compound cover
+    PxRigidBodyExt::updateMassAndInertia(*body, 10.0f);    // COM/inertia from the new shapes
+    body->setGlobalPose(PxTransform(PxVec3(x, y, z)));     // identity rotation at spawn
+    body->setLinearVelocity(PxVec3(vx, vy, vz));
+    body->setAngularVelocity(PxVec3(wx, wy, wz));
+    // Nominal "half" for the cube-sizing path = half the overall local AABB
+    // (the chunk renderer reads the real per-voxel grid separately).
+    float mnx = localBoxes[0].minX, mny = localBoxes[0].minY, mnz = localBoxes[0].minZ;
+    float mxx = localBoxes[0].maxX, mxy = localBoxes[0].maxY, mxz = localBoxes[0].maxZ;
+    for (const ColliderBox& lb : localBoxes) {
+        mnx = std::min(mnx, lb.minX); mny = std::min(mny, lb.minY); mnz = std::min(mnz, lb.minZ);
+        mxx = std::max(mxx, lb.maxX); mxy = std::max(mxy, lb.maxY); mxz = std::max(mxz, lb.maxZ);
+    }
+    b.half = 0.5f * std::max(mxx - mnx, std::max(mxy - mny, mxz - mnz));
     impl_->scene->addActor(*body);
     body->wakeUp();
     b.inScene = true;
@@ -646,6 +749,14 @@ void PhysicsWorld::ReservePool(int count) { (void)count; }
 int PhysicsWorld::AcquireBox(float x, float y, float z, float hx, float hy, float hz,
                              float vx, float vy, float vz, float wx, float wy, float wz) {
     (void)x; (void)y; (void)z; (void)hx; (void)hy; (void)hz;
+    (void)vx; (void)vy; (void)vz; (void)wx; (void)wy; (void)wz;
+    return -1;
+}
+int PhysicsWorld::AcquireBoxCompound(float x, float y, float z,
+                                     const std::vector<ColliderBox>& localBoxes,
+                                     float vx, float vy, float vz,
+                                     float wx, float wy, float wz) {
+    (void)x; (void)y; (void)z; (void)localBoxes;
     (void)vx; (void)vy; (void)vz; (void)wx; (void)wy; (void)wz;
     return -1;
 }
