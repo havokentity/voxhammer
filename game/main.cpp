@@ -25,6 +25,7 @@
 #include "voxel/destruction/box_decompose.h"  // Milestone C: world box-compound collider
 #include "voxel/destruction/connectivity.h"
 #include "voxel/destruction/island_extract.h"  // re-fracture a carved debris chunk into pieces
+#include "voxel/destruction/box_graph.h"        // Phase 1: box-level union-find connectivity
 
 #include <glm/glm.hpp>  // glm::ivec3 for the world-collider decompose
 
@@ -903,6 +904,17 @@ private:
 //
 // Returns the number of voxels detached this pass (0 = nothing floated).
 static void MarkRegionsDirtyForAabb(int x0, int y0, int z0, int x1, int y1, int z1);  // fwd-decl (defined with the region markers below)
+#if defined(VOX_HAVE_PHYSX)
+// Phase 1: box-graph structural settle + the persistent box-layer total (both
+// defined after the box layer below). Forward-declared so RunStructuralSettle
+// (which the commands call) can dispatch to / query them.
+static std::size_t BoxLayerTotal();
+static int RunStructuralSettleBoxGraph(vox::console::Console& cc, vox::voxel::VoxelWorld& world,
+                                       vox::render::Renderer& renderer,
+                                       vox::physics::PhysicsWorld& physics, DebrisField& debris,
+                                       int anchorLayers);
+#endif
+
 int RunStructuralSettle(vox::console::Console& cc,
                         vox::voxel::VoxelWorld& world,
                         vox::render::Renderer& renderer
@@ -913,6 +925,19 @@ int RunStructuralSettle(vox::console::Console& cc,
 ) {
     const int anchorLayers = cc.FindCVar("voxel.anchor_layers")
                                  ? cc.FindCVar("voxel.anchor_layers")->GetInt() : 1;
+#if defined(VOX_HAVE_PHYSX)
+    // Phase 1: prefer the box-graph settle when enabled AND the persistent box
+    // layer is current+populated (it rides the world_collider path, and the main
+    // loop only fires settle once that layer has caught up). Else fall back to the
+    // proven per-voxel SettleWorld below.
+    {
+        CVar* bg = cc.FindCVar("voxel.settle_boxgraph");
+        CVar* wc = cc.FindCVar("physics.world_collider");
+        const bool useBoxGraph = bg && bg->GetBool() && wc && wc->GetBool() && BoxLayerTotal() > 0;
+        if (useBoxGraph)
+            return RunStructuralSettleBoxGraph(cc, world, renderer, physics, debris, anchorLayers);
+    }
+#endif
     vox::voxel::SettleResult res =
         vox::voxel::SettleWorld(world, vox::voxel::kWorldDim, anchorLayers);
     if (res.detachedVoxels == 0) return 0;  // nothing floats; world untouched
@@ -1248,7 +1273,120 @@ static void JoinColliderJob() {
     if (g_colliderThread.joinable()) g_colliderThread.join();
     g_colliderJobInFlight = false;
 }
+
+// Phase 1: structural settle via box-graph union-find. Reads the persistent box
+// layer (the main loop only fires settle once the collider/box rebuild has
+// drained, so it's current), labels connected components, and drops every
+// component NOT anchored to the bottom `anchorLayers` voxel rows. Connectivity is
+// O(boxes) union-find over the layer instead of the per-voxel BFS's O(kWorldDim^3).
+// Times the label pass + total and logs them so we can see whether the O(n^2)
+// labelBoxComponents needs the spatial-grid speedup at this box count.
+static int RunStructuralSettleBoxGraph(vox::console::Console& cc, vox::voxel::VoxelWorld& world,
+                                       vox::render::Renderer& renderer,
+                                       vox::physics::PhysicsWorld& physics, DebrisField& debris,
+                                       int anchorLayers) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+
+    // 1) Flatten the persistent box layer (world voxel coords).
+    std::vector<vox::destruction::Box> boxes;
+    boxes.reserve(BoxLayerTotal());
+    for (const auto& region : g_worldRegionBoxes)
+        for (const WorldBox& wb : region) boxes.push_back(wb.box);
+    if (boxes.empty()) return 0;
+
+    // 2) Union-find components + anchored set (boxes touching the ground rows).
+    const auto t1 = clock::now();
+    const vox::destruction::BoxComponents comps = vox::destruction::labelBoxComponents(boxes);
+    const auto t2 = clock::now();
+    std::vector<int> anchorIdx;
+    for (std::size_t i = 0; i < boxes.size(); ++i)
+        if (boxes[i].mn.y < anchorLayers) anchorIdx.push_back(static_cast<int>(i));
+    const std::vector<bool> anchored = vox::destruction::anchoredComponents(comps, anchorIdx);
+    if (comps.count <= 0) return 0;
+
+    // 3) Per-component world AABB for the UNANCHORED components.
+    struct Acc { glm::ivec3 mn{0}, mx{0}; bool init = false; };
+    std::vector<Acc> acc(static_cast<std::size_t>(comps.count));
+    bool anyDetached = false;
+    for (std::size_t i = 0; i < boxes.size(); ++i) {
+        const int ci = comps.labels[i];
+        if (ci < 0 || ci >= comps.count || anchored[ci]) continue;
+        Acc& a = acc[static_cast<std::size_t>(ci)];
+        if (!a.init) { a.mn = boxes[i].mn; a.mx = boxes[i].mx; a.init = true; }
+        else { a.mn = glm::min(a.mn, boxes[i].mn); a.mx = glm::max(a.mx, boxes[i].mx); }
+        anyDetached = true;
+    }
+    if (!anyDetached) return 0;  // everything reaches the ground
+
+    debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
+    debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
+    debris.ReservePool(physics);
+
+    // 4) Each unanchored component -> a tight island grid (only its own box cells,
+    //    so concavity is preserved) -> spawn as a falling body -> clear its cells
+    //    -> incremental GPU upload of its AABB (no full re-bake/stall).
+    int detached = 0, islands = 0;
+    std::vector<std::uint32_t> upload;
+    for (int ci = 0; ci < comps.count; ++ci) {
+        if (anchored[ci] || !acc[static_cast<std::size_t>(ci)].init) continue;
+        const glm::ivec3 mn = acc[static_cast<std::size_t>(ci)].mn;
+        const glm::ivec3 mx = acc[static_cast<std::size_t>(ci)].mx;
+        const int dx = mx.x - mn.x + 1, dy = mx.y - mn.y + 1, dz = mx.z - mn.z + 1;
+        std::vector<std::uint8_t> mats(static_cast<std::size_t>(dx) * dy * dz, 0u);
+        int cells = 0;
+        for (std::size_t i = 0; i < boxes.size(); ++i) {
+            if (comps.labels[i] != ci) continue;
+            const vox::destruction::Box& b = boxes[i];
+            for (int z = b.mn.z; z <= b.mx.z; ++z)
+                for (int y = b.mn.y; y <= b.mx.y; ++y)
+                    for (int x = b.mn.x; x <= b.mx.x; ++x) {
+                        const std::uint8_t m = world.GetVoxel(x, y, z);
+                        if (!m) continue;
+                        mats[(static_cast<std::size_t>(z - mn.z) * dy + (y - mn.y)) * dx + (x - mn.x)] = m;
+                        ++cells;
+                    }
+        }
+        if (cells == 0) continue;
+        debris.SpawnIsland(physics, renderer, world, mats, dx, dy, dz, mn.x, mn.y, mn.z);
+        for (std::size_t i = 0; i < boxes.size(); ++i) {  // clear this component's cells
+            if (comps.labels[i] != ci) continue;
+            const vox::destruction::Box& b = boxes[i];
+            for (int z = b.mn.z; z <= b.mx.z; ++z)
+                for (int y = b.mn.y; y <= b.mx.y; ++y)
+                    for (int x = b.mn.x; x <= b.mx.x; ++x)
+                        world.SetVoxel(x, y, z, 0);
+        }
+        upload.clear();
+        upload.reserve(static_cast<std::size_t>(dx) * dy * dz);
+        for (int z = mn.z; z <= mx.z; ++z)
+            for (int y = mn.y; y <= mx.y; ++y)
+                for (int x = mn.x; x <= mx.x; ++x)
+                    upload.push_back(static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
+        renderer.EditVoxels(mn.x, mn.y, mn.z, mx.x + 1, mx.y + 1, mx.z + 1, upload.data(), nullptr);
+        MarkRegionsDirtyForAabb(mn.x, mn.y, mn.z, mx.x, mx.y, mx.z);
+        detached += cells;
+        ++islands;
+    }
+
+    const auto t3 = clock::now();
+    const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    vox::log::Info("settle(box-graph): {} boxes / {} comps -> {} island(s), {} vox | label {:.2f}ms total {:.2f}ms",
+                   boxes.size(), comps.count, islands, detached, ms(t2 - t1), ms(t3 - t0));
+    return detached;
+}
+
+// True iff the world-collider / box-layer rebuild has fully drained (no dirty
+// regions, no worker in flight) -- i.e. the persistent box layer is CURRENT. The
+// main loop gates the (debounced) settle on this so box-graph settle never reads
+// a stale layer. Trivially true in the no-PhysX build.
+static bool ColliderLayerIdle() {
+    return !AnyRegionDirty() && !g_colliderJobInFlight;
+}
 #endif  // VOX_HAVE_PHYSX
+#if !defined(VOX_HAVE_PHYSX)
+static bool ColliderLayerIdle() { return true; }
+#endif
 
 void Usage() {
     vox::log::Info("Voxhammer {} -- standalone DX12 voxel-destruction engine", VOX_VERSION_STRING);
@@ -1323,6 +1461,7 @@ void RegisterCoreCvars() {
     reg("voxel.debris.scale", "1.0", "Debris chunk-size multiplier (dials chunkiness; 1 = stock 1..4-voxel cubes).", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.25f, .range_max = 4.0f, .range_step = 0.25f});
     reg("voxel.debris.ttl", "0", "Seconds before debris auto-cleans. 0 = PERSIST (debris stay where they land; only culled when they fall off the world). Higher live counts cost render+physics -- lower voxel.debris.max if it slows.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 300.0f, .range_step = 5.0f});
     reg("voxel.auto_settle", "0", "Structural settle (Milestone B1): after EVERY carve (voxel.break/explode), auto-detach any voxels no longer connected to the ground and drop them as debris. Default OFF = carve behavior unchanged; turn ON to make the world 'nothing floats'. (Full-grid flood per carve; use voxel.settle to run it manually.)", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("voxel.settle_boxgraph", "1", "Phase 1: run structural settle via box-graph union-find over the persistent box layer (O(boxes)) instead of the per-voxel BFS over the dense grid (O(kWorldDim^3)). Requires physics.world_collider on (it maintains the layer); falls back to the per-voxel SettleWorld when off or the layer is empty. Logs label/total timing each settle. Default ON.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("voxel.anchor_layers", "1", "Structural settle: number of bottom grid rows (y < N) treated as GROUND anchors. A solid voxel in these layers anchors its whole connected component; anything with no path down to them detaches. 1 = only the y==0 floor.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
     reg("audio.master_volume", "0.8", "Master output volume.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.0f, .range_max = 1.0f, .range_step = 0.01f});
     reg("camera.pos", "32 40 -24", "Free-fly camera position (world units).", {.type = CVarType::Vec3, .flags = CVAR_ARCHIVE});
@@ -2068,7 +2207,11 @@ int main(int argc, char** argv) {
         // paused a few frames (coalescing a burst into a single settle). Runs BEFORE
         // the collider launch below so any islands it detaches dirty their regions in
         // time for this frame's rebuild snapshot.
-        if (g_settlePending && ++g_settleQuietFrames > 10) {
+        // Fire the debounced settle once carving has paused AND the collider/box
+        // layer has drained (ColliderLayerIdle) -- so box-graph settle reads a
+        // CURRENT box layer, never one mid-rebuild. (Idle is trivially true when
+        // physics.world_collider is off -> the SettleWorld fallback runs as before.)
+        if (g_settlePending && ++g_settleQuietFrames > 10 && ColliderLayerIdle()) {
 #if defined(VOX_HAVE_PHYSX)
             RunStructuralSettle(Console::Get(), world, renderer, physics, debris);
 #else
