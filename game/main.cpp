@@ -1022,14 +1022,26 @@ static bool AnyRegionDirty() {
     return false;
 }
 
+// Phase 0 (box layer): one greedy box of the persistent world decomposition --
+// the SAME boxes the collider builds, but kept (not discarded) in WORLD voxel
+// coords + a representative material, so connectivity (Phase 1) + stress
+// (Phase 3) run on the boxes instead of a per-voxel BFS over the dense grid.
+struct WorldBox {
+    vox::destruction::Box box;     // inclusive AABB, WORLD voxel coords
+    std::uint8_t          material = 0;  // sampled at box.mn (boxes are solid-only)
+};
+
 // One region's snapshot handed to the worker: its dense index, world origin and
-// a kRegionSize^3 uint8 solidity sub-grid (row-major, region-local coords).
+// a kRegionSize^3 uint8 sub-grid (row-major, region-local coords; holds the
+// MATERIAL id per cell, 0 = empty -- nonzero = solid).
 struct ColliderRegionJobItem {
     int index = 0;
     int ox = 0, oy = 0, oz = 0;  // region world origin (voxel coords)
     bool anySolid = false;
-    std::vector<std::uint8_t> grid;                       // region-local solidity
-    std::vector<vox::physics::ColliderBox> boxes;         // worker writes (world units)
+    int  solidCount = 0;                                  // # nonzero cells (box-layer invariant check)
+    std::vector<std::uint8_t> grid;                       // region-local MATERIAL ids (0 = empty)
+    std::vector<vox::physics::ColliderBox> boxes;         // worker writes (world units) -> PhysX
+    std::vector<WorldBox>     worldBoxes;                 // worker writes (world voxel coords) -> persistent box layer
 };
 
 // --- async-rebuild state (file-scope; the batch outlives the worker since it is
@@ -1038,6 +1050,20 @@ static bool                          g_colliderJobInFlight = false;  // main-thr
 static std::atomic<bool>             g_colliderJobReady{false};      // worker -> main
 static std::thread                   g_colliderThread;               // one worker at a time
 static std::vector<ColliderRegionJobItem> g_colliderBatch;          // main writes, worker reads/writes
+
+// Phase 0: the PERSISTENT world box layer, indexed by dense region index. Each
+// region holds its current greedy box decomposition (world voxel coords) +
+// per-box material. Written by PollColliderJob from the just-finished worker
+// batch (so it stays in lockstep with the collider on the dirty-region cadence),
+// read by the box-level connectivity/stress passes. Empty vector = cleared region.
+static std::vector<std::vector<WorldBox>> g_worldRegionBoxes(kRegionCount);
+
+// Total boxes currently in the persistent layer (verification / Phase-1 sizing).
+static std::size_t BoxLayerTotal() {
+    std::size_t n = 0;
+    for (const auto& r : g_worldRegionBoxes) n += r.size();
+    return n;
+}
 
 // Mark every region overlapping the carve sphere's AABB [h-r-1 .. h+r+1] dirty.
 static void MarkCarveRegionsDirty(int hx, int hy, int hz, int radius) {
@@ -1101,7 +1127,8 @@ static void ColliderDecomposeJob() {
     const glm::ivec3 rdims(kRegionSize, kRegionSize, kRegionSize);
     for (ColliderRegionJobItem& item : g_colliderBatch) {
         item.boxes.clear();
-        if (!item.anySolid) continue;  // empty region -> SetColliderRegion clears it
+        item.worldBoxes.clear();
+        if (!item.anySolid) continue;  // empty region -> SetColliderRegion + box layer clear it
         vox::destruction::ComponentField cf;
         cf.ids.resize(item.grid.size());
         for (std::size_t i = 0; i < item.grid.size(); ++i)
@@ -1112,9 +1139,12 @@ static void ColliderDecomposeJob() {
         const std::vector<vox::destruction::Box> boxes =
             vox::destruction::decomposeComponent(cf, rdims, 1);
 
-        // Inclusive region-local voxel AABB -> world-unit box [mn .. mx+1], then
-        // offset by the region world origin.
+        // Inclusive region-local voxel AABB -> (a) world-unit ColliderBox [mn .. mx+1]
+        // for PhysX, and (b) a WORLD-voxel-coord WorldBox [mn .. mx] (+ material) for
+        // the persistent box layer (connectivity/stress). region idx = z*S*S + y*S + x.
         item.boxes.reserve(boxes.size());
+        item.worldBoxes.reserve(boxes.size());
+        std::int64_t coveredVol = 0;
         for (const auto& b : boxes) {
             vox::physics::ColliderBox cb;
             cb.minX = static_cast<float>(item.ox + b.mn.x);
@@ -1124,7 +1154,21 @@ static void ColliderDecomposeJob() {
             cb.maxY = static_cast<float>(item.oy + b.mx.y + 1);
             cb.maxZ = static_cast<float>(item.oz + b.mx.z + 1);
             item.boxes.push_back(cb);
+
+            WorldBox wb;
+            wb.box.mn = glm::ivec3(item.ox + b.mn.x, item.oy + b.mn.y, item.oz + b.mn.z);
+            wb.box.mx = glm::ivec3(item.ox + b.mx.x, item.oy + b.mx.y, item.oz + b.mx.z);
+            const std::size_t li =
+                (static_cast<std::size_t>(b.mn.z) * kRegionSize + b.mn.y) * kRegionSize + b.mn.x;
+            wb.material = item.grid[li];   // box covers solids only, so mn corner is solid
+            item.worldBoxes.push_back(wb);
+            coveredVol += b.volume();
         }
+        // Invariant (decomposeComponent guarantees union==solids, non-overlapping):
+        // covered volume must equal the region's solid-cell count. Sanity net only.
+        if (coveredVol != item.solidCount)
+            vox::log::Warn("box layer: region {} cover {} != solids {}", item.index,
+                           static_cast<long long>(coveredVol), item.solidCount);
     }
     g_colliderJobReady.store(true, std::memory_order_release);  // publish (must be last)
 }
@@ -1148,20 +1192,22 @@ static void LaunchColliderJob(vox::voxel::VoxelWorld& world) {
                 item.oy = ry * kRegionSize;
                 item.oz = rz * kRegionSize;
                 item.grid.assign(static_cast<std::size_t>(kRegionSize) * kRegionSize * kRegionSize, 0u);
-                bool anySolid = false;
+                int solidCount = 0;
                 for (int lz = 0; lz < kRegionSize; ++lz) {
                     for (int ly = 0; ly < kRegionSize; ++ly) {
                         for (int lx = 0; lx < kRegionSize; ++lx) {
-                            if (world.GetVoxel(item.ox + lx, item.oy + ly, item.oz + lz) != 0) {
+                            const std::uint8_t m = world.GetVoxel(item.ox + lx, item.oy + ly, item.oz + lz);
+                            if (m != 0) {
                                 const std::size_t li =
                                     (static_cast<std::size_t>(lz) * kRegionSize + ly) * kRegionSize + lx;
-                                item.grid[li] = 1u;
-                                anySolid = true;
+                                item.grid[li] = m;   // store MATERIAL (nonzero = solid); box layer samples it
+                                ++solidCount;
                             }
                         }
                     }
                 }
-                item.anySolid = anySolid;
+                item.anySolid = solidCount > 0;
+                item.solidCount = solidCount;
                 g_colliderBatch.push_back(std::move(item));
             }
         }
@@ -1184,12 +1230,15 @@ static bool PollColliderJob(vox::physics::PhysicsWorld& physics) {
     g_colliderJobInFlight = false;
 
     std::size_t totalBoxes = 0;
-    for (const ColliderRegionJobItem& item : g_colliderBatch) {
+    for (ColliderRegionJobItem& item : g_colliderBatch) {
         physics.SetColliderRegion(item.index, kRegionCount, item.boxes);  // empty -> clears region
+        // Phase 0: persist this region's box decomposition (empty = cleared region).
+        if (item.index >= 0 && item.index < static_cast<int>(g_worldRegionBoxes.size()))
+            g_worldRegionBoxes[item.index] = std::move(item.worldBoxes);
         totalBoxes += item.boxes.size();
     }
-    vox::log::Trace("physics: world collider rebuilt ({} region(s), {} boxes, async)",
-                    g_colliderBatch.size(), totalBoxes);
+    vox::log::Trace("physics: world collider rebuilt ({} region(s), {} boxes; box-layer total {})",
+                    g_colliderBatch.size(), totalBoxes, BoxLayerTotal());
     g_colliderBatch.clear();
     return true;
 }
@@ -1688,6 +1737,32 @@ int main(int argc, char** argv) {
                 }
 #endif
             });
+
+#if defined(VOX_HAVE_PHYSX)
+        // Phase 0 (box layer): report the persistent world box decomposition --
+        // box count vs the dense voxel count, so you can see the sparsity win and
+        // confirm it's populated. Rides the collider path: needs
+        // physics.world_collider ON (Phase 1 will decouple it from the collider).
+        c.RegisterCommand("voxel.boxlayer",
+            "Report persistent world box-layer stats (boxes vs voxels; needs physics.world_collider on).",
+            [&world](std::span<const std::string_view>, Output& o) {
+                const std::size_t total = BoxLayerTotal();
+                int nonEmpty = 0;
+                for (const auto& r : g_worldRegionBoxes) if (!r.empty()) ++nonEmpty;
+                std::size_t solids = 0;
+                const int G = static_cast<int>(vox::voxel::kWorldDim);
+                for (int z = 0; z < G; ++z)
+                    for (int y = 0; y < G; ++y)
+                        for (int x = 0; x < G; ++x)
+                            if (world.GetVoxel(x, y, z) != 0) ++solids;
+                if (total == 0)
+                    o.Print("box layer: empty (enable physics.world_collider so it populates)");
+                else
+                    o.Format("box layer: {} boxes across {}/{} regions, covering {} solid voxels (~{}x sparser)",
+                             total, nonEmpty, kRegionCount, solids,
+                             total ? (solids / total) : 0);
+            });
+#endif
 
         // voxel.break: ray-cast from the camera along its forward vector and carve
         // a sphere (voxel.break_radius) out of the first solid voxel that's hit.
