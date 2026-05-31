@@ -724,10 +724,26 @@ int RunStructuralSettle(vox::console::Console& cc,
     }
 #endif
 
-    // Re-upload the (now lighter) world to the GPU. A full re-bake is fine here:
-    // settle is a manual command or an opt-in per-carve hook, not a hot path.
-    auto grid = world.BakeFlatGrid(vox::voxel::kWorldDim);
-    renderer.SetVoxels(grid, world.Palette().data());
+    // Push the now-cleared island cells to the GPU INCREMENTALLY (EditVoxels per
+    // island AABB), NOT a full re-bake. Renderer::SetVoxels does a GPU WaitIdle
+    // (full pipeline stall) AND rescans all kWorldDim^3 (=2M) voxels to rebuild
+    // the empty-space brick grid -- that stall, not the physics, was the settle
+    // hitch (carve never stutters precisely because it uses EditVoxels). EditVoxels
+    // writes only the touched cells + refreshes only the overlapping bricks, no
+    // WaitIdle. Read the CURRENT world state for each box (island voxels already
+    // cleared by SettleWorld; any neighbouring terrain in the AABB is preserved).
+    std::vector<std::uint32_t> region;
+    for (const auto& isl : res.islands) {
+        const int x0 = isl.origin.x, y0 = isl.origin.y, z0 = isl.origin.z;
+        const int x1 = x0 + isl.dims.x, y1 = y0 + isl.dims.y, z1 = z0 + isl.dims.z;
+        region.clear();
+        region.reserve(static_cast<std::size_t>(isl.dims.x) * isl.dims.y * isl.dims.z);
+        for (int z = z0; z < z1; ++z)
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1; ++x)
+                    region.push_back(static_cast<std::uint32_t>(world.GetVoxel(x, y, z)));
+        renderer.EditVoxels(x0, y0, z0, x1, y1, z1, region.data(), nullptr);
+    }
     return res.detachedVoxels;
 }
 
