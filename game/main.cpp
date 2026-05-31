@@ -24,6 +24,7 @@
 #include "voxel/VoxelWorld.h"
 #include "voxel/destruction/box_decompose.h"  // Milestone C: world box-compound collider
 #include "voxel/destruction/connectivity.h"
+#include "voxel/destruction/island_extract.h"  // re-fracture a carved debris chunk into pieces
 
 #include <glm/glm.hpp>  // glm::ivec3 for the world-collider decompose
 
@@ -325,6 +326,49 @@ public:
         c.id = id;
         if (UseObb()) RegisterDynObject(renderer, world, c);   // A3: tumble as an OBB rigid body (else re-stamp = no smooth rotation)
         live_.push_back(std::move(c));
+    }
+
+    // "Broken things stay breakable": ray-cast the camera ray against every live
+    // debris chunk (in each chunk's own rotated local frame), and if a chunk is
+    // the NEAREST thing the ray hits (closer than worldHitDist -- the distance to
+    // the world's RaycastSolid hit, or FLT_MAX if the world missed), carve a
+    // sphere out of THAT chunk and re-fracture it: the carve may split the chunk
+    // into several connected components, each of which becomes its own new rigid
+    // body inheriting the parent's pose + velocity. Returns true if a chunk was
+    // hit + carved (so the caller skips the world carve); false => let the world
+    // carve proceed as before. No-op (returns false) unless voxel.debris_breakable.
+    bool TryCarveRay(vox::voxel::VoxelWorld& world, vox::physics::PhysicsWorld& physics,
+                     vox::render::Renderer& renderer,
+                     const float ro[3], const float rd[3], float maxDist, int radius,
+                     float worldHitDist) {
+        {
+            CVar* cv = Console::Get().FindCVar("voxel.debris_breakable");
+            if (cv && !cv->GetBool()) return false;
+        }
+        // 1) Nearest chunk hit, must beat the world hit (+ half a voxel so a debris
+        //    chunk re-stamped INTO the world grid wins the coincident tie).
+        int   bestIdx = -1;
+        float bestT   = worldHitDist + 0.5f;
+        int   bhx = 0, bhy = 0, bhz = 0;
+        for (std::size_t i = 0; i < live_.size(); ++i) {
+            const Chunk& c = live_[i];
+            if (c.id < 0 || c.solidCount == 0) continue;
+            vox::physics::BodyState st;
+            if (!physics.GetBodyState(c.id, st)) continue;
+            // World ray -> chunk-local grid space: lo = R^-1*(ro - bodyPos) + C,
+            // ld = R^-1*rd (R orthonormal, so ld stays unit + t is world-distance).
+            float lo[3], ld[3], dlt[3] = {ro[0] - st.px, ro[1] - st.py, ro[2] - st.pz};
+            QuatRotateInv(st, dlt[0], dlt[1], dlt[2], lo[0], lo[1], lo[2]);
+            lo[0] += c.localCx; lo[1] += c.localCy; lo[2] += c.localCz;
+            QuatRotateInv(st, rd[0], rd[1], rd[2], ld[0], ld[1], ld[2]);
+            int lx, ly, lz; float t;
+            if (LocalRaycast(c, lo, ld, maxDist, lx, ly, lz, t) && t < bestT) {
+                bestT = t; bestIdx = static_cast<int>(i); bhx = lx; bhy = ly; bhz = lz;
+            }
+        }
+        if (bestIdx < 0) return false;  // world (or nothing) is nearer
+        CarveChunk(world, physics, renderer, static_cast<std::size_t>(bestIdx), bhx, bhy, bhz, radius);
+        return true;
     }
 
     // Per-frame: cull dead chunks (clearing their last footprint), then re-stamp
@@ -674,6 +718,171 @@ private:
             return;  // prev fully covered by the upcoming paint of cur
         }
         ClearBoxToTerrain(world, renderer, a);
+    }
+
+    // Map a parent-local grid point (lpx,lpy,lpz) to world via the body pose:
+    // W = bodyPos + R*(p - C). (C = local center; R = body orientation.)
+    static void LocalGridPointToWorld(const vox::physics::BodyState& st,
+                                      float cx, float cy, float cz,
+                                      float lpx, float lpy, float lpz, float out[3]) {
+        float rx, ry, rz;
+        QuatRotate(st, lpx - cx, lpy - cy, lpz - cz, rx, ry, rz);
+        out[0] = st.px + rx; out[1] = st.py + ry; out[2] = st.pz + rz;
+    }
+
+    // Amanatides-Woo voxel DDA over chunk `c`'s local mats grid (box [0,dx]x..).
+    // From local ray (lo,ld) (ld unit), returns the first SOLID cell + the param
+    // t (world units, since the local frame is a rigid transform of the world).
+    static bool LocalRaycast(const Chunk& c, const float lo[3], const float ld[3],
+                             float maxDist, int& hx, int& hy, int& hz, float& tHit) {
+        const int dim[3] = {c.dx, c.dy, c.dz};
+        float tEnter = 0.0f, tExit = maxDist;
+        for (int a = 0; a < 3; ++a) {                 // slab-clip to the grid box
+            if (std::fabs(ld[a]) < 1e-8f) {
+                if (lo[a] < 0.0f || lo[a] > static_cast<float>(dim[a])) return false;
+            } else {
+                const float inv = 1.0f / ld[a];
+                float t1 = (0.0f - lo[a]) * inv, t2 = (static_cast<float>(dim[a]) - lo[a]) * inv;
+                if (t1 > t2) std::swap(t1, t2);
+                tEnter = std::max(tEnter, t1);
+                tExit  = std::min(tExit, t2);
+                if (tEnter > tExit) return false;
+            }
+        }
+        float t = tEnter + 1e-4f;
+        if (t > tExit) return false;
+        float p[3] = {lo[0] + ld[0] * t, lo[1] + ld[1] * t, lo[2] + ld[2] * t};
+        int   cell[3], step[3];
+        float tMax[3], tDelta[3];
+        for (int a = 0; a < 3; ++a) {
+            cell[a] = static_cast<int>(std::floor(p[a]));
+            cell[a] = std::max(0, std::min(dim[a] - 1, cell[a]));
+            if (ld[a] > 1e-8f) {
+                step[a] = 1; tDelta[a] = 1.0f / ld[a];
+                tMax[a] = t + (static_cast<float>(cell[a] + 1) - p[a]) / ld[a];
+            } else if (ld[a] < -1e-8f) {
+                step[a] = -1; tDelta[a] = -1.0f / ld[a];
+                tMax[a] = t + (static_cast<float>(cell[a]) - p[a]) / ld[a];
+            } else {
+                step[a] = 0; tDelta[a] = 1e30f; tMax[a] = 1e30f;
+            }
+        }
+        const int guardMax = (dim[0] + dim[1] + dim[2]) * 2 + 8;
+        for (int guard = 0; guard < guardMax; ++guard) {
+            if (cell[0] >= 0 && cell[0] < dim[0] && cell[1] >= 0 && cell[1] < dim[1] &&
+                cell[2] >= 0 && cell[2] < dim[2]) {
+                if (c.mats[Idx(c, cell[0], cell[1], cell[2])] != 0) {
+                    hx = cell[0]; hy = cell[1]; hz = cell[2]; tHit = t; return true;
+                }
+            }
+            int axis = 0;
+            if (tMax[1] < tMax[axis]) axis = 1;
+            if (tMax[2] < tMax[axis]) axis = 2;
+            t = tMax[axis];
+            if (t > tExit) return false;
+            cell[axis] += step[axis];
+            tMax[axis] += tDelta[axis];
+            if (cell[axis] < 0 || cell[axis] >= dim[axis]) return false;  // exited the box
+        }
+        return false;
+    }
+
+    // Erase a SPHERE of solid voxels (radius, Euclidean) around local (cx,cy,cz)
+    // from chunk `c`'s mats. Returns the count removed.
+    static int CarveLocalSphere(Chunk& c, int cx, int cy, int cz, int radius) {
+        const int r2 = radius * radius;
+        int removed = 0;
+        const int z0 = std::max(0, cz - radius), z1 = std::min(c.dz - 1, cz + radius);
+        const int y0 = std::max(0, cy - radius), y1 = std::min(c.dy - 1, cy + radius);
+        const int x0 = std::max(0, cx - radius), x1 = std::min(c.dx - 1, cx + radius);
+        for (int z = z0; z <= z1; ++z)
+            for (int y = y0; y <= y1; ++y)
+                for (int x = x0; x <= x1; ++x) {
+                    const int dx = x - cx, dy = y - cy, dz = z - cz;
+                    if (dx * dx + dy * dy + dz * dz > r2) continue;
+                    const std::size_t i = Idx(c, x, y, z);
+                    if (c.mats[i]) { c.mats[i] = 0; ++removed; }
+                }
+        return removed;
+    }
+
+    // Release a live chunk (its body, render object + re-stamp footprint) and
+    // erase it from live_. Mirrors the cull path in Update().
+    void RemoveChunkAt(std::size_t idx, vox::voxel::VoxelWorld& world,
+                       vox::physics::PhysicsWorld& physics, vox::render::Renderer& renderer) {
+        if (idx >= live_.size()) return;
+        Chunk& c = live_[idx];
+        if (c.dynHandle >= 0) renderer.RemoveDynObject(c.dynHandle);
+        else if (c.hasPrev) ClearBoxToTerrain(world, renderer, c.prev);
+        if (c.id >= 0) physics.ReleaseBox(c.id);
+        live_.erase(live_.begin() + static_cast<std::ptrdiff_t>(idx));
+    }
+
+    // Carve a sphere out of chunk `idx`'s local grid at local (lx,ly,lz), then
+    // re-fracture: relabel connected components and spawn each as its OWN new
+    // body at the parent's pose + inherited velocity (plus a gentle outward kick
+    // off the carve point so split pieces separate). The parent is released.
+    void CarveChunk(vox::voxel::VoxelWorld& world, vox::physics::PhysicsWorld& physics,
+                    vox::render::Renderer& renderer,
+                    std::size_t idx, int lx, int ly, int lz, int radius) {
+        if (idx >= live_.size()) return;
+        vox::physics::BodyState st;
+        if (!physics.GetBodyState(live_[idx].id, st)) return;
+        float plin[3] = {0, 0, 0}, pang[3] = {0, 0, 0};
+        physics.GetBodyVelocity(live_[idx].id, plin, pang);
+
+        const int removed = CarveLocalSphere(live_[idx], lx, ly, lz, radius);
+        if (removed == 0) return;  // grazed empty space
+
+        // Take the parent's grid + frame, then drop the parent body (frees a pool
+        // slot for the children we're about to spawn).
+        const int   pdx = live_[idx].dx, pdy = live_[idx].dy, pdz = live_[idx].dz;
+        const float pcx = live_[idx].localCx, pcy = live_[idx].localCy, pcz = live_[idx].localCz;
+        std::vector<std::uint8_t> pmats = std::move(live_[idx].mats);
+        RemoveChunkAt(idx, world, physics, renderer);
+
+        vox::destruction::ComponentField cf =
+            vox::destruction::labelComponents(pmats.data(), glm::ivec3(pdx, pdy, pdz), nullptr);
+        if (cf.totalCount <= 0) return;  // fully destroyed -> nothing respawns
+
+        float cw[3];  // world carve point (for the separation kick)
+        LocalGridPointToWorld(st, pcx, pcy, pcz, static_cast<float>(lx) + 0.5f,
+                              static_cast<float>(ly) + 0.5f, static_cast<float>(lz) + 0.5f, cw);
+
+        for (int comp = 1; comp <= cf.totalCount; ++comp) {
+            if (static_cast<int>(live_.size()) >= maxLive_) break;  // live cap
+            vox::destruction::LocalGrid g = vox::destruction::extractIsland(
+                pmats.data(), cf, glm::ivec3(pdx, pdy, pdz), static_cast<std::uint16_t>(comp));
+            if (g.dims.x <= 0 || g.dims.y <= 0 || g.dims.z <= 0) continue;
+
+            Chunk ch;
+            ch.dx = g.dims.x; ch.dy = g.dims.y; ch.dz = g.dims.z;
+            ch.mats = std::move(g.data);
+            ch.solidCount = 0; for (std::uint8_t m : ch.mats) if (m) ++ch.solidCount;
+            if (ch.solidCount == 0) continue;
+            ch.localCx = 0.5f * ch.dx; ch.localCy = 0.5f * ch.dy; ch.localCz = 0.5f * ch.dz;
+
+            float wc[3];  // child body center = parent W(originInParent + childC)
+            LocalGridPointToWorld(st, pcx, pcy, pcz,
+                                  static_cast<float>(g.originInParent.x) + ch.localCx,
+                                  static_cast<float>(g.originInParent.y) + ch.localCy,
+                                  static_cast<float>(g.originInParent.z) + ch.localCz, wc);
+
+            float ox = wc[0] - cw[0], oy = wc[1] - cw[1], oz = wc[2] - cw[2];
+            const float ol = std::sqrt(ox * ox + oy * oy + oz * oz);
+            if (ol > 1e-3f) { ox /= ol; oy /= ol; oz /= ol; }
+            else { ox = Frand(-1.0f, 1.0f); oy = 1.0f; oz = Frand(-1.0f, 1.0f); }
+            const float kick = 2.0f;
+            const float vx = plin[0] + ox * kick, vy = plin[1] + oy * kick, vz = plin[2] + oz * kick;
+
+            const int newId = AcquireForChunk(physics, ch, wc[0], wc[1], wc[2],
+                                              vx, vy, vz, pang[0], pang[1], pang[2]);
+            if (newId < 0) break;  // pool exhausted
+            ch.id = newId;
+            physics.SetBodyPose(newId, wc, &st.qx);   // children keep the parent's rotation
+            if (UseObb()) RegisterDynObject(renderer, world, ch);
+            live_.push_back(std::move(ch));
+        }
     }
 
     std::vector<std::uint32_t> scratch_;  // serial-only (main-thread) upload buffer
@@ -1049,6 +1258,7 @@ void RegisterCoreCvars() {
     reg("physics.solver.position_iters", "8", "Solver position iterations.", {.type = CVarType::Int, .flags = CVAR_ARCHIVE, .range_min = 1, .range_max = 32, .range_step = 1});
     reg("physics.world_collider", "0", "Milestone C: build a STATIC box-compound collider matching the voxel terrain (greedy box cover -> one PxRigidStatic of PxBoxGeometry) so falling debris + B1 detached islands LAND on the terrain instead of dropping through to the y=0 plane. Default OFF = behavior unchanged. ON rebuilds the collider after each carve (voxel.break/explode) + after voxel.settle. Additive to the y=0 ground plane.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("physics.debris_compound", "1", "#2 of Teardown ladder: give each debris/island chunk a box-COMPOUND collider (greedy box cover of ITS OWN voxels, B0 decompose) instead of one oversized bounding box, so a CONCAVE chunk collides as its real shape and can fall THROUGH a gap a bounding box would wedge in (fixes 'a chunk hit an invisible box in a gap'). Solid (convex) chunks keep a single box; chunks needing >48 boxes fall back to one box (cost). Default ON; matters once physics.world_collider is on.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
+    reg("voxel.debris_breakable", "1", "Broken stays breakable: voxel.break / voxel.explode also ray-cast the camera ray against live debris chunks; if a chunk is the nearest thing hit, it is carved in its OWN local frame and RE-FRACTURED (the carve relabels connected components and each piece becomes its own rigid body, inheriting the parent's pose + velocity). Default ON; turn OFF to only ever carve the static world.", {.type = CVarType::Bool, .flags = CVAR_ARCHIVE});
     reg("sim.fluid.grid_resolution", "MED", "FLIP/Eulerian fluid grid resolution.", {.type = CVarType::Enum, .flags = CVAR_ARCHIVE, .enum_values = {"LOW", "MED", "HIGH", "ULTRA"}});
     reg("sim.fire.combustion_rate", "1.0", "Combustion rate multiplier.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 0.1f, .range_max = 5.0f, .range_step = 0.1f});
     reg("voxel.streaming.horizon_meters", "256", "Voxel streaming horizon.", {.type = CVarType::Float, .flags = CVAR_ARCHIVE, .range_min = 64.0f, .range_max = 512.0f, .range_step = 8.0f});
@@ -1500,22 +1710,36 @@ int main(int argc, char** argv) {
                 const float cyw = std::cos(yaw), syw = std::sin(yaw);
                 const float fwd[3] = {cp * syw, sp, cp * cyw};
 
+                const int radius = cc.FindCVar("voxel.break_radius")
+                                       ? cc.FindCVar("voxel.break_radius")->GetInt() : 2;
                 int hx = 0, hy = 0, hz = 0;
                 const float maxDist = static_cast<float>(vox::voxel::kWorldDim) * 2.0f;
-                if (!world.RaycastSolid(pos, fwd, maxDist, hx, hy, hz)) {
+                const bool worldHit = world.RaycastSolid(pos, fwd, maxDist, hx, hy, hz);
+                float worldHitDist = 1e30f;
+                if (worldHit) {
+                    const float wdx = (hx + 0.5f) - pos[0], wdy = (hy + 0.5f) - pos[1], wdz = (hz + 0.5f) - pos[2];
+                    worldHitDist = std::sqrt(wdx * wdx + wdy * wdy + wdz * wdz);
+                }
+#if defined(VOX_HAVE_PHYSX)
+                debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
+                debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
+                debris.ReservePool(physics);
+                // "Broken stays breakable": if a debris chunk is the nearest thing
+                // the ray hits, carve + re-fracture THAT chunk and skip the world.
+                if (debris.TryCarveRay(world, physics, renderer, pos, fwd, maxDist, radius, worldHitDist)) {
+                    o.Print("voxel.break: carved a debris chunk");
+                    return;
+                }
+#endif
+                if (!worldHit) {
                     o.Print("voxel.break: nothing solid in range");
                     return;
                 }
-                const int radius = cc.FindCVar("voxel.break_radius")
-                                       ? cc.FindCVar("voxel.break_radius")->GetInt() : 2;
 #if defined(VOX_HAVE_PHYSX)
                 // Capture the REAL voxels about to be removed as falling chunks
                 // BEFORE carving (so world.GetVoxel still returns the solids).
                 // Each chunk keeps its true shape + original colors and tumbles;
                 // the run loop re-stamps it at the body's full transform.
-                debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
-                debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
-                debris.ReservePool(physics);
                 debris.SpawnFromCarve(world, physics, renderer, hx, hy, hz, radius,
                                       /*force=*/0.0f, /*radial=*/false);
 #endif
@@ -1579,24 +1803,38 @@ int main(int argc, char** argv) {
                 const float cyw = std::cos(yaw), syw = std::sin(yaw);
                 const float fwd[3] = {cp * syw, sp, cp * cyw};
 
-                int hx = 0, hy = 0, hz = 0;
-                const float maxDist = static_cast<float>(vox::voxel::kWorldDim) * 2.0f;
-                if (!world.RaycastSolid(pos, fwd, maxDist, hx, hy, hz)) {
-                    o.Print("voxel.explode: nothing solid in range");
-                    return;
-                }
                 const int radius = cc.FindCVar("voxel.explode_radius")
                                        ? cc.FindCVar("voxel.explode_radius")->GetInt() : 8;
+                int hx = 0, hy = 0, hz = 0;
+                const float maxDist = static_cast<float>(vox::voxel::kWorldDim) * 2.0f;
+                const bool worldHit = world.RaycastSolid(pos, fwd, maxDist, hx, hy, hz);
+                float worldHitDist = 1e30f;
+                if (worldHit) {
+                    const float wdx = (hx + 0.5f) - pos[0], wdy = (hy + 0.5f) - pos[1], wdz = (hz + 0.5f) - pos[2];
+                    worldHitDist = std::sqrt(wdx * wdx + wdy * wdy + wdz * wdz);
+                }
 #if defined(VOX_HAVE_PHYSX)
-                // Capture the REAL voxels about to be removed as a RADIAL debris
-                // burst BEFORE carving (so world.GetVoxel still sees the solids):
-                // each chunk keeps its true shape + original colors and tumbles
-                // outward from the crater, magnitude scaled by voxel.explode_force.
                 const float force = cc.FindCVar("voxel.explode_force")
                                         ? cc.FindCVar("voxel.explode_force")->GetFloat() : 12.0f;
                 debris.SetMaxLive(cc.FindCVar("voxel.debris.max") ? cc.FindCVar("voxel.debris.max")->GetInt() : 256);
                 debris.SetScale(cc.FindCVar("voxel.debris.scale") ? cc.FindCVar("voxel.debris.scale")->GetFloat() : 1.0f);
                 debris.ReservePool(physics);
+                // "Broken stays breakable": a nearer debris chunk takes the blast
+                // (carve + re-fracture it) instead of the world.
+                if (debris.TryCarveRay(world, physics, renderer, pos, fwd, maxDist, radius, worldHitDist)) {
+                    o.Print("voxel.explode: shattered a debris chunk");
+                    return;
+                }
+#endif
+                if (!worldHit) {
+                    o.Print("voxel.explode: nothing solid in range");
+                    return;
+                }
+#if defined(VOX_HAVE_PHYSX)
+                // Capture the REAL voxels about to be removed as a RADIAL debris
+                // burst BEFORE carving (so world.GetVoxel still sees the solids):
+                // each chunk keeps its true shape + original colors and tumbles
+                // outward from the crater, magnitude scaled by voxel.explode_force.
                 debris.SpawnFromCarve(world, physics, renderer, hx, hy, hz, radius, /*force=*/force, /*radial=*/true);
 #endif
                 const int removed = world.CarveSphere(hx, hy, hz, radius);

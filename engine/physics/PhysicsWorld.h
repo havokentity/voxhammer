@@ -165,6 +165,18 @@ public:
     // chunk renderer fetch a single chunk's transform without scanning.
     bool GetBodyState(int id, BodyState& out) const;
 
+    // Read a body's linear + angular velocity into lin[3]/ang[3]. Returns false
+    // (leaving the buffers untouched) for an unknown/parked id or stub build.
+    // Used when a debris chunk fractures further: the split pieces inherit the
+    // parent's motion so the break looks continuous.
+    bool GetBodyVelocity(int id, float lin[3], float ang[3]) const;
+
+    // Set a body's full world pose (position + orientation quaternion (x,y,z,w)).
+    // No-op for an unknown/parked id or in the stub build. AcquireBox spawns with
+    // identity rotation; this lets the caller re-orient a freshly acquired body
+    // (e.g. a fracture child must keep its parent chunk's rotation).
+    void SetBodyPose(int id, const float pos[3], const float quat[4]);
+
     // World-space Y of the body whose id is `id` (added via AddBox/AddDynamicBox),
     // or NaN if it is not a live id. Lets the caller cull debris that fell below
     // the ground.

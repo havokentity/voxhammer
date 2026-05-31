@@ -639,6 +639,37 @@ bool PhysicsWorld::GetBodyState(int id, BodyState& out) const {
     return true;
 }
 
+bool PhysicsWorld::GetBodyVelocity(int id, float lin[3], float ang[3]) const {
+    if (!impl_ || id < 0 || id >= static_cast<int>(impl_->dynamics.size())) {
+        return false;
+    }
+    const Impl::Body& b = impl_->dynamics[static_cast<std::size_t>(id)];
+    if (!b.actor || (b.pooled && !b.inScene)) {
+        return false;
+    }
+    const PxVec3 l = b.actor->getLinearVelocity();
+    const PxVec3 a = b.actor->getAngularVelocity();
+    lin[0] = l.x; lin[1] = l.y; lin[2] = l.z;
+    ang[0] = a.x; ang[1] = a.y; ang[2] = a.z;
+    return true;
+}
+
+void PhysicsWorld::SetBodyPose(int id, const float pos[3], const float quat[4]) {
+    if (!impl_ || id < 0 || id >= static_cast<int>(impl_->dynamics.size())) {
+        return;
+    }
+    Impl::Body& b = impl_->dynamics[static_cast<std::size_t>(id)];
+    if (!b.actor || (b.pooled && !b.inScene)) {
+        return;
+    }
+    // PxQuat ctor is (x,y,z,w); normalize defensively (a denormal quat asserts).
+    PxQuat q(quat[0], quat[1], quat[2], quat[3]);
+    const float n2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    if (n2 < 1e-12f) q = PxQuat(PxIdentity);
+    else q.normalize();
+    b.actor->setGlobalPose(PxTransform(PxVec3(pos[0], pos[1], pos[2]), q));
+}
+
 float PhysicsWorld::BodyPosY(int id) const {
     return BodyY(id);  // same dense-index lookup
 }
@@ -765,6 +796,13 @@ void PhysicsWorld::EnumerateBodies(std::vector<BodyState>& out) const { out.clea
 bool PhysicsWorld::GetBodyState(int id, BodyState& out) const {
     (void)id; (void)out;
     return false;
+}
+bool PhysicsWorld::GetBodyVelocity(int id, float lin[3], float ang[3]) const {
+    (void)id; (void)lin; (void)ang;
+    return false;
+}
+void PhysicsWorld::SetBodyPose(int id, const float pos[3], const float quat[4]) {
+    (void)id; (void)pos; (void)quat;
 }
 float PhysicsWorld::BodyPosY(int id) const {
     (void)id;
