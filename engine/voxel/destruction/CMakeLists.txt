@@ -12,8 +12,14 @@ add_library(vox_destruction STATIC
     stability.cpp
     box_decompose.h
     box_decompose.cpp
+    box_graph.h
+    box_graph.cpp
+    stress.h
+    stress.cpp
     island_extract.h
     island_extract.cpp
+    slice_fracture.h
+    slice_fracture.cpp
 )
 
 target_link_libraries(vox_destruction PUBLIC vox_includes glm::glm)
